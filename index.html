@@ -7,9 +7,13 @@
   <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js"></script>
+  <!-- PDF.js for reading PDF word banks -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script>if(window.pdfjsLib)pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";</script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-database-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-auth-compat.js"></script>
   <style>body{margin:0;padding:0;background:#0C1628;}</style>
 </head>
 <body>
@@ -21,21 +25,22 @@
 ========================================================= -->
 <script>
 const FIREBASE_CONFIG = {
-  apiKey: "AIzaSyDL6D10omw_PWdHGYbVmHyn0912pHWCgtI",
-  authDomain: "spelling-bee-portillo.firebaseapp.com",
-  databaseURL: "https://spelling-bee-portillo-default-rtdb.firebaseio.com",
-  projectId: "spelling-bee-portillo",
-  storageBucket: "spelling-bee-portillo.firebasestorage.app",
+  apiKey:            "AIzaSyDL6D10omw_PWdHGYbVmHyn0912pHWCgtI",
+  authDomain:        "spelling-bee-portillo.firebaseapp.com",
+  databaseURL:       "https://spelling-bee-portillo-default-rtdb.firebaseio.com",
+  projectId:         "spelling-bee-portillo",
+  storageBucket:     "spelling-bee-portillo.firebasestorage.app",
   messagingSenderId: "77310918785",
-  appId: "1:77310918785:web:a107af7e10c538abc08d80"
+  appId:             "1:77310918785:web:a107af7e10c538abc08d80"
 };
 window.FIREBASE_OK = false;
 try {
-  if (FIREBASE_CONFIG.apiKey !== "REEMPLAZA_CON_TU_API_KEY") {
-    firebase.initializeApp(FIREBASE_CONFIG);
-    window.rtdb = firebase.database();
-    window.FIREBASE_OK = true;
-  }
+  firebase.initializeApp(FIREBASE_CONFIG);
+  window.rtdb   = firebase.database();
+  window.fbAuth = firebase.auth();
+  window.fbAuth.useDeviceLanguage();
+  window.gProvider = new firebase.auth.GoogleAuthProvider();
+  window.FIREBASE_OK = true;
 } catch(e) { console.error("Firebase:", e); }
 </script>
 
@@ -43,10 +48,9 @@ try {
 const { useState, useEffect, useRef, useCallback } = React;
 
 /* ── ROOM UTILS ── */
-function generateRoomId(inst) {
-  const pre = inst.replace(/[^a-zA-Z0-9]/g,"").toUpperCase().slice(0,6).padEnd(2,"X");
-  const suf = Math.random().toString(36).substring(2,6).toUpperCase();
-  return pre + "-" + suf;
+function generateRoomId() {
+  const digits = String(Math.floor(100000 + Math.random() * 900000));
+  return "jd-" + digits;
 }
 function getShareUrl(roomId) {
   return window.location.origin + window.location.pathname + "?room=" + roomId;
@@ -64,14 +68,14 @@ const STAGES = {
 function initState() {
   return {
     phase:"setup", host:{name:"Monitor",ts:0},
-    judges:[{id:"J1",name:"",order:1},{id:"J2",name:"",order:2},{id:"J3",name:"",order:3}],
+    judges:[], // Filled as judges claim slots
     contestants:[], banks:{basic:[],intermediate:[],advanced:[]},
     usedWords:{basic:[],intermediate:[],advanced:[]},
     stage:"basic", cIdx:0, slot:0, activeWord:null, judgment:null,
     scores:{basic:{},intermediate:{},advanced:{},tiebreaker:{}},
     history:[], stageComplete:false, advancing:[],
     tbLen:null, tbRound:0, results:null, setupComplete:false,
-    institution:"", level:"", roomId:"", pdfConfirmed:{},
+    institution:"", level:"", roomId:"", pdfConfirmed:{}, logoB64:"", disputedWords:{}, contestantsConfirmed:false,
   };
 }
 
@@ -96,6 +100,91 @@ async function getPhonetics(words, onProgress) {
     if (i+5 < words.length) await new Promise(r => setTimeout(r, 180));
   }
   return map;
+}
+
+/* ── DOCUMENT PARSING (Word .docx + PDF + plain text) ── */
+
+/* Parse plain text / paste for word bank */
+function parseTextBank(text) {
+  const entries=[], seen=new Set();
+  for (const rawLine of text.split(/[
+]+/)) {
+    const line=rawLine.trim(); if(!line)continue;
+    let matched=false;
+    for (const sep of [" | "," - ","	"]) {
+      const idx=line.indexOf(sep);
+      if(idx>0){
+        const w=line.slice(0,idx).trim().toLowerCase();
+        const ph=line.slice(idx+sep.length).trim();
+        if(/^[a-z][a-z\s'-]*$/.test(w)&&!seen.has(w)){entries.push({word:w.replace(/\s+/g," "),phonetic:ph});seen.add(w);matched=true;break;}
+      }
+    }
+    if(!matched){
+      // Try "123 word" numbered list format or plain word
+      const numMatch=line.match(/^\d+\.?\s+(.+)$/);
+      const wordPart=numMatch?numMatch[1].trim():line;
+      for(const part of wordPart.split(/[,;]+/)){
+        const w=part.trim().toLowerCase().replace(/\s+/g," ");
+        if(w.length>0&&/^[a-z][a-z\s'-]*$/.test(w)&&!seen.has(w)){entries.push({word:w,phonetic:""});seen.add(w);}
+      }
+    }
+  }
+  return entries;
+}
+
+/* Parse plain text for contestant names */
+function parseTextNames(text) {
+  return text.split(/[
+]+/)
+    .map(l=>l.replace(/^\d+[\.\)\-]\s*/,"").trim())
+    .filter(n=>n.length>1&&n.length<80);
+}
+
+/* Parse PDF word bank */
+async function parsePDFWordBank(file) {
+  return new Promise(resolve => {
+    const fr=new FileReader();
+    fr.onload=async e=>{
+      try {
+        if(!window.pdfjsLib){resolve([]);return;}
+        const pdf=await pdfjsLib.getDocument({data:e.target.result}).promise;
+        let fullText="";
+        for(let p=1;p<=pdf.numPages;p++){
+          const page=await pdf.getPage(p);
+          const content=await page.getTextContent();
+          // Extract text items sorted by position (top-to-bottom, left-to-right)
+          const items=content.items.map(i=>({str:i.str,x:i.transform[4],y:i.transform[5]}));
+          fullText+=items.map(i=>i.str).join(" ")+"
+";
+        }
+        resolve(parseTextBank(fullText));
+      } catch(err){resolve([]);}
+    };
+    fr.readAsArrayBuffer(file);
+  });
+}
+
+/* Parse PDF contestant list */
+async function parsePDFNames(file) {
+  return new Promise(resolve => {
+    const fr=new FileReader();
+    fr.onload=async e=>{
+      try {
+        if(!window.pdfjsLib){resolve([]);return;}
+        const pdf=await pdfjsLib.getDocument({data:e.target.result}).promise;
+        let text="";
+        for(let p=1;p<=pdf.numPages;p++){
+          const page=await pdf.getPage(p);
+          const content=await page.getTextContent();
+          text+=content.items.map(i=>i.str).join("
+")+"
+";
+        }
+        resolve(parseTextNames(text));
+      } catch{resolve([]);}
+    };
+    fr.readAsArrayBuffer(file);
+  });
 }
 
 /* ── DOCUMENT PARSING ── */
@@ -336,7 +425,7 @@ function printReport(gs, role, onDone) {
     .stbl{width:100%;border-collapse:collapse;font-size:7pt;table-layout:fixed;}
     .stbl th{background:#f0f0f0;border:.5px solid #bbb;padding:2.5px 3px;text-align:left;font-size:6.5pt;}
     .stbl td{border:.5px solid #ccc;padding:2px 3px;vertical-align:middle;}
-    .nm{white-space:normal;word-break:break-word;font-weight:700;line-height:1.25;}
+    .nm{white-space:normal;word-break:break-word;font-weight:700;line-height:1.25;width:33%;}
     .rc{text-align:center;width:9pt;padding:1.5px 0px;font-weight:700;font-size:6.5pt;}
     .rc.ok{color:#16a34a;}.rc.fail{color:#dc2626;}.rc.nd{color:#ccc;font-size:6pt;}
     .sh{text-align:center;font-size:5.5pt;width:9pt;padding:1px 0px;}
@@ -395,7 +484,7 @@ function printReport(gs, role, onDone) {
     +'<table class="stbl"><thead>'
     +'<tr style="background:#1a1a2e;color:#fff;">'
     +'<th style="border:.5px solid #555;padding:3px 3px;width:20pt;text-align:center">No.</th>'
-    +'<th style="border:.5px solid #555;padding:3px 4px;text-align:left">Contestant</th>'
+    +'<th style="border:.5px solid #555;padding:3px 4px;text-align:left;width:33%">Contestant</th>'
     +'<th colspan="3" style="border:.5px solid #555;padding:3px 4px;text-align:center;background:#16537e">Round 1 &mdash; Basic</th>'
     +'<th colspan="3" style="border:.5px solid #555;padding:3px 4px;text-align:center;background:#7a4f00">Round 2 &mdash; Intermediate</th>'
     +'<th colspan="3" style="border:.5px solid #555;padding:3px 4px;text-align:center;background:#7a1616">Round 3 &mdash; Advanced</th>'
@@ -439,6 +528,88 @@ function printReport(gs, role, onDone) {
   win.onload=()=>{setTimeout(()=>{win.print();if(onDone)onDone();},500);};
 }
 
+
+/* ════════════════════════════════════════════════════
+   SISTEMA DE USUARIOS MAESTRO / OPERADORES
+════════════════════════════════════════════════════ */
+const ADMIN_PATH   = "spellingbee/admin";
+const ROOMS_PATH   = "spellingbee/rooms";
+const DEFAULT_PWD  = "jd-reset-2025";    // contraseña por defecto al crear/resetear
+
+/* Hashing SHA-256 con Web Crypto */
+async function hashPwd(pwd) {
+  const data = new TextEncoder().encode(pwd + ":jd-sb-salt");
+  const buf  = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+}
+
+/* Contar salas activas de un usuario */
+async function countActiveRooms(username) {
+  const snap = await window.rtdb.ref(ROOMS_PATH).once("value");
+  const rooms = snap.val()||{};
+  return Object.values(rooms).filter(r=>r.state?.createdBy===username&&r.state?.phase!=="archived").length;
+}
+
+/* Cargar todos los usuarios operadores */
+async function loadAdminUsers() {
+  const snap = await window.rtdb.ref(ADMIN_PATH+"/users").once("value");
+  const data = snap.val()||{};
+  // Enrich with active room count
+  const enriched = await Promise.all(Object.entries(data).map(async([username,u])=>{
+    const active = await countActiveRooms(username);
+    return {...u, username, activeRooms:active};
+  }));
+  return enriched;
+}
+
+/* Crear usuario operador */
+async function createAdminUser(username, roomLimit, masterUID) {
+  const pwdHash = await hashPwd(DEFAULT_PWD);
+  const user = { passwordHash:pwdHash, roomLimit:roomLimit||5, active:true,
+    createdAt:Date.now(), createdBy:masterUID, totalCreated:0 };
+  await window.rtdb.ref(ADMIN_PATH+"/users/"+username).set(user);
+}
+
+/* Resetear contraseña a default */
+async function resetAdminUserPwd(username) {
+  const hash = await hashPwd(DEFAULT_PWD);
+  await window.rtdb.ref(ADMIN_PATH+"/users/"+username+"/passwordHash").set(hash);
+}
+
+/* Cambiar límite de salas */
+async function setRoomLimit(username, limit) {
+  await window.rtdb.ref(ADMIN_PATH+"/users/"+username+"/roomLimit").set(limit);
+}
+
+/* Desactivar usuario */
+async function toggleAdminUser(username, active) {
+  await window.rtdb.ref(ADMIN_PATH+"/users/"+username+"/active").set(active);
+}
+
+/* Login de operador */
+async function loginOperator(username, password) {
+  const snap = await window.rtdb.ref(ADMIN_PATH+"/users/"+username).once("value");
+  const u = snap.val();
+  if (!u||!u.active) return {ok:false, err:"Usuario no encontrado o desactivado"};
+  const hash = await hashPwd(password);
+  if (hash !== u.passwordHash) return {ok:false, err:"Contraseña incorrecta"};
+  const active = await countActiveRooms(username);
+  return {ok:true, user:{type:"operator",username,roomLimit:u.roomLimit,activeRooms:active}};
+}
+
+/* Verificar/registrar master de Google */
+async function verifyOrRegisterMaster(uid, email) {
+  const snap = await window.rtdb.ref(ADMIN_PATH+"/masterUID").once("value");
+  const storedUID = snap.val();
+  if (!storedUID) {
+    // First time — register this Google account as master
+    await window.rtdb.ref(ADMIN_PATH+"/masterUID").set(uid);
+    await window.rtdb.ref(ADMIN_PATH+"/masterEmail").set(email);
+    return true;
+  }
+  return storedUID === uid;
+}
+
 /* ── CSS ── */
 const CSS = `
   @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,600;0,700;1,400;1,600&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap');
@@ -476,6 +647,20 @@ const CSS = `
   .word-table input{background:transparent;border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:3px 6px;color:#E8EDF8;font-family:'Cormorant Garamond',serif;font-size:.9rem;font-style:italic;outline:none;width:100%;}
   .word-table input:focus{border-color:rgba(232,162,0,.5);background:rgba(232,162,0,.05);}
   .dot{width:11px;height:11px;border-radius:3px;display:inline-block;}
+  @media(max-width:639px){
+    .sb{font-size:14px;}
+    .card{padding:15px;border-radius:13px;}
+    .btn{font-size:.84rem;padding:9px 16px;}
+    .spin-btn{padding:16px 36px;font-size:1.1rem;letter-spacing:.08em;}
+    .word-font{font-size:clamp(1.8rem,9vw,3.2rem);}
+    .ph-font{font-size:1rem;}
+    .check{padding:10px 12px;gap:9px;}
+    .field{font-size:.9rem;padding:9px 12px;}
+    .overlay{padding:10px;}
+  }
+  @media(max-width:380px){
+    .spin-btn{padding:14px 28px;font-size:1rem;}
+  }
   @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
   @keyframes pop{0%{transform:scale(.88)}55%{transform:scale(1.06)}100%{transform:none}}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
@@ -506,6 +691,18 @@ function App() {
   const [ovrModal, setOvrModal] = useState(false);
   const [wordKey,  setWordKey]  = useState(0);
   const [logoB64,  setLogoB64]  = useState("");
+  const [pasteTexts, setPasteTexts] = useState({basic:"",inter:"",adv:"",pax:""});
+  const [pasteMode,  setPasteMode]  = useState({basic:false,inter:false,adv:false,pax:false});
+  const [isMobile, setIsMobile] = useState(typeof window!=="undefined"&&window.innerWidth<640);
+  const [adminUser,   setAdminUser]   = useState(null);   // {type,username,roomLimit,activeRooms} or {type:"master",uid,email}
+  const [showAdmin,   setShowAdmin]   = useState(false);  // show admin overlay
+  const [adminView,   setAdminView]   = useState("login"); // "login"|"dashboard"|"setup-master"
+  const [adminUsers,  setAdminUsers]  = useState([]);
+  const [adminBusy,   setAdminBusy]   = useState(false);
+  const [adminStatus, setAdminStatus] = useState("");
+  const [adminForm,   setAdminForm]   = useState({username:"",password:"",limit:5});
+  const [newUserForm, setNewUserForm] = useState({username:"",limit:5});
+  const [operLogin,   setOperLogin]   = useState({username:"",password:""});
   const [disputeModal, setDisputeModal] = useState(false);
   const [revealAdvancing, setRevealAdvancing] = useState(false);
 
@@ -551,6 +748,11 @@ function App() {
   }, [role, roomId]);
 
   useEffect(() => { if(gs?.stage||gs?.stageComplete===false) setRevealAdvancing(false); }, [gs?.stage]);
+  useEffect(() => {
+    const h=()=>setIsMobile(window.innerWidth<640);
+    window.addEventListener("resize",h);
+    return()=>window.removeEventListener("resize",h);
+  },[]);
 
   const upd = useCallback(fn => {
     setGs(prev => {
@@ -562,12 +764,100 @@ function App() {
     });
   }, []);
 
+  /* ── ADMIN HANDLERS ── */
+  const doGoogleLogin = async () => {
+    setAdminBusy(true); setAdminStatus("");
+    try {
+      const result = await window.fbAuth.signInWithPopup(window.gProvider);
+      const { uid, email } = result.user;
+      const isMaster = await verifyOrRegisterMaster(uid, email);
+      if (isMaster) {
+        setAdminUser({type:"master", uid, email});
+        const users = await loadAdminUsers();
+        setAdminUsers(users);
+        setAdminView("dashboard");
+      } else {
+        setAdminStatus("⚠ Esta cuenta de Google no es la cuenta maestra registrada.");
+        await window.fbAuth.signOut();
+      }
+    } catch(e) { setAdminStatus("❌ Error: "+e.message); }
+    setAdminBusy(false);
+  };
+
+  const doOperatorLogin = async () => {
+    if (!operLogin.username||!operLogin.password) return;
+    setAdminBusy(true); setAdminStatus("");
+    const res = await loginOperator(operLogin.username, operLogin.password);
+    if (res.ok) {
+      setAdminUser(res.user);
+      setShowAdmin(false);
+    } else {
+      setAdminStatus("❌ "+res.err);
+    }
+    setAdminBusy(false);
+  };
+
+  const doAdminLogout = async () => {
+    await window.fbAuth?.signOut().catch(()=>{});
+    setAdminUser(null); setShowAdmin(false); setAdminView("login");
+  };
+
+  const doCreateAdminUser = async () => {
+    if (!newUserForm.username.trim()||!adminUser?.uid) return;
+    setAdminBusy(true); setAdminStatus("");
+    try {
+      await createAdminUser(newUserForm.username.trim(), +newUserForm.limit||5, adminUser.uid);
+      const users = await loadAdminUsers();
+      setAdminUsers(users);
+      setNewUserForm({username:"",limit:5});
+      setAdminStatus("✅ Usuario «"+newUserForm.username.trim()+"» creado. Contraseña: "+DEFAULT_PWD);
+    } catch(e) { setAdminStatus("❌ "+e.message); }
+    setAdminBusy(false);
+  };
+
+  const doResetPwd = async (username) => {
+    setAdminBusy(true);
+    await resetAdminUserPwd(username);
+    setAdminStatus("✅ Contraseña de «"+username+"» restablecida a: "+DEFAULT_PWD);
+    setAdminBusy(false);
+  };
+
+  const doSetLimit = async (username, limit) => {
+    setAdminBusy(true);
+    await setRoomLimit(username, +limit);
+    const users = await loadAdminUsers();
+    setAdminUsers(users);
+    setAdminBusy(false);
+  };
+
+  const doToggleUser = async (username, active) => {
+    await toggleAdminUser(username, active);
+    const users = await loadAdminUsers();
+    setAdminUsers(users);
+  };
+
+  const doRefreshUsers = async () => {
+    setAdminBusy(true);
+    const users = await loadAdminUsers();
+    setAdminUsers(users);
+    setAdminBusy(false);
+  };
+
   /* ── CREATE ROOM ── */
   const doCreateRoom = async () => {
     if (!inst.trim()) return;
     if (!window.FIREBASE_OK) { alert("Configura Firebase primero — ver SETUP.md"); return; }
-    const newId = generateRoomId(inst);
-    const ns = {...initState(), roomId:newId, institution:inst.trim(), level:lvl.trim(), expiresAt:Date.now()+72*3600*1000, lastActivity:Date.now()};
+    if (!adminUser) { setShowAdmin(true); setAdminView("login"); return; }
+    // Check room limit for operators
+    if (adminUser.type==="operator") {
+      const active = await countActiveRooms(adminUser.username);
+      if (active >= adminUser.roomLimit) {
+        alert("Has alcanzado el límite de "+adminUser.roomLimit+" sala(s) simultánea(s) para tu cuenta.\nCierra salas activas o contacta al administrador para ampliar tu límite.");
+        return;
+      }
+    }
+    const newId = generateRoomId();
+    const ns = {...initState(), roomId:newId, institution:inst.trim(), level:lvl.trim(), createdBy:adminUser?.username||adminUser?.email||"master", expiresAt:Date.now()+72*3600*1000, lastActivity:Date.now()};
     await window.rtdb.ref("spellingbee/rooms/"+newId+"/state").set(ns);
     sessionStorage.setItem("creator-"+newId, "1");
     window.history.pushState({}, "", window.location.pathname+"?room="+newId);
@@ -584,8 +874,17 @@ function App() {
     if (!role||!nameIn.trim()) return;
     const snap = await window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").once("value");
     let s = snap.val() || gs || initState();
-    if (role==="host") s = {...s, host:{name:nameIn.trim(),ts:Date.now()}};
-    else s = {...s, judges:s.judges.map(j=>j.id===role?{...j,name:nameIn.trim(),ts:Date.now()}:j)};
+    if (role==="host") {
+      s = {...s, host:{name:nameIn.trim(),ts:Date.now()}};
+    } else if (role==="judge") {
+      // Claim next available slot
+      const taken=(s.judges||[]).map(j=>j.id);
+      const available=["J1","J2","J3"].find(id=>!taken.includes(id));
+      if(!available){alert("No hay más lugares disponibles para jurados.");return;}
+      const newJudge={id:available,name:nameIn.trim(),order:taken.length+1,ts:Date.now()};
+      s={...s,judges:[...(s.judges||[]),newJudge]};
+      setRole(available); // Update local role to actual slot
+    }
     window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").set(s); setGs(s);
     const isCreator = sessionStorage.getItem("creator-"+roomId)==="1";
     if (isCreator && s.phase==="setup") setScreen("setup");
@@ -597,21 +896,29 @@ function App() {
   const doLoginCreator = async () => {
     if (!role||!nameIn.trim()) return;
     let s = gs || initState();
-    if (role==="host") s = {...s, host:{name:nameIn.trim(),ts:Date.now()}};
-    else s = {...s, judges:s.judges.map(j=>j.id===role?{...j,name:nameIn.trim(),ts:Date.now()}:j)};
+    if (role==="host") {
+      s={...s,host:{name:nameIn.trim(),ts:Date.now()}};
+    } else if(role==="judge"){
+      const taken=(s.judges||[]).map(j=>j.id);
+      const available=["J1","J2","J3"].find(id=>!taken.includes(id));
+      if(!available){alert("No hay más lugares disponibles.");return;}
+      const newJudge={id:available,name:nameIn.trim(),order:taken.length+1,ts:Date.now()};
+      s={...s,judges:[...(s.judges||[]),newJudge]};
+      setRole(available);
+    }
     window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").set(s); setGs(s);
     setScreen("setup");
   };
 
   /* ── SETUP ── */
   const doLoadBanks = async () => {
-    if (!files.basic&&!files.inter&&!files.adv) { setStatus("⚠ Sube al menos un banco."); return; }
+    if (!files.basic&&!files.inter&&!files.adv&&!pasteTexts.basic.trim()&&!pasteTexts.inter.trim()&&!pasteTexts.adv.trim()) { setStatus("⚠ Sube al menos un banco de palabras o pega el texto."); return; }
     setBusy(true); setStatus("📄 Leyendo documentos Word...");
     try {
       const [bW,iW,aW] = await Promise.all([
-        files.basic ? parseWordDoc(files.basic) : Promise.resolve([]),
-        files.inter ? parseWordDoc(files.inter) : Promise.resolve([]),
-        files.adv   ? parseWordDoc(files.adv)   : Promise.resolve([]),
+        files.basic ? (files.basic.name?.endsWith('.pdf')?parsePDFWordBank(files.basic):parseWordDoc(files.basic)) : pasteTexts.basic?Promise.resolve(parseTextBank(pasteTexts.basic)):Promise.resolve([]),
+        files.inter ? (files.inter.name?.endsWith('.pdf')?parsePDFWordBank(files.inter):parseWordDoc(files.inter)) : pasteTexts.inter?Promise.resolve(parseTextBank(pasteTexts.inter)):Promise.resolve([]),
+        files.adv   ? (files.adv.name?.endsWith('.pdf')  ?parsePDFWordBank(files.adv)  :parseWordDoc(files.adv))   : pasteTexts.adv?Promise.resolve(parseTextBank(pasteTexts.adv)):Promise.resolve([]),
       ]);
       const need = [...new Set([...bW,...iW,...aW].filter(w=>!w.phonetic).map(w=>w.word))];
       setStatus("🔤 Generando fonética para "+need.length+" palabras (API gratuita)...");
@@ -627,10 +934,12 @@ function App() {
   };
 
   const doLoadContestants = async () => {
-    if (!files.pax) { setStatus("⚠ Sube el archivo."); return; }
+    if (!files.pax && !pasteTexts.pax?.trim()) { setStatus("⚠ Sube el archivo o pega la lista de concursantes."); return; }
     setBusy(true);
     try {
-      const names = await parseNamesDoc(files.pax);
+      const names = files.pax
+        ? (files.pax.name?.endsWith('.pdf') ? await parsePDFNames(files.pax) : await parseNamesDoc(files.pax))
+        : parseTextNames(pasteTexts.pax||"");
       upd(prev => ({...prev, contestants:names.map((n,i)=>({id:"C"+(i+1),name:n,active:true}))}));
       setStatus("✅ "+names.length+" concursantes cargados."); setTab("contestants");
     } catch { setStatus("❌ Error al leer la lista."); }
@@ -645,6 +954,22 @@ function App() {
     }));
     setStatus("✅ Bancos y jurados guardados.");
     setTab("contestants");
+  };
+
+  const doConfirmContestants = () => {
+    upd(prev=>({...prev, contestantsConfirmed:true}));
+  };
+  const doEditContestant = (id, newName) => {
+    upd(prev=>({...prev, contestants:prev.contestants.map(c=>c.id===id?{...c,name:newName}:c)}));
+  };
+  const doRemoveContestant = id => {
+    upd(prev=>({...prev, contestants:prev.contestants.filter(c=>c.id!==id), contestantsConfirmed:false}));
+  };
+  const doAddContestant = name => {
+    upd(prev=>{
+      const next=[...prev.contestants,{id:"C"+(prev.contestants.length+1),name:name.trim(),active:true}];
+      return {...prev,contestants:next,contestantsConfirmed:false};
+    });
   };
 
   const doStart = () => {
@@ -799,8 +1124,9 @@ function App() {
     printReport(gsRef.current, role, () => {
       upd(prev=>{
         const confirmed={...prev.pdfConfirmed,[role]:true};
-        const judgesConfirmed=["J1","J2","J3"].filter(id=>confirmed[id]).length;
-        const shouldArchive=judgesConfirmed>=3;
+        const totalJudges=(prev.judges||[]).length||3;
+        const judgesConfirmed=(prev.judges||[]).filter(j=>confirmed[j.id]).length;
+        const shouldArchive=totalJudges>0&&judgesConfirmed>=totalJudges;
         return {...prev, pdfConfirmed:confirmed, phase:shouldArchive?"archived":prev.phase};
       });
     });
@@ -824,7 +1150,7 @@ function App() {
   const nextCfg=cfg?.next?STAGES[cfg.next]:null;
   const shareUrl=roomId?getShareUrl(roomId):"";
   const qrUrl=roomId?"https://api.qrserver.com/v1/create-qr-code/?size=180x180&data="+encodeURIComponent(shareUrl)+"&color=E8EDF8&bgcolor=162038":"";
-  const confirmedCount=["J1","J2","J3"].filter(id=>gs?.pdfConfirmed?.[id]).length;
+  const confirmedCount=(gs?.judges||[]).filter(j=>gs?.pdfConfirmed?.[j.id]).length;
   const allConfirmed=confirmedCount>=4;
 
   /* ── DISPUTE MODAL ── */
@@ -883,6 +1209,108 @@ function App() {
   ══════════════════════════════════════ */
 
   /* INIT spinner */
+  /* ── ADMIN MODAL OVERLAY ── */
+  const AdminModal = showAdmin && (
+    <div className="overlay" style={{zIndex:500,alignItems:"flex-start",paddingTop:40}} onClick={()=>setShowAdmin(false)}>
+      <div className="card" style={{width:"100%",maxWidth:520,maxHeight:"88vh",overflowY:"auto",display:"flex",flexDirection:"column",gap:14}} onClick={e=>e.stopPropagation()}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+          <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.5rem",fontWeight:700}}>
+            {adminView==="login"?"🔐 Acceso":"👑 Panel de Administración"}
+          </h2>
+          <button className="btn btn-ghost" style={{padding:"4px 10px",fontSize:".76rem"}} onClick={()=>setShowAdmin(false)}>✕</button>
+        </div>
+
+        {/* ── LOGIN VIEW ── */}
+        {adminView==="login" && (
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            {/* Google login for master */}
+            <div style={{borderBottom:"1px solid rgba(255,255,255,.08)",paddingBottom:14}}>
+              <p style={{color:"#4B5A78",fontSize:".78rem",marginBottom:10}}>Si eres el <strong style={{color:"#E8A200"}}>usuario maestro</strong>, inicia sesión con tu cuenta de Google:</p>
+              <button className="btn" style={{width:"100%",padding:12,background:"#fff",color:"#111",gap:10,fontSize:".9rem"}} disabled={adminBusy} onClick={doGoogleLogin}>
+                <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+                {adminBusy?"Conectando...":"Iniciar sesión con Google"}
+              </button>
+            </div>
+            {/* Operator login */}
+            <p style={{color:"#4B5A78",fontSize:".78rem",marginTop:2}}>O si eres un <strong style={{color:"#a78bfa"}}>usuario operador</strong>:</p>
+            <input className="field" placeholder="Nombre de usuario" value={operLogin.username} onChange={e=>setOperLogin(p=>({...p,username:e.target.value}))} style={{fontSize:".88rem"}}/>
+            <input className="field" placeholder="Contraseña" type="password" value={operLogin.password} onChange={e=>setOperLogin(p=>({...p,password:e.target.value}))}
+              onKeyDown={e=>e.key==="Enter"&&doOperatorLogin()} style={{fontSize:".88rem"}}/>
+            <button className="btn btn-gold" style={{width:"100%"}} disabled={adminBusy||!operLogin.username||!operLogin.password} onClick={doOperatorLogin}>
+              {adminBusy?"Verificando...":"Entrar como Operador"}
+            </button>
+            {adminStatus && <p style={{color:adminStatus.startsWith("✅")?"#22c55e":"#f87171",fontSize:".82rem"}}>{adminStatus}</p>}
+          </div>
+        )}
+
+        {/* ── DASHBOARD VIEW (master only) ── */}
+        {adminView==="dashboard" && adminUser?.type==="master" && (
+          <div style={{display:"flex",flexDirection:"column",gap:14}}>
+            <div style={{padding:"8px 12px",background:"rgba(232,162,0,.1)",border:"1px solid rgba(232,162,0,.25)",borderRadius:10}}>
+              <p style={{color:"#E8A200",fontSize:".78rem",fontWeight:700}}>👑 Maestro: {adminUser.email}</p>
+            </div>
+
+            {/* Create new user */}
+            <div style={{borderBottom:"1px solid rgba(255,255,255,.08)",paddingBottom:14}}>
+              <p style={{color:"#6B7FA3",fontSize:".72rem",fontWeight:700,letterSpacing:".05em",marginBottom:10}}>➕ CREAR USUARIO OPERADOR</p>
+              <div style={{display:"flex",gap:8,marginBottom:8}}>
+                <input className="field" placeholder="Nombre de usuario (sin espacios)" value={newUserForm.username}
+                  onChange={e=>setNewUserForm(p=>({...p,username:e.target.value.replace(/\s/g,"")}))} style={{flex:2,fontSize:".85rem"}}/>
+                <div style={{flex:1,display:"flex",flexDirection:"column",gap:3}}>
+                  <label style={{color:"#4B5A78",fontSize:".65rem"}}>Límite de salas</label>
+                  <input className="field" type="number" min={1} max={50} value={newUserForm.limit}
+                    onChange={e=>setNewUserForm(p=>({...p,limit:+e.target.value}))} style={{textAlign:"center"}}/>
+                </div>
+              </div>
+              <p style={{color:"#2D3A55",fontSize:".72rem",marginBottom:8}}>Contraseña inicial: <code style={{color:"#a78bfa",background:"rgba(167,139,250,.1)",padding:"1px 6px",borderRadius:4}}>{DEFAULT_PWD}</code></p>
+              <button className="btn btn-gold" style={{width:"100%"}} disabled={adminBusy||!newUserForm.username.trim()} onClick={doCreateAdminUser}>
+                {adminBusy?"Creando...":"Crear Usuario"}
+              </button>
+              {adminStatus && <p style={{color:adminStatus.startsWith("✅")?"#22c55e":"#f87171",fontSize:".8rem",marginTop:6}}>{adminStatus}</p>}
+            </div>
+
+            {/* User list */}
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+              <p style={{color:"#6B7FA3",fontSize:".72rem",fontWeight:700,letterSpacing:".05em"}}>👥 USUARIOS REGISTRADOS ({adminUsers.length})</p>
+              <button className="btn btn-ghost" style={{padding:"3px 10px",fontSize:".68rem"}} onClick={doRefreshUsers}>{adminBusy?"⏳":"🔄 Actualizar"}</button>
+            </div>
+            {adminUsers.length===0&&<p style={{color:"#2D3A55",fontSize:".8rem",textAlign:"center"}}>No hay usuarios creados aún</p>}
+            {adminUsers.map(u=>(
+              <div key={u.username} style={{background:"rgba(255,255,255,.04)",borderRadius:10,padding:"10px 13px",border:"1px solid rgba(255,255,255,.07)"}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6,flexWrap:"wrap"}}>
+                  <span style={{fontWeight:700,color:u.active?"#E8EDF8":"#3B4B6A",flex:1}}>{u.username}</span>
+                  <span style={{fontSize:".72rem",padding:"2px 8px",borderRadius:10,background:u.active?"rgba(34,197,94,.15)":"rgba(239,68,68,.1)",color:u.active?"#22c55e":"#f87171",border:"1px solid "+(u.active?"rgba(34,197,94,.3)":"rgba(239,68,68,.25)")}}>
+                    {u.active?"Activo":"Desactivado"}
+                  </span>
+                  <span style={{fontSize:".72rem",color:"#4B5A78"}}>
+                    {u.activeRooms}/{u.roomLimit} salas
+                  </span>
+                </div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  <button className="btn btn-ghost" style={{padding:"4px 10px",fontSize:".72rem",color:"#f59e0b",borderColor:"rgba(245,158,11,.3)"}}
+                    onClick={()=>doResetPwd(u.username)}>🔑 Resetear contraseña</button>
+                  <div style={{display:"flex",alignItems:"center",gap:4}}>
+                    <span style={{color:"#4B5A78",fontSize:".72rem"}}>Límite:</span>
+                    <input type="number" min={1} max={50} defaultValue={u.roomLimit}
+                      onBlur={e=>doSetLimit(u.username,e.target.value)}
+                      style={{width:46,background:"rgba(255,255,255,.06)",border:"1px solid rgba(255,255,255,.1)",borderRadius:6,padding:"3px 5px",color:"#E8EDF8",fontSize:".78rem",textAlign:"center"}}/>
+                  </div>
+                  <button className="btn btn-ghost" style={{padding:"4px 10px",fontSize:".72rem",color:u.active?"#ef4444":"#22c55e",borderColor:u.active?"rgba(239,68,68,.3)":"rgba(34,197,94,.3)"}}
+                    onClick={()=>doToggleUser(u.username,!u.active)}>
+                    {u.active?"⛔ Desactivar":"✅ Activar"}
+                  </button>
+                </div>
+                <p style={{color:"#2D3A55",fontSize:".68rem",marginTop:5}}>
+                  Creado: {new Date(u.createdAt).toLocaleDateString("es-SV")}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
   if (screen==="init") return (
     <div className="sb" style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh"}}>
       <style>{CSS}</style>
@@ -946,6 +1374,7 @@ function App() {
   if (screen==="landing") return (
     <div className="sb" style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:24,gap:28}}>
       <style>{CSS}</style>
+      {AdminModal}
       <div style={{textAlign:"center"}}>
         <div style={{fontSize:"3.5rem",lineHeight:1.1,marginBottom:6}}>🐝</div>
         <h1 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"3rem",fontWeight:700,color:"#E8A200",lineHeight:1}}>Spelling Bee</h1>
@@ -972,6 +1401,23 @@ function App() {
           ⚠️ Firebase no configurado — edita index.html con tus credenciales (ver SETUP.md)
         </div>
       )}
+
+      {/* Admin status + button */}
+      <div style={{display:"flex",alignItems:"center",gap:10,marginTop:4}}>
+        {adminUser ? (
+          <div style={{display:"flex",alignItems:"center",gap:8,padding:"5px 12px",background:"rgba(34,197,94,.1)",border:"1px solid rgba(34,197,94,.25)",borderRadius:16}}>
+            <span style={{fontSize:".72rem",color:"#22c55e"}}>
+              {adminUser.type==="master"?"👑 Maestro: "+adminUser.email:"⚙️ "+adminUser.username+" · "+adminUser.activeRooms+"/"+adminUser.roomLimit+" salas"}
+            </span>
+            <button className="btn btn-ghost" style={{padding:"2px 8px",fontSize:".68rem"}} onClick={doAdminLogout}>Salir</button>
+            {adminUser.type==="master" && <button className="btn btn-ghost" style={{padding:"2px 8px",fontSize:".68rem"}} onClick={()=>{setAdminView("dashboard");setShowAdmin(true);}}>Panel</button>}
+          </div>
+        ) : (
+          <button className="btn btn-ghost" style={{padding:"5px 12px",fontSize:".72rem",color:"#4B5A78",borderColor:"rgba(255,255,255,.08)"}} onClick={()=>{setAdminView("login");setShowAdmin(true);}}>
+            🔐 Acceso de operador
+          </button>
+        )}
+      </div>
     </div>
   );
 
@@ -999,7 +1445,7 @@ function App() {
         <p style={{color:"#4B5A78",fontSize:".78rem",marginBottom:12}}>Selecciona el rol que deseas tener. Puedes ser Monitor, o también cualquiera de los jurados.</p>
         <input className="field" placeholder="Tu nombre completo" value={nameIn} onChange={e=>setNameIn(e.target.value)} style={{marginBottom:10}}/>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
-          {[{id:"host",icon:"🎤",l:"Monitor"},{id:"J1",icon:"⚖️",l:"Jurado 1"},{id:"J2",icon:"⚖️",l:"Jurado 2"},{id:"J3",icon:"⚖️",l:"Jurado 3"}].map(r=>(
+          {[{id:"host",icon:"🎤",l:"Monitor"},{id:"judge",icon:"⚖️",l:"Jurado"}].map(r=>(
             <button key={r.id} className="btn" onClick={()=>setRole(r.id)} style={{padding:"10px 8px",fontSize:".82rem",flexDirection:"column",gap:3,background:role===r.id?"#E8A200":"rgba(255,255,255,.05)",color:role===r.id?"#0C1628":"#E8EDF8",border:role===r.id?"none":"1px solid rgba(255,255,255,.1)"}}>
               <span style={{fontSize:"1.1rem"}}>{r.icon}</span><span style={{fontWeight:700}}>{r.l}</span>
             </button>
@@ -1029,14 +1475,48 @@ function App() {
         </div>
         <div>
           <p style={{color:"#6B7FA3",fontSize:".72rem",fontWeight:700,letterSpacing:".06em",marginBottom:7}}>SELECCIONA TU ROL</p>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
-            {[{id:"host",icon:"🎤",l:"Monitor",s:"Deseo ser el Monitor"},{id:"J1",icon:"⚖️",l:"Jurado 1",s:"Deseo ser Jurado 1"},{id:"J2",icon:"⚖️",l:"Jurado 2",s:"Deseo ser Jurado 2"},{id:"J3",icon:"⚖️",l:"Jurado 3",s:"Deseo ser Jurado 3"}].map(r=>(
-              <button key={r.id} className="btn" onClick={()=>setRole(r.id)} style={{flexDirection:"column",gap:4,padding:"14px 10px",fontSize:".82rem",background:role===r.id?"#E8A200":"rgba(255,255,255,.05)",color:role===r.id?"#0C1628":"#E8EDF8",border:role===r.id?"none":"1px solid rgba(255,255,255,.1)"}}>
-                <span style={{fontSize:"1.3rem"}}>{r.icon}</span>
-                <span style={{fontWeight:700}}>{r.l}</span>
-                <span style={{opacity:.65,fontSize:".7rem"}}>{r.s}</span>
-              </button>
-            ))}
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {/* Monitor slot */}
+            {(() => {
+              const hostName=gs?.host?.name;
+              const occupied=!!hostName;
+              return (
+                <button className="btn" onClick={()=>!occupied&&setRole("host")} style={{flexDirection:"row",gap:10,padding:"12px 14px",fontSize:".86rem",background:role==="host"?"#E8A200":occupied?"rgba(255,255,255,.03)":"rgba(255,255,255,.05)",color:role==="host"?"#0C1628":occupied?"#3B4B6A":"#E8EDF8",border:role==="host"?"none":"1px solid rgba(255,255,255,.1)",cursor:occupied?"not-allowed":"pointer",opacity:occupied?0.7:1,justifyContent:"flex-start"}}>
+                  <span style={{fontSize:"1.3rem"}}>🎤</span>
+                  <div style={{textAlign:"left"}}>
+                    <div style={{fontWeight:700}}>Monitor</div>
+                    <div style={{fontSize:".72rem",opacity:.75}}>{occupied?"Ocupado: "+hostName:"Deseo ser el Monitor"}</div>
+                  </div>
+                  {occupied&&<span style={{marginLeft:"auto",fontSize:".68rem",color:"#ef4444",fontWeight:700}}>OCUPADO</span>}
+                </button>
+              );
+            })()}
+            {/* Judge slots */}
+            {(() => {
+              const takenSlots=(gs?.judges||[]).map(j=>({id:j.id,name:j.name}));
+              const availableCount=3-takenSlots.length;
+              return (
+                <button className="btn" onClick={()=>availableCount>0&&setRole("judge")} style={{flexDirection:"row",gap:10,padding:"12px 14px",fontSize:".86rem",background:role==="judge"?"#E8A200":availableCount===0?"rgba(255,255,255,.03)":"rgba(255,255,255,.05)",color:role==="judge"?"#0C1628":availableCount===0?"#3B4B6A":"#E8EDF8",border:role==="judge"?"none":"1px solid rgba(255,255,255,.1)",cursor:availableCount===0?"not-allowed":"pointer",justifyContent:"flex-start",flexDirection:"column",alignItems:"flex-start"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,width:"100%"}}>
+                    <span style={{fontSize:"1.3rem"}}>⚖️</span>
+                    <div style={{textAlign:"left",flex:1}}>
+                      <div style={{fontWeight:700}}>Jurado</div>
+                      <div style={{fontSize:".72rem",opacity:.75}}>{availableCount===0?"No hay lugares disponibles":`${availableCount} lugar${availableCount!==1?"es":""} disponible${availableCount!==1?"s":""}`}</div>
+                    </div>
+                    {availableCount===0&&<span style={{fontSize:".68rem",color:"#ef4444",fontWeight:700}}>LLENO</span>}
+                  </div>
+                  {takenSlots.length>0&&(
+                    <div style={{display:"flex",gap:4,flexWrap:"wrap",marginTop:5,paddingLeft:30}}>
+                      {takenSlots.map(j=>(
+                        <span key={j.id} style={{fontSize:".65rem",background:"rgba(34,197,94,.15)",color:"#22c55e",padding:"1px 7px",borderRadius:10,border:"1px solid rgba(34,197,94,.25)"}}>
+                          ✅ {j.name}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </button>
+              );
+            })()}
           </div>
         </div>
         <button className="btn btn-gold" style={{width:"100%",padding:13}} disabled={!role||!nameIn.trim()} onClick={doLogin}>Entrar al Concurso →</button>
@@ -1108,17 +1588,30 @@ function App() {
               Word: una palabra por línea. Opcional con fonética: <span style={{fontFamily:"monospace",color:"#a78bfa"}}>apple | /ˈæpəl/</span><br/>
               La fonética se genera automáticamente desde dictionaryapi.dev (gratis, sin clave).
             </p>
-            {[{key:"basic",l:"Nivel Básico",icon:"🟢",c:"#22c55e"},{key:"inter",l:"Nivel Intermedio",icon:"🟡",c:"#f59e0b"},{key:"adv",l:"Nivel Avanzado",icon:"🔴",c:"#ef4444"}].map(({key,l,icon,c})=>(
-              <label key={key} className={"upzone "+(files[key]?"ok":"")} style={{marginBottom:8,borderColor:files[key]?c:undefined}}>
-                <input type="file" accept=".docx,.doc" onChange={e=>setFiles(p=>({...p,[key]:e.target.files[0]||null}))}/>
-                <div style={{display:"flex",alignItems:"center",gap:10}}>
-                  <span style={{fontSize:"1.3rem"}}>{icon}</span>
-                  <div>
-                    <div style={{color:files[key]?"#22c55e":"#E8EDF8",fontWeight:600,fontSize:".88rem"}}>{l}</div>
-                    <div style={{color:"#4B5A78",fontSize:".74rem"}}>{files[key]?"✓ "+files[key].name:"Click para subir (.docx)"}</div>
+            {[{key:"basic",l:"Level Basic",icon:"🟢",c:"#22c55e"},{key:"inter",l:"Level Intermediate",icon:"🟡",c:"#f59e0b"},{key:"adv",l:"Level Advanced",icon:"🔴",c:"#ef4444"}].map(({key,l,icon,c})=>(
+              <div key={key} style={{marginBottom:10,border:"1px solid rgba(255,255,255,.08)",borderRadius:10,overflow:"hidden"}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,padding:"7px 12px",background:"rgba(255,255,255,.03)"}}>
+                  <span style={{fontSize:"1.2rem"}}>{icon}</span>
+                  <span style={{fontWeight:700,fontSize:".85rem",color:"#E8EDF8",flex:1}}>{l}</span>
+                  <div style={{display:"flex",gap:4}}>
+                    <button className="btn btn-ghost" style={{padding:"3px 9px",fontSize:".68rem",background:!pasteMode[key]?"rgba(232,162,0,.15)":"rgba(255,255,255,.05)",color:!pasteMode[key]?"#E8A200":"#4B5A78",borderColor:!pasteMode[key]?"rgba(232,162,0,.35)":"rgba(255,255,255,.1)"}} onClick={()=>setPasteMode(p=>({...p,[key]:false}))}>📂 Archivo</button>
+                    <button className="btn btn-ghost" style={{padding:"3px 9px",fontSize:".68rem",background:pasteMode[key]?"rgba(232,162,0,.15)":"rgba(255,255,255,.05)",color:pasteMode[key]?"#E8A200":"#4B5A78",borderColor:pasteMode[key]?"rgba(232,162,0,.35)":"rgba(255,255,255,.1)"}} onClick={()=>setPasteMode(p=>({...p,[key]:true}))}>📋 Pegar</button>
                   </div>
                 </div>
-              </label>
+                {!pasteMode[key] ? (
+                  <label className={"upzone "+(files[key]?"ok":"")} style={{borderRadius:0,border:"none",borderTop:"1px solid rgba(255,255,255,.06)",margin:0,borderColor:files[key]?c:undefined}}>
+                    <input type="file" accept=".docx,.doc,.pdf" onChange={e=>setFiles(p=>({...p,[key]:e.target.files[0]||null}))}/>
+                    <div style={{display:"flex",alignItems:"center",gap:10,padding:"6px 0"}}>
+                      <div style={{color:files[key]?"#22c55e":"#4B5A78",fontSize:".78rem"}}>{files[key]?"✓ "+files[key].name:"Word (.docx) o PDF — una palabra por línea, o pégalo"}</div>
+                    </div>
+                  </label>
+                ) : (
+                  <textarea className="field" rows={5} placeholder={"above
+account
+actually | /ˈæktʃuəli/
+..."} value={pasteTexts[key]} onChange={e=>setPasteTexts(p=>({...p,[key]:e.target.value}))} style={{borderRadius:0,border:"none",borderTop:"1px solid rgba(255,255,255,.06)",width:"100%",resize:"vertical",fontSize:".84rem"}}/>
+                )}
+              </div>
             ))}
             {progress && (
               <div style={{margin:"10px 0",padding:"10px 14px",background:"rgba(167,139,250,.1)",border:"1px solid rgba(167,139,250,.3)",borderRadius:10}}>
@@ -1162,28 +1655,77 @@ function App() {
       {tab==="contestants" && (
         <div className="fade-up">
           <div className="card" style={{marginBottom:12}}>
-            <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:14}}>🏆 LISTA DE CONCURSANTES</p>
-            <label className={"upzone "+(files.pax?"ok":"")} style={{display:"block",marginBottom:10}}>
-              <input type="file" accept=".docx,.doc" onChange={e=>setFiles(p=>({...p,pax:e.target.files[0]||null}))}/>
-              <div style={{display:"flex",alignItems:"center",gap:10}}>
-                <span style={{fontSize:"1.3rem"}}>📋</span>
-                <div>
-                  <div style={{color:files.pax?"#22c55e":"#E8EDF8",fontWeight:600,fontSize:".88rem"}}>Lista de Concursantes</div>
-                  <div style={{color:"#4B5A78",fontSize:".74rem"}}>{files.pax?"✓ "+files.pax.name:"Un nombre por línea, en orden de participación"}</div>
-                </div>
-              </div>
-            </label>
-            <button className="btn btn-ghost" style={{width:"100%"}} disabled={busy||!files.pax} onClick={doLoadContestants}>{busy?"⏳ Cargando...":"📥 Cargar Lista"}</button>
+            <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:10}}>🏆 LISTA DE CONCURSANTES</p>
+            <div style={{display:"flex",gap:6,marginBottom:10}}>
+              <button className="btn btn-ghost" style={{flex:1,padding:"7px 10px",fontSize:".76rem",background:!pasteMode.pax?"rgba(232,162,0,.15)":"rgba(255,255,255,.05)",color:!pasteMode.pax?"#E8A200":"#4B5A78",borderColor:!pasteMode.pax?"rgba(232,162,0,.35)":"rgba(255,255,255,.1)"}} onClick={()=>setPasteMode(p=>({...p,pax:false}))}>📂 Subir archivo</button>
+              <button className="btn btn-ghost" style={{flex:1,padding:"7px 10px",fontSize:".76rem",background:pasteMode.pax?"rgba(232,162,0,.15)":"rgba(255,255,255,.05)",color:pasteMode.pax?"#E8A200":"#4B5A78",borderColor:pasteMode.pax?"rgba(232,162,0,.35)":"rgba(255,255,255,.1)"}} onClick={()=>setPasteMode(p=>({...p,pax:true}))}>📋 Pegar texto</button>
+            </div>
+            {!pasteMode.pax ? (
+              <>
+                <label className={"upzone "+(files.pax?"ok":"")} style={{display:"block",marginBottom:8}}>
+                  <input type="file" accept=".docx,.doc,.pdf" onChange={e=>setFiles(p=>({...p,pax:e.target.files[0]||null}))}/>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    <span style={{fontSize:"1.3rem"}}>📋</span>
+                    <div>
+                      <div style={{color:files.pax?"#22c55e":"#E8EDF8",fontWeight:600,fontSize:".88rem"}}>Lista de Concursantes</div>
+                      <div style={{color:"#4B5A78",fontSize:".74rem"}}>{files.pax?"✓ "+files.pax.name:"Word (.docx) o PDF — un nombre por línea"}</div>
+                    </div>
+                  </div>
+                </label>
+                <button className="btn btn-ghost" style={{width:"100%"}} disabled={busy||!files.pax} onClick={doLoadContestants}>{busy?"⏳ Cargando...":"📥 Cargar Lista"}</button>
+              </>
+            ) : (
+              <>
+                <textarea className="field" rows={8} placeholder={"1. Carlos Ernesto Martínez\n2. Ana Sofía Rivas\n3. José Daniel Portillo\n..."} value={pasteTexts.pax} onChange={e=>setPasteTexts(p=>({...p,pax:e.target.value}))} style={{resize:"vertical",fontFamily:"inherit",marginBottom:8}}/>
+                <button className="btn btn-ghost" style={{width:"100%"}} disabled={busy||!pasteTexts.pax.trim()} onClick={doLoadContestants}>{busy?"⏳ Procesando...":"📥 Cargar desde texto"}</button>
+              </>
+            )}
+
+            {/* Participant list with edit/delete/add */}
             {gs?.contestants?.length>0 && (
-              <div style={{marginTop:12,display:"flex",flexWrap:"wrap",gap:5}}>
-                {gs.contestants.map((c,i)=>(
-                  <span key={c.id} style={{background:"rgba(232,162,0,.12)",border:"1px solid rgba(232,162,0,.25)",borderRadius:16,padding:"3px 10px",fontSize:".74rem",color:"#E8A200"}}>{i+1}. {c.name}</span>
-                ))}
+              <div style={{marginTop:14}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                  <p style={{color:"#4B5A78",fontSize:".72rem",fontWeight:700,letterSpacing:".05em"}}>{gs.contestants.length} CONCURSANTES {gs.contestantsConfirmed?"✅ CONFIRMADOS":"— SIN CONFIRMAR"}</p>
+                  {gs.contestantsConfirmed && <button className="btn btn-ghost" style={{padding:"3px 10px",fontSize:".72rem"}} onClick={()=>upd(prev=>({...prev,contestantsConfirmed:false}))}>✏️ Editar</button>}
+                </div>
+                <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:240,overflowY:"auto"}}>
+                  {gs.contestants.map((c,i)=>(
+                    <div key={c.id} style={{display:"flex",alignItems:"center",gap:7,padding:"6px 10px",background:"rgba(255,255,255,.04)",borderRadius:8}}>
+                      <span style={{color:"#4B5A78",fontSize:".72rem",width:20,textAlign:"right",flexShrink:0}}>{i+1}</span>
+                      {!gs.contestantsConfirmed ? (
+                        <>
+                          <input className="field" value={c.name} onChange={e=>doEditContestant(c.id,e.target.value)} style={{flex:1,padding:"4px 8px",fontSize:".84rem"}}/>
+                          <button style={{background:"none",border:"none",cursor:"pointer",color:"#ef4444",fontSize:"1rem",padding:"2px 4px"}} onClick={()=>doRemoveContestant(c.id)} title="Eliminar">✕</button>
+                        </>
+                      ) : (
+                        <span style={{flex:1,fontSize:".88rem",color:"#E8EDF8"}}>{c.name}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                {!gs.contestantsConfirmed && (
+                  <div style={{marginTop:8,display:"flex",gap:8}}>
+                    <input className="field" id="newNameInput" placeholder="Agregar concursante..." style={{flex:1,fontSize:".84rem"}}
+                      onKeyDown={e=>{if(e.key==="Enter"&&e.target.value.trim()){doAddContestant(e.target.value);e.target.value="";}}}/>
+                    <button className="btn btn-ghost" style={{padding:"8px 12px",fontSize:".82rem"}}
+                      onClick={()=>{const el=document.getElementById("newNameInput");if(el&&el.value.trim()){doAddContestant(el.value);el.value="";}}}
+                    >+ Agregar</button>
+                  </div>
+                )}
+                {!gs.contestantsConfirmed && (
+                  <button className="btn btn-green" style={{width:"100%",marginTop:10}} onClick={doConfirmContestants}>
+                    ✅ Confirmar Lista de Participantes
+                  </button>
+                )}
               </div>
             )}
           </div>
           {status && <div style={{padding:"9px 13px",background:"rgba(255,255,255,.05)",borderRadius:10,color:"#E8EDF8",fontSize:".83rem",marginBottom:12}}>{status}</div>}
-          <button className="btn btn-gold" style={{width:"100%",padding:14,fontSize:"1rem"}} disabled={!gs?.contestants?.length||!gs?.banks?.basic?.length} onClick={doStart}>🚀 Iniciar Concurso</button>
+          <button className="btn btn-gold" style={{width:"100%",padding:14,fontSize:"1rem"}}
+            disabled={!gs?.contestants?.length||!gs?.banks?.basic?.length||!gs?.contestantsConfirmed}
+            onClick={doStart}>
+            {!gs?.contestantsConfirmed?"⚠️ Confirma la lista antes de iniciar":"🚀 Iniciar Concurso"}
+          </button>
         </div>
       )}
     </div>
@@ -1198,7 +1740,7 @@ function App() {
       {gs?.institution && <p style={{color:"#4B5A78"}}>{gs.institution}{gs?.level?" · "+gs.level:""}</p>}
       <div className="card" style={{textAlign:"center"}}>
         <p style={{color:"#4B5A78",fontSize:".76rem",fontWeight:700,letterSpacing:".05em",marginBottom:4}}>CONECTADO COMO</p>
-        <p style={{color:"#E8A200",fontSize:"1.15rem",fontWeight:700}}>{gs?.judges?.find(jj=>jj.id===role)?.name||gs?.host?.name||role}</p>
+        <p style={{color:"#E8A200",fontSize:"1.15rem",fontWeight:700}}>{gs?.judges?.find(jj=>jj.id===role)?.name||(role==="host"?gs?.host?.name:null)||nameIn||role}</p>
         <p style={{color:"#2D3A55",fontSize:".72rem",marginTop:4}}>🟢 Firebase · Sala {roomId}</p>
       </div>
     </div>
@@ -1236,7 +1778,7 @@ function App() {
                 Descarga tu acta PDF, guárdala o imprímela. Una vez que los 3 jurados confirmen, la sala se cierra automáticamente.
               </p>
               <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:4}}>
-                {["J1","J2","J3"].map(id=>(
+                {(gs?.judges||[]).map(j=>j.id).map(id=>(
                   <span key={id} style={{fontSize:".74rem",padding:"3px 10px",borderRadius:12,
                     background:gs?.pdfConfirmed?.[id]?"rgba(34,197,94,.15)":"rgba(255,255,255,.06)",
                     color:gs?.pdfConfirmed?.[id]?"#22c55e":"#4B5A78",
@@ -1252,7 +1794,7 @@ function App() {
               ) : (
                 <div style={{textAlign:"center",padding:"8px 0"}}>
                   <p style={{color:"#22c55e",fontSize:".84rem",marginBottom:6}}>✅ Tu acta fue confirmada.</p>
-                  {!allDone && <p style={{color:"#4B5A78",fontSize:".76rem"}}>Esperando a los demás jurados ({confirmedCount}/3)...</p>}
+                  {!allDone && <p style={{color:"#4B5A78",fontSize:".76rem"}}>Esperando a los demás jurados ({confirmedCount}/{judgeCount})...</p>}
                   {allDone && <p style={{color:"#22c55e",fontSize:".84rem",fontWeight:700}}>✅ Todos confirmaron — cerrando sala...</p>}
                 </div>
               )}
@@ -1297,7 +1839,7 @@ function App() {
           </span>
           {isHost&&<span style={{fontSize:".68rem",color:"#2D3A55",marginLeft:8}}>{active.length} activos</span>}
         </div>
-        <div style={{color:"#4B5A78",fontSize:".76rem"}}>{isHost?"🎤 Monitor":gs.judges.find(jj=>jj.id===role)?.name||role}</div>
+        <div style={{color:"#4B5A78",fontSize:".76rem"}}>{isHost?"🎤 Monitor":gs.judges.find(jj=>jj.id===role)?.name||"Jurado"}</div>
       </div>
 
       {/* Dispute indicator */}
