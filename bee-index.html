@@ -1,0 +1,1549 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>Spelling Bee — Sistema de Concurso</title>
+  <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-database-compat.js"></script>
+  <style>body{margin:0;padding:0;background:#0C1628;}</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- =========================================================
+     FIREBASE CONFIG — reemplaza con los datos de tu proyecto
+     console.firebase.google.com → ⚙ Configuración → App web
+========================================================= -->
+<script>
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyDL6D10omw_PWdHGYbVmHyn0912pHWCgtI",
+  authDomain: "spelling-bee-portillo.firebaseapp.com",
+  databaseURL: "https://spelling-bee-portillo-default-rtdb.firebaseio.com",
+  projectId: "spelling-bee-portillo",
+  storageBucket: "spelling-bee-portillo.firebasestorage.app",
+  messagingSenderId: "77310918785",
+  appId: "1:77310918785:web:a107af7e10c538abc08d80"
+};
+window.FIREBASE_OK = false;
+try {
+  if (FIREBASE_CONFIG.apiKey !== "REEMPLAZA_CON_TU_API_KEY") {
+    firebase.initializeApp(FIREBASE_CONFIG);
+    window.rtdb = firebase.database();
+    window.FIREBASE_OK = true;
+  }
+} catch(e) { console.error("Firebase:", e); }
+</script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ── ROOM UTILS ── */
+function generateRoomId(inst) {
+  const pre = inst.replace(/[^a-zA-Z0-9]/g,"").toUpperCase().slice(0,6).padEnd(2,"X");
+  const suf = Math.random().toString(36).substring(2,6).toUpperCase();
+  return pre + "-" + suf;
+}
+function getShareUrl(roomId) {
+  return window.location.origin + window.location.pathname + "?room=" + roomId;
+}
+
+/* ── STAGE CONFIG ── */
+const STAGES = {
+  basic:        { label:"Básica",     color:"#22c55e", bank:"basic",        next:"intermediate", wpr:3 },
+  intermediate: { label:"Intermedia", color:"#f59e0b", bank:"intermediate", next:"advanced",     wpr:3 },
+  advanced:     { label:"Avanzada",   color:"#ef4444", bank:"advanced",     next:"tiebreaker",   wpr:3 },
+  tiebreaker:   { label:"Desempate",  color:"#a78bfa", bank:"advanced",     next:null,           wpr:1 },
+};
+
+/* ── INITIAL STATE ── */
+function initState() {
+  return {
+    phase:"setup", host:{name:"Monitor",ts:0},
+    judges:[{id:"J1",name:"",order:1},{id:"J2",name:"",order:2},{id:"J3",name:"",order:3}],
+    contestants:[], banks:{basic:[],intermediate:[],advanced:[]},
+    usedWords:{basic:[],intermediate:[],advanced:[]},
+    stage:"basic", cIdx:0, slot:0, activeWord:null, judgment:null,
+    scores:{basic:{},intermediate:{},advanced:{},tiebreaker:{}},
+    history:[], stageComplete:false, advancing:[],
+    tbLen:null, tbRound:0, results:null, setupComplete:false,
+    institution:"", level:"", roomId:"", pdfConfirmed:{},
+  };
+}
+
+/* ── PHONETICS (dictionaryapi.dev — 100% gratis, sin clave) ── */
+async function getPhonetics(words, onProgress) {
+  const map = {};
+  for (let i = 0; i < words.length; i += 5) {
+    const batch = words.slice(i, i+5);
+    await Promise.allSettled(batch.map(async word => {
+      try {
+        const ctrl = new AbortController();
+        setTimeout(() => ctrl.abort(), 5000);
+        const res = await fetch("https://api.dictionaryapi.dev/api/v2/entries/en/" + encodeURIComponent(word), {signal:ctrl.signal});
+        if (res.ok) {
+          const d = await res.json();
+          const ph = d[0]?.phonetic || d[0]?.phonetics?.find(p=>p?.text)?.text || "";
+          if (ph) map[word] = ph;
+        }
+      } catch {}
+    }));
+    if (onProgress) onProgress(Math.min(i+5, words.length), words.length);
+    if (i+5 < words.length) await new Promise(r => setTimeout(r, 180));
+  }
+  return map;
+}
+
+/* ── DOCUMENT PARSING ── */
+async function parseWordDoc(file) {
+  return new Promise(resolve => {
+    const fr = new FileReader();
+    fr.onload = async e => {
+      try {
+        const {value} = await window.mammoth.extractRawText({arrayBuffer:e.target.result});
+        const entries=[], seen=new Set();
+        for (const rawLine of value.split(/[\r\n]+/)) {
+          const line = rawLine.trim(); if (!line) continue;
+          let matched = false;
+          for (const sep of [" | "," - ","\t"]) {
+            const idx = line.indexOf(sep);
+            if (idx>0) {
+              const w=line.slice(0,idx).trim().toLowerCase();
+              const ph=line.slice(idx+sep.length).trim();
+              if (/^[a-z][a-z'-]*$/.test(w)&&!seen.has(w)) { entries.push({word:w,phonetic:ph}); seen.add(w); matched=true; break; }
+            }
+          }
+          if (!matched) {
+            for (const part of line.split(",")) {
+              const w=part.trim().toLowerCase();
+              if (w.length>1&&/^[a-z][a-z'-]*$/.test(w)&&!seen.has(w)) { entries.push({word:w,phonetic:""}); seen.add(w); }
+            }
+          }
+        }
+        resolve(entries);
+      } catch { resolve([]); }
+    };
+    fr.readAsArrayBuffer(file);
+  });
+}
+
+async function parseNamesDoc(file) {
+  return new Promise(resolve => {
+    const fr = new FileReader();
+    fr.onload = async e => {
+      try {
+        const {value} = await window.mammoth.extractRawText({arrayBuffer:e.target.result});
+        resolve(value.split(/[\r\n]+/).map(l=>l.replace(/^\d+[\.\)\-]\s*/,"").trim()).filter(n=>n.length>1&&n.length<80));
+      } catch { resolve([]); }
+    };
+    fr.readAsArrayBuffer(file);
+  });
+}
+
+/* ── GAME UTILITIES ── */
+function pickWord(bank, used, len) {
+  let pool = bank.filter(w=>!used.includes(w.word));
+  if (len) pool = pool.filter(w=>w.word.length===len);
+  if (!pool.length&&len) pool = bank.filter(w=>!used.includes(w.word));
+  if (!pool.length) return null;
+  return pool[Math.floor(Math.random()*pool.length)];
+}
+function computeVerdict(j) {
+  if (!j) return null;
+  // If discrepancy was resolved, use the agreed final
+  if (j.phase==="agreed" && j.final) {
+    const f=j.final;
+    if (f.override!==null&&f.override!==undefined) return f.override;
+    if (f.err) return "incorrect";
+    if (f.start&&f.end) return "correct";
+    return "incorrect";
+  }
+  // Otherwise use the shared live evaluation
+  const s=j.shared||j;
+  if (s.override!==null&&s.override!==undefined) return s.override;
+  if (s.err) return "incorrect";
+  if (s.start&&s.end) return "correct";
+  return null;
+}
+function judgeVoteVerdict(v) {
+  if (!v) return null;
+  if (v.err) return "incorrect";
+  if (v.start&&v.end) return "correct";
+  return null;
+}
+function detectDiscrepancy(j) {
+  if (!j?.votes) return false;
+  const vArr = Object.values(j.votes);
+  if (vArr.length < 2) return false;
+  const verdicts = vArr.map(v => judgeVoteVerdict(v));
+  return verdicts.some(v => v !== verdicts[0]);
+}
+function getScore(scores, stage, cId) {
+  if (stage==="tiebreaker") {
+    const r=scores.tiebreaker?.[cId]?.rounds||[];
+    return {correct:r.filter(x=>x==="correct").length,total:r.length,words:r};
+  }
+  const v=scores[stage]?.[cId]?.v||[];
+  return {correct:v.filter(x=>x==="correct").length,total:v.length,words:v};
+}
+function rankActive(contestants, scores, stage) {
+  return contestants.filter(c=>c.active)
+    .map(c=>({...c,...getScore(scores,stage,c.id)}))
+    .sort((a,b)=>b.correct-a.correct||a.name.localeCompare(b.name));
+}
+function canResolveTop3(r) {
+  if (!r.length) return false;
+  if (r.length<=2) return true;
+  return r[0].correct!==r[1].correct && r[1].correct!==r[2].correct;
+}
+function reasonText(reasons, result) {
+  if (result==="correct") return "Correcta";
+  if (!reasons) return "Incorrecto";
+  if (reasons.override==="correct")   return "Correcto por consenso de jurados";
+  if (reasons.override==="incorrect") return "Incorrecto por consenso de jurados";
+  const issues=[];
+  if (!reasons.start) issues.push("No pronunció al inicio");
+  if (!reasons.end)   issues.push("No pronunció al final");
+  if (reasons.err) issues.push((reasons.err.type==="skipped"?"Omitió":"Deletreó mal")+" la letra «"+reasons.err.letter.toUpperCase()+"»");
+  return issues.length ? issues.join("; ") : "Incorrecto";
+}
+
+/* ── PDF REPORT v4 — Landscape oficio, 2-section layout ── */
+function printReport(gs, role, onDone) {
+  const judge = role==="host" ? gs.host : gs.judges.find(j=>j.id===role);
+  const name = judge?.name || role;
+  const roleLabel = role==="host" ? "Monitor / Host" : "Judge "+role.replace("J","")+", Order "+judge?.order;
+  const date = new Date().toLocaleDateString("en-US",{year:"numeric",month:"long",day:"numeric"});
+  const getC = id => gs.contestants.find(c=>c.id===id);
+
+  /* ── Placement map ── */
+  const placeMap = {};
+  if (gs.results) {
+    if (gs.results.first)  placeMap[gs.results.first]  = { label:"1st Place", emoji:"&#127945;" };
+    if (gs.results.second) placeMap[gs.results.second] = { label:"2nd Place", emoji:"&#129352;" };
+    if (gs.results.third)  placeMap[gs.results.third]  = { label:"3rd Place", emoji:"&#129353;" };
+  }
+
+  const hasTb = gs.history.some(h=>h.stage==="tiebreaker");
+  const allC  = gs.contestants||[];
+
+  /* ── Result cell for summary table ── */
+  function resCell(cId, stage, slot) {
+    const e = gs.history.filter(h=>h.cId===cId&&h.stage===stage)[slot];
+    if (!e) return '<td class="rc nd" style="font-size:5.5pt">&ndash;</td>';
+    return e.result==="correct"
+      ? '<td class="rc ok">&#10003;</td>'
+      : '<td class="rc fail">&#10007;</td>';
+  }
+
+  /* ── Reason text (English) ── */
+  function reasonEn(r, result) {
+    if (result==="correct") return "Correct";
+    if (!r) return "Incorrect";
+    if (r.override==="correct")   return "Correct — judges&rsquo; consensus";
+    if (r.override==="incorrect") return "Incorrect — judges&rsquo; consensus";
+    const issues=[];
+    if (!r.start) issues.push("Did not pronounce the word at the start");
+    if (!r.end)   issues.push("Did not pronounce the word at the end");
+    if (r.err) issues.push((r.err.type==="skipped"?"Skipped":"Misspelled")
+      +" letter &laquo;"+r.err.letter.toUpperCase()+"&raquo;");
+    return issues.length ? issues.join("; ") : "Incorrect";
+  }
+
+  /* ── Logo ── */
+  const logoHTML = gs.logoB64
+    ? '<img src="'+gs.logoB64+'" style="position:absolute;top:11mm;left:14mm;width:3cm;height:3cm;object-fit:contain" alt="Logo">'
+    : "";
+  const logoMiniHTML = gs.logoB64
+    ? '<img src="'+gs.logoB64+'" style="width:1.6cm;height:1.6cm;object-fit:contain;vertical-align:middle;margin-right:8px" alt="">'
+    : "";
+  const padL = gs.logoB64 ? "padding-left:3.6cm" : "";
+
+  /* ── SUMMARY ROWS ── */
+  const summaryRows = allC.map((c,i)=>{
+    const plc=placeMap[c.id];
+    const plcBg=plc
+      ?(c.id===gs.results?.first?"background:#fef9c3"
+        :c.id===gs.results?.second?"background:#f1f5f9":"background:#fef3e2"):"";
+    const plcTxt=plc?plc.emoji+"&#8202;"+plc.label:"&mdash;";
+    return '<tr style="'+(i%2?"background:#f9f9f9":"")+'">'
+      +'<td class="rc" style="font-weight:700">'+(i+1)+'</td>'
+      +'<td class="nm">'+c.name+'</td>'
+      +resCell(c.id,"basic",0)+resCell(c.id,"basic",1)+resCell(c.id,"basic",2)
+      +resCell(c.id,"intermediate",0)+resCell(c.id,"intermediate",1)+resCell(c.id,"intermediate",2)
+      +resCell(c.id,"advanced",0)+resCell(c.id,"advanced",1)+resCell(c.id,"advanced",2)
+      +(hasTb?resCell(c.id,"tiebreaker",0)+resCell(c.id,"tiebreaker",1):"")
+      +'<td class="place" style="'+plcBg+'">'+plcTxt+'</td>'
+      +'</tr>';
+  }).join("");
+
+  const tbHdr = hasTb
+    ? '<th colspan="2" style="background:#3a1680;border:.5px solid #555;padding:3px 4px;text-align:center">Break the Tie</th>'
+    : "";
+  const tbSub = hasTb
+    ? '<th class="sh">R1</th><th class="sh">R2</th>'
+    : "";
+
+  /* ── DETAIL BLOCKS (per student, vertical flow) ── */
+  let detailBlocks = "";
+  for (const c of allC) {
+    const ents = gs.history.filter(h=>h.cId===c.id);
+    // Always include ALL contestants, even those with no words recorded
+    const plc=placeMap[c.id];
+    const cor=ents.filter(e=>e.result==="correct").length;
+    const stageName={basic:"Basic",intermediate:"Intermediate",advanced:"Advanced",tiebreaker:"Tie-breaker"};
+    const stageColor={basic:"#16537e",intermediate:"#7a4f00",advanced:"#7a1616",tiebreaker:"#3a1680"};
+    const noHistMsg='<tr><td colspan="5" style="border:.5px solid #ccc;padding:3px 6px;color:#aaa;font-style:italic;text-align:center">No words recorded for this contestant</td></tr>';
+    const rows=ents.length===0?noHistMsg:ents.map(e=>{
+      const ok=e.result==="correct";
+      return '<tr class="'+(ok?"dr-ok":"dr-fail")+'">'
+        +'<td class="dt-stage" style="color:'+stageColor[e.stage]+'">'+stageName[e.stage]+'</td>'
+        +'<td class="dt-word">'+e.word.toUpperCase()+'</td>'
+        +'<td class="dt-ph">'+(e.phonetic||"&mdash;")+'</td>'
+        +'<td class="dt-res" style="color:'+(ok?"#16a34a":"#dc2626")+'">'+(ok?"&#10003;":"&#10007;")+'</td>'
+        +'<td class="dt-obs" style="color:'+(ok?"#16a34a":"#dc2626")+'">'+(ok?"&#10003; ":"&#10007; ")+reasonEn(e.reasons,e.result)+'</td>'
+        +'</tr>';
+    }).join("");
+    detailBlocks+='<div class="sblock">'
+      +'<table class="dt"><thead><tr class="dt-hdr">'
+      +'<th colspan="3" style="text-align:left">'+c.name+'</th>'
+      +'<th colspan="2" style="text-align:right;font-weight:400">'
+        +(ents.length===0?'No words recorded':(cor+'/'+ents.length+' correct'))+(plc?" &nbsp;&bull;&nbsp; "+plc.emoji+" "+plc.label:"")
+      +'</th></tr>'
+      +'<tr class="dt-sub"><th class="dt-stage">Stage</th><th class="dt-word">Word</th><th class="dt-ph">IPA Phonetics</th>'
+      +'<th class="dt-res" style="text-align:center">Result</th><th class="dt-obs">Observation / Reason for Error</th></tr></thead>'
+      +'<tbody>'+rows+'</tbody></table></div>';
+  }
+
+  const css=`
+    @page { size:355.6mm 215.9mm landscape; margin:11mm 14mm 12mm; }
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{font-family:Arial,Helvetica,sans-serif;font-size:7.5pt;color:#111;line-height:1.3;position:relative;}
+    /* ── Summary section ── */
+    .sum-wrap{page-break-after:always;}
+    .hdr{text-align:center;border-bottom:1.5px solid #111;padding-bottom:7px;margin-bottom:7px;}
+    .hdr h1{font-size:11.5pt;font-weight:700;letter-spacing:.02em;margin-bottom:1px;}
+    .hdr .inst{font-size:9.5pt;font-weight:700;color:#222;margin-bottom:1px;}
+    .hdr .sub{font-size:7pt;color:#555;}
+    .meta{display:flex;gap:10px;margin-bottom:7px;font-size:7pt;}
+    .meta-item{background:#f7f7f7;border:.5px solid #ddd;border-radius:2px;padding:3px 7px;}
+    .meta-lbl{color:#888;font-size:5.5pt;font-weight:700;letter-spacing:.05em;text-transform:uppercase;margin-bottom:1px;}
+    /* ── Summary table ── */
+    .stbl{width:100%;border-collapse:collapse;font-size:7pt;table-layout:fixed;}
+    .stbl th{background:#f0f0f0;border:.5px solid #bbb;padding:2.5px 3px;text-align:left;font-size:6.5pt;}
+    .stbl td{border:.5px solid #ccc;padding:2px 3px;vertical-align:middle;}
+    .nm{white-space:normal;word-break:break-word;font-weight:700;line-height:1.25;}
+    .rc{text-align:center;width:9pt;padding:1.5px 0px;font-weight:700;font-size:6.5pt;}
+    .rc.ok{color:#16a34a;}.rc.fail{color:#dc2626;}.rc.nd{color:#ccc;font-size:6pt;}
+    .sh{text-align:center;font-size:5.5pt;width:9pt;padding:1px 0px;}
+    .place{text-align:center;font-size:7pt;font-weight:700;width:46pt;padding:2px 3px;}
+    /* ── Signature (summary page only) ── */
+    .sig-wrap{margin-top:18px;display:flex;justify-content:center;}
+    .sig{width:200pt;text-align:center;}
+    .sig-line{border-top:1px solid #222;margin-top:28px;margin-bottom:3px;}
+    .sig-name{font-size:8pt;font-weight:700;}
+    .sig-role{font-size:6.5pt;color:#555;}
+    /* ── Detail section ── */
+    .detail-wrap{}
+    .mini-hdr{display:flex;align-items:center;justify-content:center;border-bottom:1.5px solid #111;padding-bottom:6px;margin-bottom:8px;}
+    .mini-hdr-text{text-align:center;}
+    .mini-hdr-text h2{font-size:9.5pt;font-weight:700;margin-bottom:1px;}
+    .mini-hdr-text p{font-size:7pt;color:#555;}
+    .det-title{font-size:8pt;font-weight:700;color:#374151;border-left:2.5px solid #374151;padding-left:6px;margin-bottom:7px;}
+    .sblock{page-break-inside:avoid;margin-bottom:10px;}
+    .dt{width:100%;border-collapse:collapse;font-size:7pt;table-layout:fixed;}
+    .dt td,.dt th{border:.5px solid #ccc;padding:2px 4px;vertical-align:middle;}
+    .dt-hdr{background:#1a1a2e;color:#fff;}
+    .dt-hdr th{font-size:7.5pt;border-color:#444;}
+    .dt-sub{background:#eee;font-size:6.5pt;}
+    .dt-sub th{padding:2px 4px;}
+    .dt-stage{width:52pt;color:#555;font-size:6.5pt;}
+    .dt-word{width:70pt;font-weight:700;font-size:8pt;letter-spacing:.05em;}
+    .dt-ph{width:68pt;font-style:italic;color:#555;font-size:7pt;}
+    .dt-res{width:20pt;text-align:center;font-weight:700;}
+    .dt-obs{color:#555;}
+    .dr-ok .dt-obs,.dr-ok .dt-res{color:#16a34a;}
+    .dr-fail{background:#fff9f9;}.dr-fail .dt-obs,.dr-fail .dt-res{color:#dc2626;}
+    .footer{margin-top:8px;font-size:6pt;color:#bbb;text-align:center;border-top:.5px solid #eee;padding-top:3px;}
+  `;
+
+  const html='<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Spelling Bee Evaluation Record</title>'
+    +'<style>'+css+'</style></head><body>'
+    +logoHTML
+
+    /* ── SECTION 1: Summary ── */
+    +'<div class="sum-wrap">'
+    +'<div class="hdr" style="'+padL+'">'
+    +'<h1>&#127829; Spelling Bee &mdash; Official Evaluation Record</h1>'
+    +(gs.institution?'<div class="inst">'+gs.institution+(gs.level?" &bull; "+gs.level:"")+'</div>':"")
+    +'</div>'
+
+    /* meta row */
+    +'<div class="meta">'
+    +'<div class="meta-item"><div class="meta-lbl">Evaluator</div><strong>'+name+'</strong></div>'
+    +'<div class="meta-item"><div class="meta-lbl">Role</div>'+roleLabel+'</div>'
+    +'<div class="meta-item"><div class="meta-lbl">Room</div><strong>'+(gs.roomId||"")+'</strong></div>'
+    +'<div class="meta-item"><div class="meta-lbl">Date</div>'+date+'</div>'
+    +'<div class="meta-item"><div class="meta-lbl">Contestants</div><strong>'+allC.length+'</strong></div>'
+    +'</div>'
+
+    /* summary table */
+    +'<table class="stbl"><thead>'
+    +'<tr style="background:#1a1a2e;color:#fff;">'
+    +'<th style="border:.5px solid #555;padding:3px 3px;width:20pt;text-align:center">No.</th>'
+    +'<th style="border:.5px solid #555;padding:3px 4px;text-align:left">Contestant</th>'
+    +'<th colspan="3" style="border:.5px solid #555;padding:3px 4px;text-align:center;background:#16537e">Round 1 &mdash; Basic</th>'
+    +'<th colspan="3" style="border:.5px solid #555;padding:3px 4px;text-align:center;background:#7a4f00">Round 2 &mdash; Intermediate</th>'
+    +'<th colspan="3" style="border:.5px solid #555;padding:3px 4px;text-align:center;background:#7a1616">Round 3 &mdash; Advanced</th>'
+    +tbHdr
+    +'<th style="border:.5px solid #555;padding:3px 3px;text-align:center;width:46pt">Place</th>'
+    +'</tr>'
+    +'<tr style="background:#eee;">'
+    +'<th class="sh"></th><th class="sh"></th>'
+    +'<th class="sh">W1</th><th class="sh">W2</th><th class="sh">W3</th>'
+    +'<th class="sh">W1</th><th class="sh">W2</th><th class="sh">W3</th>'
+    +'<th class="sh">W1</th><th class="sh">W2</th><th class="sh">W3</th>'
+    +tbSub
+    +'<th class="sh"></th>'
+    +'</tr></thead>'
+    +'<tbody>'+summaryRows+'</tbody></table>'
+
+    /* signature — only judge, no coordinator/director */
+    +'<div class="sig-wrap">'
+    +'<div class="sig"><div class="sig-line"></div>'
+    +'<div class="sig-name">'+name+'</div>'
+    +'<div class="sig-role">'+roleLabel+'</div>'
+    +'</div></div>'
+    +'</div>' /* end sum-wrap */
+
+    /* ── SECTION 2: Detail (new page) ── */
+    +'<div class="detail-wrap">'
+    +'<div class="mini-hdr">'
+    +(gs.logoB64?logoMiniHTML:"")
+    +'<div class="mini-hdr-text">'
+    +'<h2>'+( gs.institution||"Spelling Bee")+(gs.level?" &bull; "+gs.level:"")+'</h2>'
+    +'<p>Detailed Results by Contestant</p>'
+    +'</div></div>'
+    +detailBlocks
+    +'</div>' /* end detail-wrap */
+
+    +'</body></html>';
+
+  const win=window.open("","_blank","width=1300,height=820,menubar=yes");
+  if(!win){alert("Allow pop-ups and try again.");return;}
+  win.document.write(html); win.document.close();
+  win.onload=()=>{setTimeout(()=>{win.print();if(onDone)onDone();},500);};
+}
+
+/* ── CSS ── */
+const CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,600;0,700;1,400;1,600&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap');
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+  body{background:#0C1628;}
+  .sb{min-height:100vh;background:#0C1628;color:#E8EDF8;font-family:'Plus Jakarta Sans',system-ui,sans-serif;font-size:15px;}
+  .word-font{font-family:'Cormorant Garamond',Georgia,serif;font-weight:700;letter-spacing:.14em;}
+  .ph-font{font-family:'Cormorant Garamond',Georgia,serif;font-style:italic;color:#6B7FA3;}
+  .ltr{display:inline-block;padding:2px 3px;border-radius:5px;cursor:pointer;transition:background .1s,color .1s;}
+  .ltr:hover{background:rgba(255,255,255,.13);}
+  .ltr.skip{color:#fbbf24;text-decoration:underline wavy 1.5px;}
+  .ltr.bad{color:#f87171;background:rgba(248,113,113,.2);}
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:10px 20px;border-radius:11px;border:none;cursor:pointer;font-family:inherit;font-size:.88rem;font-weight:600;transition:all .18s;white-space:nowrap;line-height:1;}
+  .btn:disabled{opacity:.35;cursor:not-allowed;pointer-events:none;}
+  .btn-gold{background:#E8A200;color:#0C1628;}.btn-gold:not(:disabled):hover{background:#F5AC00;box-shadow:0 4px 18px rgba(232,162,0,.42);transform:translateY(-1px);}
+  .btn-green{background:#16a34a;color:#fff;}.btn-green:not(:disabled):hover{background:#15803d;}
+  .btn-red{background:#dc2626;color:#fff;}.btn-red:not(:disabled):hover{background:#b91c1c;}
+  .btn-ghost{background:rgba(255,255,255,.07);color:#E8EDF8;border:1px solid rgba(255,255,255,.14);}.btn-ghost:not(:disabled):hover{background:rgba(255,255,255,.12);}
+  .btn-pdf{background:rgba(99,102,241,.18);color:#a5b4fc;border:1px solid rgba(99,102,241,.35);}.btn-pdf:not(:disabled):hover{background:rgba(99,102,241,.3);}
+  .spin-btn{background:linear-gradient(135deg,#E8A200,#FF7700);color:#0C1628;padding:18px 52px;font-size:1.28rem;letter-spacing:.12em;border-radius:16px;box-shadow:0 5px 28px rgba(232,162,0,.45);}
+  .spin-btn:not(:disabled):hover{transform:scale(1.05);}
+  .card{background:#162038;border-radius:16px;border:1px solid rgba(255,255,255,.07);padding:20px;}
+  .check{display:flex;align-items:center;gap:11px;padding:11px 15px;border-radius:10px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);cursor:pointer;user-select:none;transition:all .15s;}
+  .check.on{background:rgba(34,197,94,.14);border-color:rgba(34,197,94,.38);}
+  .check:not(.on):hover{background:rgba(255,255,255,.09);}
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.82);display:flex;align-items:center;justify-content:center;z-index:300;backdrop-filter:blur(6px);padding:16px;}
+  .upzone{border:2px dashed rgba(255,255,255,.18);border-radius:12px;padding:15px;cursor:pointer;transition:border-color .2s;position:relative;display:block;}
+  .upzone:hover{border-color:rgba(232,162,0,.5);}.upzone.ok{border-color:rgba(34,197,94,.6);}
+  .upzone input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;}
+  .field{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:10px 13px;color:#E8EDF8;font-size:.9rem;font-family:inherit;outline:none;width:100%;transition:border-color .15s;}
+  .field:focus{border-color:rgba(232,162,0,.5);}select.field{cursor:pointer;}
+  .word-table{width:100%;border-collapse:collapse;}
+  .word-table th{color:#4B5A78;font-size:.7rem;font-weight:700;letter-spacing:.05em;padding:5px 8px;border-bottom:1px solid rgba(255,255,255,.07);text-align:left;}
+  .word-table td{padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.04);font-size:.84rem;}
+  .word-table input{background:transparent;border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:3px 6px;color:#E8EDF8;font-family:'Cormorant Garamond',serif;font-size:.9rem;font-style:italic;outline:none;width:100%;}
+  .word-table input:focus{border-color:rgba(232,162,0,.5);background:rgba(232,162,0,.05);}
+  .dot{width:11px;height:11px;border-radius:3px;display:inline-block;}
+  @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  @keyframes pop{0%{transform:scale(.88)}55%{transform:scale(1.06)}100%{transform:none}}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  .fade-up{animation:fadeUp .3s ease;}.pop{animation:pop .4s ease;}.pulse{animation:pulse 2s infinite;}
+`;
+
+/* ════════════════════════════════════════════
+   APP
+════════════════════════════════════════════ */
+function App() {
+  const [screen,   setScreen]   = useState("init");
+  const [roomId,   setRoomId]   = useState(null);
+  const [gs,       setGs]       = useState(null);
+  const [role,     setRole]     = useState(null);
+  const [nameIn,   setNameIn]   = useState("");
+  const [inst,     setInst]     = useState("");
+  const [lvl,      setLvl]      = useState("");
+  const [joinCode, setJoinCode] = useState("");
+  const [jNames,   setJNames]   = useState({J1:"",J2:"",J3:""});
+  const [jOrders,  setJOrders]  = useState({J1:1,J2:2,J3:3});
+  const [files,    setFiles]    = useState({basic:null,inter:null,adv:null,pax:null});
+  const [status,   setStatus]   = useState("");
+  const [busy,     setBusy]     = useState(false);
+  const [tab,      setTab]      = useState("judges");
+  const [editBanks,setEditBanks]= useState({basic:[],intermediate:[],advanced:[]});
+  const [progress, setProgress] = useState(null);
+  const [ltrModal, setLtrModal] = useState(null);
+  const [ovrModal, setOvrModal] = useState(false);
+  const [wordKey,  setWordKey]  = useState(0);
+  const [logoB64,  setLogoB64]  = useState("");
+  const [disputeModal, setDisputeModal] = useState(false);
+  const [revealAdvancing, setRevealAdvancing] = useState(false);
+
+  const gsRef     = useRef(gs);     gsRef.current     = gs;
+  const screenRef = useRef(screen); screenRef.current = screen;
+  const roomRef   = useRef(roomId); roomRef.current   = roomId;
+
+  /* Init — read ?room= from URL */
+  useEffect(() => {
+    const room = new URLSearchParams(window.location.search).get("room");
+    if (!room) { setScreen("landing"); return; }
+    setRoomId(room); roomRef.current = room;
+    if (!window.FIREBASE_OK) { setScreen("firebase-error"); return; }
+    setScreen("checking");
+    window.rtdb.ref("spellingbee/rooms/"+room+"/state").once("value").then(snap => {
+      const s = snap.val();
+      if (!s) { setScreen("room-not-found"); return; }
+      if (s.phase==="archived") { setScreen("room-closed"); return; }
+      // Auto-expire after 72 hours of inactivity
+      const last = s.lastActivity || s.expiresAt - 72*3600*1000 || 0;
+      const expired = s.expiresAt ? Date.now() > s.expiresAt : (Date.now() - last > 72*3600*1000);
+      if (expired) {
+        window.rtdb.ref("spellingbee/rooms/"+room+"/state/phase").set("archived");
+        setScreen("room-closed"); return;
+      }
+      setGs(s); setScreen("login");
+    }).catch(() => setScreen("room-not-found"));
+  }, []);
+
+  /* Firebase real-time subscription */
+  useEffect(() => {
+    if (!role||!roomId||!window.FIREBASE_OK) return;
+    const ref = window.rtdb.ref("spellingbee/rooms/"+roomId+"/state");
+    const h = snap => {
+      const data = snap.val(); if (!data) return;
+      setGs(prev => JSON.stringify(prev)===JSON.stringify(data) ? prev : data);
+      const sc = screenRef.current;
+      if (data.phase==="competition" && (sc==="setup"||sc==="setup-wait")) setScreen("competition");
+      if (data.phase==="results" && sc!=="results") setScreen("results");
+    };
+    ref.on("value", h);
+    return () => ref.off("value", h);
+  }, [role, roomId]);
+
+  useEffect(() => { if(gs?.stage||gs?.stageComplete===false) setRevealAdvancing(false); }, [gs?.stage]);
+
+  const upd = useCallback(fn => {
+    setGs(prev => {
+      const base = typeof fn==="function" ? fn(prev||initState()) : fn;
+      const next = {...base, lastActivity:Date.now()};
+      if (roomRef.current && window.FIREBASE_OK)
+        window.rtdb.ref("spellingbee/rooms/"+roomRef.current+"/state").set(next);
+      return next;
+    });
+  }, []);
+
+  /* ── CREATE ROOM ── */
+  const doCreateRoom = async () => {
+    if (!inst.trim()) return;
+    if (!window.FIREBASE_OK) { alert("Configura Firebase primero — ver SETUP.md"); return; }
+    const newId = generateRoomId(inst);
+    const ns = {...initState(), roomId:newId, institution:inst.trim(), level:lvl.trim(), expiresAt:Date.now()+72*3600*1000, lastActivity:Date.now()};
+    await window.rtdb.ref("spellingbee/rooms/"+newId+"/state").set(ns);
+    sessionStorage.setItem("creator-"+newId, "1");
+    window.history.pushState({}, "", window.location.pathname+"?room="+newId);
+    setRoomId(newId); roomRef.current = newId; setGs(ns); setScreen("share-link");
+  };
+
+  const doJoinByCode = () => {
+    const code = joinCode.trim().toUpperCase(); if (!code) return;
+    window.location.href = window.location.pathname+"?room="+code;
+  };
+
+  /* ── LOGIN ── */
+  const doLogin = async () => {
+    if (!role||!nameIn.trim()) return;
+    const snap = await window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").once("value");
+    let s = snap.val() || gs || initState();
+    if (role==="host") s = {...s, host:{name:nameIn.trim(),ts:Date.now()}};
+    else s = {...s, judges:s.judges.map(j=>j.id===role?{...j,name:nameIn.trim(),ts:Date.now()}:j)};
+    window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").set(s); setGs(s);
+    const isCreator = sessionStorage.getItem("creator-"+roomId)==="1";
+    if (isCreator && s.phase==="setup") setScreen("setup");
+    else if (s.phase==="setup") setScreen("setup-wait");
+    else if (s.phase==="competition") setScreen("competition");
+    else setScreen("results");
+  };
+
+  const doLoginCreator = async () => {
+    if (!role||!nameIn.trim()) return;
+    let s = gs || initState();
+    if (role==="host") s = {...s, host:{name:nameIn.trim(),ts:Date.now()}};
+    else s = {...s, judges:s.judges.map(j=>j.id===role?{...j,name:nameIn.trim(),ts:Date.now()}:j)};
+    window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").set(s); setGs(s);
+    setScreen("setup");
+  };
+
+  /* ── SETUP ── */
+  const doLoadBanks = async () => {
+    if (!files.basic&&!files.inter&&!files.adv) { setStatus("⚠ Sube al menos un banco."); return; }
+    setBusy(true); setStatus("📄 Leyendo documentos Word...");
+    try {
+      const [bW,iW,aW] = await Promise.all([
+        files.basic ? parseWordDoc(files.basic) : Promise.resolve([]),
+        files.inter ? parseWordDoc(files.inter) : Promise.resolve([]),
+        files.adv   ? parseWordDoc(files.adv)   : Promise.resolve([]),
+      ]);
+      const need = [...new Set([...bW,...iW,...aW].filter(w=>!w.phonetic).map(w=>w.word))];
+      setStatus("🔤 Generando fonética para "+need.length+" palabras (API gratuita)...");
+      setProgress({done:0, total:need.length||1});
+      const pm = await getPhonetics(need, (done,total) => { setProgress({done,total}); setStatus("🔤 "+done+"/"+total+" palabras procesadas..."); });
+      const fill = arr => arr.map(w=>({...w, phonetic:w.phonetic||pm[w.word]||""}));
+      setEditBanks({basic:fill(bW), intermediate:fill(iW), advanced:fill(aW)});
+      setProgress(null);
+      setStatus("✅ Básico:"+bW.length+" · Intermedio:"+iW.length+" · Avanzado:"+aW.length+" palabras cargadas.");
+      setTab("banks");
+    } catch(e) { setStatus("❌ "+e.message); setProgress(null); }
+    setBusy(false);
+  };
+
+  const doLoadContestants = async () => {
+    if (!files.pax) { setStatus("⚠ Sube el archivo."); return; }
+    setBusy(true);
+    try {
+      const names = await parseNamesDoc(files.pax);
+      upd(prev => ({...prev, contestants:names.map((n,i)=>({id:"C"+(i+1),name:n,active:true}))}));
+      setStatus("✅ "+names.length+" concursantes cargados."); setTab("contestants");
+    } catch { setStatus("❌ Error al leer la lista."); }
+    setBusy(false);
+  };
+
+  const doSaveBanks = () => {
+    upd(prev => ({
+      ...prev,
+      banks:{basic:editBanks.basic, intermediate:editBanks.intermediate, advanced:editBanks.advanced},
+      judges:prev.judges.map(j=>({...j, name:jNames[j.id]||j.name, order:jOrders[j.id]})),
+    }));
+    setStatus("✅ Bancos y jurados guardados.");
+    setTab("contestants");
+  };
+
+  const doStart = () => {
+    upd(prev => ({...prev, phase:"competition", logoB64:logoB64||window._logoB64||"", setupComplete:true, stage:"basic", cIdx:0, slot:0, activeWord:null, judgment:null, stageComplete:false}));
+    setScreen("competition");
+  };
+
+  /* ── GAME ── */
+  const doSpin = () => {
+    const s=gsRef.current; if(!s) return;
+    const active=s.contestants.filter(c=>c.active);
+    const cur=active[s.cIdx]; if(!cur) return;
+    const cfg=STAGES[s.stage];
+    const word=pickWord(s.banks[cfg.bank], s.usedWords[cfg.bank], s.stage==="tiebreaker"?s.tbLen:null);
+    if (!word) { alert("No quedan palabras disponibles en este banco."); return; }
+    setWordKey(k=>k+1);
+    upd(prev=>({
+      ...prev,
+      activeWord:{...word,cId:cur.id},
+      judgment:{start:false,end:false,err:null,override:null},
+      usedWords:{...prev.usedWords,[cfg.bank]:[...prev.usedWords[cfg.bank],word.word]},
+      tbLen:s.stage==="tiebreaker"&&!prev.tbLen ? word.word.length : prev.tbLen,
+    }));
+  };
+
+  const doToggle = f => upd(prev => prev.judgment ? {...prev,judgment:{...prev.judgment,[f]:!prev.judgment[f]}} : prev);
+
+  const doLetterClick = (i,l) => {
+    const j=gsRef.current?.judgment; if(!j) return;
+    if (j.err?.index===i) upd(prev=>({...prev,judgment:{...prev.judgment,err:null}}));
+    else setLtrModal({index:i,letter:l});
+  };
+
+  const doMarkErr = type => {
+    upd(prev=>({...prev,judgment:{...prev.judgment,err:{index:ltrModal.index,letter:ltrModal.letter,type}}}));
+    setLtrModal(null);
+  };
+
+  const doOverride = v => { upd(prev=>({...prev,judgment:{...prev.judgment,override:v}})); setOvrModal(false); };
+
+  /* ── Discrepancy system ── */
+  const doFlagDispute = () => {
+    const s=gsRef.current; if(!s?.activeWord||!s?.judgment) return;
+    const key=s.stage+"-"+s.cIdx+"-"+s.slot;
+    const shared=s.judgment.shared||s.judgment;
+    upd(prev=>({...prev, disputedWords:{...prev.disputedWords,
+      [key]:{word:s.activeWord.word,phonetic:s.activeWord.phonetic,
+        cId:s.contestants.filter(c=>c.active)[s.cIdx]?.id,
+        cName:s.contestants.filter(c=>c.active)[s.cIdx]?.name,
+        stage:s.stage, slot:s.slot,
+        description: "Jurado "+role.replace("J","")+" marca discrepancia",
+        flaggedBy:role,
+        sharedState:{start:shared.start,end:shared.end,err:shared.err},
+        resolved:false, finalResult:null}}}));
+    setDisputeModal(true);
+  };
+  const doResolveDispute = (result, key) => {
+    upd(prev=>{
+      const dw={...prev.disputedWords};
+      if(dw[key]){dw[key]={...dw[key],resolved:true,finalResult:result};}
+      // Also update history if that word was already recorded
+      const h=[...prev.history];
+      const hIdx=h.findIndex(x=>x.stage===prev.stage&&x.cId===dw[key]?.cId&&x.word===dw[key]?.word);
+      if(hIdx>=0){h[hIdx]={...h[hIdx],result,reasons:{...(h[hIdx].reasons),override:result}};}
+      // Update scores too
+      const ns={...prev.scores};
+      if(prev.stage!=="tiebreaker"&&dw[key]){
+        const cId=dw[key].cId, slot=dw[key].slot;
+        const pv=ns[prev.stage]?.[cId]?.v||[];
+        const nv=[...pv]; nv[slot]=result;
+        ns[prev.stage]={...ns[prev.stage],[cId]:{v:nv}};
+      }
+      return {...prev, disputedWords:dw, history:h, scores:ns};
+    });
+  };
+  const doLogoUpload = (file) => {
+    if (!file) return;
+    const fr=new FileReader();
+    fr.onload=e=>{ setLogoB64(e.target.result); window._logoB64=e.target.result; };
+    fr.readAsDataURL(file);
+  };
+  const doNext = () => {
+    const s=gsRef.current; if(!s) return;
+    const active=s.contestants.filter(c=>c.active);
+    const cur=active[s.cIdx]; if(!cur) return;
+    const cfg=STAGES[s.stage];
+    const v=computeVerdict(s.judgment)||"incorrect";
+    let ns={...s.scores};
+    if (s.stage==="tiebreaker") {
+      const pr=s.scores.tiebreaker?.[cur.id]?.rounds||[];
+      ns.tiebreaker={...s.scores.tiebreaker,[cur.id]:{rounds:[...pr,v]}};
+    } else {
+      const pv=s.scores[s.stage]?.[cur.id]?.v||[];
+      const nv=[...pv]; nv[s.slot]=v;
+      ns[s.stage]={...s.scores[s.stage],[cur.id]:{v:nv}};
+    }
+    const hEntry={
+      stage:s.stage, stageLabel:cfg.label,
+      cId:cur.id, cName:cur.name,
+      word:s.activeWord?.word||"", phonetic:s.activeWord?.phonetic||"",
+      result:v,
+      reasons:{start:(s.judgment?.final||s.judgment?.shared||s.judgment)?.start,end:(s.judgment?.final||s.judgment?.shared||s.judgment)?.end,err:(s.judgment?.final||s.judgment?.shared||s.judgment)?.err,override:(s.judgment?.final||s.judgment?.shared||s.judgment)?.override},
+    };
+    const nextSlot=s.slot+1;
+    if (nextSlot<cfg.wpr) {
+      upd(prev=>({...prev,scores:ns,history:[...prev.history,hEntry],activeWord:null,judgment:null,slot:nextSlot}));
+    } else {
+      const nextIdx=s.cIdx+1;
+      if (nextIdx>=active.length) {
+        upd(prev=>({...prev,scores:ns,history:[...prev.history,hEntry],activeWord:null,judgment:null,cIdx:0,slot:0,stageComplete:true}));
+      } else {
+        upd(prev=>({...prev,scores:ns,history:[...prev.history,hEntry],activeWord:null,judgment:null,cIdx:nextIdx,slot:0}));
+      }
+    }
+  };
+
+  const doSubmit = () => {
+    const s=gsRef.current; if(!s) return;
+    const ranked=rankActive(s.contestants.filter(c=>c.active),s.scores,s.stage);
+    let advIds = s.stage==="tiebreaker" ? ranked.map(c=>c.id) : ranked.filter(c=>c.correct>=2).map(c=>c.id);
+    if (advIds.length<2 && ranked.length>=2) advIds=ranked.slice(0,2).map(c=>c.id);
+    if (!advIds.length) advIds=ranked.slice(0,1).map(c=>c.id);
+    upd(prev=>({...prev,advancing:advIds}));
+  };
+
+  const doAdvance = () => {
+    const s=gsRef.current; if(!s) return;
+    const ranked=rankActive(s.contestants.filter(c=>s.advancing.includes(c.id)),s.scores,s.stage);
+    const r3=canResolveTop3(ranked);
+    if (s.stage==="tiebreaker") {
+      if (r3) {
+        upd(prev=>({...prev,phase:"results",results:{first:ranked[0]?.id||null,second:ranked[1]?.id||null,third:ranked[2]?.id||null}}));
+        setScreen("results");
+      } else {
+        upd(prev=>({...prev,cIdx:0,slot:0,activeWord:null,judgment:null,stageComplete:false,advancing:[],tbRound:prev.tbRound+1}));
+      }
+      return;
+    }
+    if (s.stage==="advanced" && (r3||ranked.length<=2)) {
+      upd(prev=>({...prev,phase:"results",results:{first:ranked[0]?.id||null,second:ranked[1]?.id||null,third:ranked[2]?.id||null}}));
+      setScreen("results"); return;
+    }
+    const next=STAGES[s.stage]?.next; if(!next) return;
+    upd(prev=>({
+      ...prev, stage:next,
+      contestants:prev.contestants.map(c=>({...c,active:s.advancing.includes(c.id)})),
+      cIdx:0,slot:0,activeWord:null,judgment:null,stageComplete:false,advancing:[],tbLen:null,tbRound:0,
+    }));
+  };
+
+  const doPrintAndConfirm = () => {
+    printReport(gsRef.current, role, () => {
+      upd(prev=>{
+        const confirmed={...prev.pdfConfirmed,[role]:true};
+        const judgesConfirmed=["J1","J2","J3"].filter(id=>confirmed[id]).length;
+        const shouldArchive=judgesConfirmed>=3;
+        return {...prev, pdfConfirmed:confirmed, phase:shouldArchive?"archived":prev.phase};
+      });
+    });
+  };
+
+  const doArchive = () => {
+    if (!confirm("¿Cerrar definitivamente esta sala? Los nuevos visitantes ya no podrán unirse.")) return;
+    upd(prev=>({...prev,phase:"archived"}));
+  };
+
+  /* ── DERIVED ── */
+  const isHost=role==="host", isJudge=role&&role!=="host";
+  const active=gs?.contestants?.filter(c=>c.active)||[];
+  const cur=active[gs?.cIdx??0];
+  const j=gs?.judgment, aw=gs?.activeWord;
+  const cfg=gs?.stage?STAGES[gs.stage]:null;
+  const stCol=cfg?.color||"#E8A200", wpr=cfg?.wpr??3;
+  const ranked=gs?rankActive(active,gs.scores,gs.stage):[];
+  const verdict=computeVerdict(j);
+  const wColor=verdict==="correct"?"#22c55e":verdict==="incorrect"||j?.err?"#ef4444":"#22c55e";
+  const nextCfg=cfg?.next?STAGES[cfg.next]:null;
+  const shareUrl=roomId?getShareUrl(roomId):"";
+  const qrUrl=roomId?"https://api.qrserver.com/v1/create-qr-code/?size=180x180&data="+encodeURIComponent(shareUrl)+"&color=E8EDF8&bgcolor=162038":"";
+  const confirmedCount=["J1","J2","J3"].filter(id=>gs?.pdfConfirmed?.[id]).length;
+  const allConfirmed=confirmedCount>=4;
+
+  /* ── DISPUTE MODAL ── */
+  const pendingDisputes = Object.entries(gs?.disputedWords||{}).filter(([k,d])=>!d.resolved);
+  const DisputeModal = disputeModal && pendingDisputes.length>0 && (
+    <div className="overlay" onClick={()=>setDisputeModal(false)}>
+      <div className="card" style={{width:"100%",maxWidth:500,display:"flex",flexDirection:"column",gap:12,maxHeight:"80vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+        <h3 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"1.4rem",color:"#fbbf24"}}>⚠️ Discrepancias Pendientes</h3>
+        <p style={{color:"#6B7FA3",fontSize:".8rem"}}>Los siguientes casos requieren deliberación. Seleccionen el resultado acordado:</p>
+        {pendingDisputes.map(([key,d])=>(
+          <div key={key} style={{background:"rgba(251,191,36,.08)",border:"1px solid rgba(251,191,36,.25)",borderRadius:10,padding:12}}>
+            <p style={{color:"#E8EDF8",fontWeight:700,fontSize:".9rem",marginBottom:2}}>{d.word?.toUpperCase()}</p>
+            <p style={{color:"#6B7FA3",fontSize:".78rem",marginBottom:4}}>{d.cName} · Etapa {STAGES[d.stage]?.label} · Palabra {(d.slot||0)+1}</p>
+            <p style={{color:"#fbbf24",fontSize:".74rem",marginBottom:10}}>⚠ {d.description}</p>
+            <div style={{display:"flex",gap:8}}>
+              <button className="btn btn-green" style={{flex:1,padding:10,fontSize:".84rem"}} onClick={()=>{doResolveDispute("correct",key);}}>✅ Correcto</button>
+              <button className="btn btn-red"   style={{flex:1,padding:10,fontSize:".84rem"}} onClick={()=>{doResolveDispute("incorrect",key);}}>❌ Incorrecto</button>
+            </div>
+          </div>
+        ))}
+        <button className="btn btn-ghost" onClick={()=>setDisputeModal(false)}>Cerrar</button>
+      </div>
+    </div>
+  );
+
+  /* ── MODALS ── */
+  const LtrModal = ltrModal && (
+    <div className="overlay" onClick={()=>setLtrModal(null)}>
+      <div className="card" style={{width:"100%",maxWidth:300,display:"flex",flexDirection:"column",gap:10}} onClick={e=>e.stopPropagation()}>
+        <h3 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"1.5rem"}}>
+          Error en «<span style={{color:"#E8A200"}}>{ltrModal.letter.toUpperCase()}</span>»
+        </h3>
+        <p style={{color:"#6B7FA3",fontSize:".82rem"}}>¿Qué error cometió el concursante?</p>
+        <button className="btn" style={{background:"rgba(251,191,36,.15)",color:"#fbbf24",border:"1px solid rgba(251,191,36,.3)",padding:13,width:"100%"}} onClick={()=>doMarkErr("skipped")}>⚡ La omitió / se la saltó</button>
+        <button className="btn" style={{background:"rgba(248,113,113,.15)",color:"#f87171",border:"1px solid rgba(248,113,113,.3)",padding:13,width:"100%"}} onClick={()=>doMarkErr("misspelled")}>❌ La deletreó incorrectamente</button>
+        <button className="btn btn-ghost" onClick={()=>setLtrModal(null)}>Cancelar</button>
+      </div>
+    </div>
+  );
+
+  const OvrModal = ovrModal && (
+    <div className="overlay" onClick={()=>setOvrModal(false)}>
+      <div className="card" style={{width:"100%",maxWidth:300,display:"flex",flexDirection:"column",gap:10}} onClick={e=>e.stopPropagation()}>
+        <h3 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"1.5rem"}}>✏️ Corrección por Consenso</h3>
+        <p style={{color:"#6B7FA3",fontSize:".82rem"}}>Resultado acordado por los jurados:</p>
+        <button className="btn btn-green" style={{padding:13,width:"100%"}} onClick={()=>doOverride("correct")}>✅ Correcto</button>
+        <button className="btn btn-red"   style={{padding:13,width:"100%"}} onClick={()=>doOverride("incorrect")}>❌ Incorrecto</button>
+        {j?.override!=null && <button className="btn btn-ghost" style={{width:"100%"}} onClick={()=>doOverride(null)}>🗑 Quitar corrección</button>}
+        <button className="btn btn-ghost" style={{width:"100%"}} onClick={()=>setOvrModal(false)}>Cancelar</button>
+      </div>
+    </div>
+  );
+
+  /* ══════════════════════════════════════
+     SCREENS
+  ══════════════════════════════════════ */
+
+  /* INIT spinner */
+  if (screen==="init") return (
+    <div className="sb" style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh"}}>
+      <style>{CSS}</style>
+      <p className="pulse" style={{color:"#4B5A78"}}>Iniciando...</p>
+    </div>
+  );
+
+  /* FIREBASE ERROR */
+  if (screen==="firebase-error") return (
+    <div className="sb" style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:20}}>
+      <style>{CSS}</style>
+      <div className="card" style={{maxWidth:500,width:"100%",textAlign:"center"}}>
+        <div style={{fontSize:"3rem",marginBottom:12}}>⚙️</div>
+        <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.6rem",marginBottom:12}}>Configura Firebase primero</h2>
+        <p style={{color:"#6B7FA3",fontSize:".88rem",lineHeight:1.8,marginBottom:16}}>
+          Abre <code style={{background:"rgba(255,255,255,.1)",padding:"2px 6px",borderRadius:4}}>index.html</code> con un editor de texto y reemplaza los valores de <strong style={{color:"#E8EDF8"}}>FIREBASE_CONFIG</strong> con los de tu proyecto.
+        </p>
+        <div style={{background:"rgba(232,162,0,.1)",border:"1px solid rgba(232,162,0,.3)",borderRadius:10,padding:14,fontSize:".82rem",color:"#E8A200"}}>
+          📖 Sigue el archivo <strong>SETUP.md</strong> incluido (5-10 minutos)
+        </div>
+      </div>
+    </div>
+  );
+
+  /* CHECKING */
+  if (screen==="checking") return (
+    <div className="sb" style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",gap:16}}>
+      <style>{CSS}</style>
+      <div className="pulse" style={{fontSize:"3rem"}}>🐝</div>
+      <p style={{color:"#4B5A78"}}>Verificando sala {roomId}...</p>
+    </div>
+  );
+
+  /* ROOM NOT FOUND */
+  if (screen==="room-not-found") return (
+    <div className="sb" style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:20}}>
+      <style>{CSS}</style>
+      <div className="card" style={{maxWidth:420,width:"100%",textAlign:"center"}}>
+        <div style={{fontSize:"3rem",marginBottom:12}}>🔍</div>
+        <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#ef4444",fontSize:"1.8rem",marginBottom:10}}>Sala no encontrada</h2>
+        <p style={{color:"#6B7FA3",marginBottom:20}}>El código <code style={{background:"rgba(255,255,255,.08)",padding:"2px 8px",borderRadius:6,color:"#E8EDF8"}}>{roomId}</code> no existe o el enlace expiró.</p>
+        <button className="btn btn-ghost" onClick={()=>{window.history.pushState({},"",window.location.pathname);setScreen("landing");}}>← Volver</button>
+      </div>
+    </div>
+  );
+
+  /* ROOM CLOSED */
+  if (screen==="room-closed") return (
+    <div className="sb" style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:20}}>
+      <style>{CSS}</style>
+      <div className="card" style={{maxWidth:420,width:"100%",textAlign:"center"}}>
+        <div style={{fontSize:"3rem",marginBottom:12}}>🔒</div>
+        <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#a78bfa",fontSize:"1.8rem",marginBottom:10}}>Concurso finalizado</h2>
+        <p style={{color:"#6B7FA3",marginBottom:16}}>La sala <strong style={{color:"#E8EDF8"}}>{roomId}</strong> ya cerró. Las actas fueron generadas o la sala expiró después de 72 horas de inactividad.</p>
+        <button className="btn btn-ghost" onClick={()=>{window.history.pushState({},"",window.location.pathname);setScreen("landing");}}>← Crear un nuevo concurso</button>
+      </div>
+    </div>
+  );
+
+  /* LANDING */
+  if (screen==="landing") return (
+    <div className="sb" style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:24,gap:28}}>
+      <style>{CSS}</style>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:"3.5rem",lineHeight:1.1,marginBottom:6}}>🐝</div>
+        <h1 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"3rem",fontWeight:700,color:"#E8A200",lineHeight:1}}>Spelling Bee</h1>
+        <p style={{color:"#4B5A78",marginTop:5,fontSize:".85rem"}}>Sistema Multi-sala · Tiempo real · Actas PDF</p>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,width:"100%",maxWidth:560}}>
+        <div className="card" style={{display:"flex",flexDirection:"column",gap:12,borderColor:"rgba(232,162,0,.35)"}}>
+          <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em"}}>🆕 CREAR CONCURSO</p>
+          <p style={{color:"#4B5A78",fontSize:".78rem",lineHeight:1.5}}>Genera una sala única con enlace y QR para compartir con los jurados</p>
+          <input className="field" placeholder="Nombre de la institución *" value={inst} onChange={e=>setInst(e.target.value)} style={{fontSize:".84rem"}}/>
+          <input className="field" placeholder="Grado / Nivel (opcional)" value={lvl} onChange={e=>setLvl(e.target.value)} style={{fontSize:".84rem"}}/>
+          <button className="btn btn-gold" disabled={!inst.trim()||!window.FIREBASE_OK} onClick={doCreateRoom} style={{width:"100%"}}>Generar Sala →</button>
+        </div>
+        <div className="card" style={{display:"flex",flexDirection:"column",gap:12}}>
+          <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em"}}>🔗 UNIRSE A SALA</p>
+          <p style={{color:"#4B5A78",fontSize:".78rem",lineHeight:1.5}}>Escribe el código de sala que te compartió el configurador del concurso</p>
+          <input className="field" placeholder="Código (ej: UNAB-K7X2)" value={joinCode} onChange={e=>setJoinCode(e.target.value.toUpperCase())} onKeyDown={e=>e.key==="Enter"&&doJoinByCode()} style={{fontSize:".84rem",letterSpacing:".06em"}}/>
+          <button className="btn btn-ghost" disabled={!joinCode.trim()} onClick={doJoinByCode} style={{width:"100%"}}>Entrar →</button>
+          <p style={{color:"#2D3A55",fontSize:".72rem",textAlign:"center"}}>o abre el enlace / escanea el QR que recibiste</p>
+        </div>
+      </div>
+      {!window.FIREBASE_OK && (
+        <div style={{maxWidth:560,width:"100%",padding:"10px 14px",background:"rgba(239,68,68,.1)",border:"1px solid rgba(239,68,68,.3)",borderRadius:10,color:"#f87171",fontSize:".82rem"}}>
+          ⚠️ Firebase no configurado — edita index.html con tus credenciales (ver SETUP.md)
+        </div>
+      )}
+    </div>
+  );
+
+  /* SHARE LINK */
+  if (screen==="share-link") return (
+    <div className="sb" style={{maxWidth:580,margin:"0 auto",padding:"24px 16px",display:"flex",flexDirection:"column",gap:16}}>
+      <style>{CSS}</style>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:"2.5rem"}}>🐝</div>
+        <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#22c55e",fontSize:"1.8rem",fontWeight:700,margin:"4px 0"}}>¡Sala creada!</h2>
+        <p style={{color:"#4B5A78",fontSize:".85rem"}}>{gs?.institution}{gs?.level?" · "+gs.level:""}</p>
+      </div>
+      <div className="card" style={{display:"flex",gap:18,alignItems:"center",flexWrap:"wrap",justifyContent:"center",borderColor:"rgba(34,197,94,.3)"}}>
+        <img src={qrUrl} alt="QR" style={{width:150,height:150,borderRadius:10}} onError={e=>e.target.style.display="none"}/>
+        <div style={{flex:1,minWidth:200}}>
+          <p style={{color:"#4B5A78",fontSize:".72rem",fontWeight:700,letterSpacing:".06em",marginBottom:5}}>CÓDIGO DE SALA</p>
+          <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"2rem",fontWeight:700,color:"#E8A200",letterSpacing:".12em",marginBottom:10}}>{roomId}</div>
+          <p style={{color:"#4B5A78",fontSize:".72rem",fontWeight:700,letterSpacing:".06em",marginBottom:5}}>ENLACE DE ACCESO</p>
+          <div style={{background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.1)",borderRadius:8,padding:"7px 11px",fontSize:".74rem",color:"#a78bfa",wordBreak:"break-all",marginBottom:8}}>{shareUrl}</div>
+          <button className="btn btn-ghost" style={{fontSize:".76rem",padding:"6px 14px"}} onClick={()=>navigator.clipboard.writeText(shareUrl).then(()=>alert("¡Enlace copiado!"))}>📋 Copiar enlace</button>
+        </div>
+      </div>
+      <div className="card">
+        <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:4}}>👤 TU ACCESO — Configurador</p>
+        <p style={{color:"#4B5A78",fontSize:".78rem",marginBottom:12}}>Selecciona el rol que deseas tener. Puedes ser Monitor, o también cualquiera de los jurados.</p>
+        <input className="field" placeholder="Tu nombre completo" value={nameIn} onChange={e=>setNameIn(e.target.value)} style={{marginBottom:10}}/>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+          {[{id:"host",icon:"🎤",l:"Monitor"},{id:"J1",icon:"⚖️",l:"Jurado 1"},{id:"J2",icon:"⚖️",l:"Jurado 2"},{id:"J3",icon:"⚖️",l:"Jurado 3"}].map(r=>(
+            <button key={r.id} className="btn" onClick={()=>setRole(r.id)} style={{padding:"10px 8px",fontSize:".82rem",flexDirection:"column",gap:3,background:role===r.id?"#E8A200":"rgba(255,255,255,.05)",color:role===r.id?"#0C1628":"#E8EDF8",border:role===r.id?"none":"1px solid rgba(255,255,255,.1)"}}>
+              <span style={{fontSize:"1.1rem"}}>{r.icon}</span><span style={{fontWeight:700}}>{r.l}</span>
+            </button>
+          ))}
+        </div>
+        <button className="btn btn-gold" style={{width:"100%"}} disabled={!role||!nameIn.trim()} onClick={doLoginCreator}>Iniciar Configuración →</button>
+      </div>
+    </div>
+  );
+
+  /* LOGIN */
+  if (screen==="login") return (
+    <div className="sb" style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:20,gap:22}}>
+      <style>{CSS}</style>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:"3rem",marginBottom:4}}>🐝</div>
+        <h1 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"2.2rem",fontWeight:700,color:"#E8A200"}}>Spelling Bee</h1>
+        {gs?.institution && <p style={{color:"#4B5A78",fontSize:".85rem",marginTop:4}}>{gs.institution}{gs?.level?" · "+gs.level:""}</p>}
+        <div style={{marginTop:6,display:"inline-flex",alignItems:"center",gap:6,padding:"3px 12px",borderRadius:16,background:"rgba(167,139,250,.15)",border:"1px solid rgba(167,139,250,.35)",fontSize:".74rem",color:"#a78bfa"}}>
+          Sala: {roomId}
+        </div>
+      </div>
+      <div className="card" style={{width:"100%",maxWidth:400,display:"flex",flexDirection:"column",gap:14}}>
+        <div>
+          <p style={{color:"#6B7FA3",fontSize:".72rem",fontWeight:700,letterSpacing:".06em",marginBottom:7}}>TU NOMBRE COMPLETO</p>
+          <input className="field" placeholder="Escribe tu nombre..." value={nameIn} onChange={e=>setNameIn(e.target.value)} onKeyDown={e=>e.key==="Enter"&&role&&nameIn.trim()&&doLogin()}/>
+        </div>
+        <div>
+          <p style={{color:"#6B7FA3",fontSize:".72rem",fontWeight:700,letterSpacing:".06em",marginBottom:7}}>SELECCIONA TU ROL</p>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            {[{id:"host",icon:"🎤",l:"Monitor",s:"Deseo ser el Monitor"},{id:"J1",icon:"⚖️",l:"Jurado 1",s:"Deseo ser Jurado 1"},{id:"J2",icon:"⚖️",l:"Jurado 2",s:"Deseo ser Jurado 2"},{id:"J3",icon:"⚖️",l:"Jurado 3",s:"Deseo ser Jurado 3"}].map(r=>(
+              <button key={r.id} className="btn" onClick={()=>setRole(r.id)} style={{flexDirection:"column",gap:4,padding:"14px 10px",fontSize:".82rem",background:role===r.id?"#E8A200":"rgba(255,255,255,.05)",color:role===r.id?"#0C1628":"#E8EDF8",border:role===r.id?"none":"1px solid rgba(255,255,255,.1)"}}>
+                <span style={{fontSize:"1.3rem"}}>{r.icon}</span>
+                <span style={{fontWeight:700}}>{r.l}</span>
+                <span style={{opacity:.65,fontSize:".7rem"}}>{r.s}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <button className="btn btn-gold" style={{width:"100%",padding:13}} disabled={!role||!nameIn.trim()} onClick={doLogin}>Entrar al Concurso →</button>
+      </div>
+    </div>
+  );
+
+  /* SETUP */
+  if (screen==="setup") return (
+    <div className="sb" style={{maxWidth:720,margin:"0 auto",padding:"20px 16px 80px"}}>
+      <style>{CSS}</style>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:10}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <span style={{fontSize:"2rem"}}>🐝</span>
+          <div>
+            <h1 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.8rem",fontWeight:700}}>Configuración</h1>
+            <p style={{color:"#4B5A78",fontSize:".78rem"}}>{gs?.institution}{gs?.level?" · "+gs.level:""}</p>
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 12px",background:"rgba(167,139,250,.1)",border:"1px solid rgba(167,139,250,.3)",borderRadius:20}}>
+          <span style={{color:"#a78bfa",fontSize:".74rem",fontWeight:700,letterSpacing:".06em"}}>{roomId}</span>
+          <button className="btn btn-ghost" style={{padding:"3px 8px",fontSize:".7rem"}} onClick={()=>navigator.clipboard.writeText(shareUrl).then(()=>alert("¡Enlace copiado!"))}>📋</button>
+        </div>
+      </div>
+
+      <div style={{display:"flex",gap:6,marginBottom:18,borderBottom:"1px solid rgba(255,255,255,.08)"}}>
+        {[{id:"judges",l:"1. Jurados"},{id:"banks",l:"2. Palabras"},{id:"contestants",l:"3. Concursantes"}].map(t=>(
+          <button key={t.id} className="btn" onClick={()=>setTab(t.id)} style={{borderRadius:"8px 8px 0 0",padding:"8px 16px",fontSize:".82rem",background:tab===t.id?"#162038":"transparent",color:tab===t.id?"#E8A200":"#4B5A78",border:tab===t.id?"1px solid rgba(255,255,255,.1)":"none",borderBottom:tab===t.id?"1px solid #162038":"none"}}>{t.l}</button>
+        ))}
+      </div>
+
+      {tab==="judges" && (
+        <div className="card fade-up" style={{marginBottom:14}}>
+          <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:14}}>👥 REGISTRO DE JURADOS</p>
+          {["J1","J2","J3"].map((id,i)=>(
+            <div key={id} style={{display:"flex",gap:8,marginBottom:8,alignItems:"center"}}>
+              <span style={{color:"#4B5A78",fontSize:".78rem",minWidth:58,flexShrink:0}}>Jurado {i+1}</span>
+              <input className="field" placeholder={"Nombre del Jurado "+(i+1)} value={jNames[id]} onChange={e=>setJNames(p=>({...p,[id]:e.target.value}))} style={{flex:1,fontSize:".88rem"}}/>
+              <select className="field" value={jOrders[id]} onChange={e=>setJOrders(p=>({...p,[id]:+e.target.value}))} style={{width:100,flexShrink:0}}>
+                <option value={1}>Orden 1°</option><option value={2}>Orden 2°</option><option value={3}>Orden 3°</option>
+              </select>
+            </div>
+          ))}
+          <div style={{marginTop:14,paddingTop:12,borderTop:"1px solid rgba(255,255,255,.07)"}}>
+            <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:8}}>🏫 LOGO DE LA INSTITUCIÓN</p>
+            <p style={{color:"#4B5A78",fontSize:".74rem",marginBottom:8}}>Aparecerá en la esquina superior izquierda del acta PDF (3×3 cm). Cualquier formato de imagen.</p>
+            <label className={"upzone "+(logoB64?"ok":"")} style={{display:"block",marginBottom:8}}>
+              <input type="file" accept="image/*" onChange={e=>doLogoUpload(e.target.files[0])}/>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                {logoB64
+                  ? <img src={logoB64} style={{width:48,height:48,objectFit:"contain",borderRadius:6,border:"1px solid rgba(255,255,255,.1)"}} alt="Logo"/>
+                  : <span style={{fontSize:"1.3rem"}}>🏫</span>}
+                <div>
+                  <div style={{color:logoB64?"#22c55e":"#E8EDF8",fontWeight:600,fontSize:".88rem"}}>{logoB64?"✓ Logo cargado":"Subir logo (opcional)"}</div>
+                  <div style={{color:"#4B5A78",fontSize:".74rem"}}>PNG, JPG, SVG — Click para seleccionar</div>
+                </div>
+              </div>
+            </label>
+          </div>
+          <button className="btn btn-gold" style={{marginTop:8}} onClick={()=>setTab("banks")}>Continuar → Palabras</button>
+        </div>
+      )}
+
+      {tab==="banks" && (
+        <div className="fade-up">
+          <div className="card" style={{marginBottom:12}}>
+            <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:4}}>📚 BANCOS DE PALABRAS</p>
+            <p style={{color:"#4B5A78",fontSize:".75rem",marginBottom:14}}>
+              Word: una palabra por línea. Opcional con fonética: <span style={{fontFamily:"monospace",color:"#a78bfa"}}>apple | /ˈæpəl/</span><br/>
+              La fonética se genera automáticamente desde dictionaryapi.dev (gratis, sin clave).
+            </p>
+            {[{key:"basic",l:"Nivel Básico",icon:"🟢",c:"#22c55e"},{key:"inter",l:"Nivel Intermedio",icon:"🟡",c:"#f59e0b"},{key:"adv",l:"Nivel Avanzado",icon:"🔴",c:"#ef4444"}].map(({key,l,icon,c})=>(
+              <label key={key} className={"upzone "+(files[key]?"ok":"")} style={{marginBottom:8,borderColor:files[key]?c:undefined}}>
+                <input type="file" accept=".docx,.doc" onChange={e=>setFiles(p=>({...p,[key]:e.target.files[0]||null}))}/>
+                <div style={{display:"flex",alignItems:"center",gap:10}}>
+                  <span style={{fontSize:"1.3rem"}}>{icon}</span>
+                  <div>
+                    <div style={{color:files[key]?"#22c55e":"#E8EDF8",fontWeight:600,fontSize:".88rem"}}>{l}</div>
+                    <div style={{color:"#4B5A78",fontSize:".74rem"}}>{files[key]?"✓ "+files[key].name:"Click para subir (.docx)"}</div>
+                  </div>
+                </div>
+              </label>
+            ))}
+            {progress && (
+              <div style={{margin:"10px 0",padding:"10px 14px",background:"rgba(167,139,250,.1)",border:"1px solid rgba(167,139,250,.3)",borderRadius:10}}>
+                <div style={{color:"#a78bfa",fontSize:".82rem",marginBottom:6}}>🔤 Fonética: {progress.done}/{progress.total} palabras</div>
+                <div style={{height:4,background:"rgba(255,255,255,.1)",borderRadius:2}}>
+                  <div style={{height:4,background:"#a78bfa",borderRadius:2,width:Math.round(progress.done/progress.total*100)+"%",transition:"width .3s"}}/>
+                </div>
+              </div>
+            )}
+            <button className="btn btn-ghost" style={{width:"100%",marginTop:8}} disabled={busy} onClick={doLoadBanks}>
+              {busy ? "⏳ Procesando..." : "📥 Cargar + Generar Fonética Automática"}
+            </button>
+          </div>
+          {["basic","intermediate","advanced"].some(k=>editBanks[k]?.length>0) && (
+            <div className="card" style={{marginBottom:12}}>
+              <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:12}}>✏️ REVISAR / EDITAR FONÉTICA</p>
+              {[{key:"basic",label:"Básico",color:"#22c55e"},{key:"intermediate",label:"Intermedio",color:"#f59e0b"},{key:"advanced",label:"Avanzado",color:"#ef4444"}].map(({key,label,color})=>editBanks[key]?.length>0&&(
+                <div key={key} style={{marginBottom:14}}>
+                  <p style={{color,fontSize:".78rem",fontWeight:700,marginBottom:6}}>{label} — {editBanks[key].length} palabras</p>
+                  <div style={{maxHeight:200,overflowY:"auto",border:"1px solid rgba(255,255,255,.08)",borderRadius:10}}>
+                    <table className="word-table">
+                      <thead><tr><th>#</th><th>Palabra</th><th>Fonética IPA (editable)</th></tr></thead>
+                      <tbody>{editBanks[key].map((w,i)=>(
+                        <tr key={w.word}>
+                          <td style={{color:"#4B5A78",fontSize:".75rem",width:32}}>{i+1}</td>
+                          <td style={{fontWeight:600,letterSpacing:".06em"}}>{w.word.toUpperCase()}</td>
+                          <td><input placeholder="/fonética/" value={w.phonetic} onChange={e=>{const v=e.target.value;setEditBanks(p=>({...p,[key]:p[key].map((x,xi)=>xi===i?{...x,phonetic:v}:x)}))}}/></td>
+                        </tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                </div>
+              ))}
+              <button className="btn btn-gold" style={{width:"100%"}} onClick={doSaveBanks}>💾 Guardar y Continuar</button>
+            </div>
+          )}
+          {status && <div style={{padding:"9px 13px",background:"rgba(255,255,255,.05)",borderRadius:10,color:"#E8EDF8",fontSize:".83rem",marginTop:8}}>{status}</div>}
+        </div>
+      )}
+
+      {tab==="contestants" && (
+        <div className="fade-up">
+          <div className="card" style={{marginBottom:12}}>
+            <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:14}}>🏆 LISTA DE CONCURSANTES</p>
+            <label className={"upzone "+(files.pax?"ok":"")} style={{display:"block",marginBottom:10}}>
+              <input type="file" accept=".docx,.doc" onChange={e=>setFiles(p=>({...p,pax:e.target.files[0]||null}))}/>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                <span style={{fontSize:"1.3rem"}}>📋</span>
+                <div>
+                  <div style={{color:files.pax?"#22c55e":"#E8EDF8",fontWeight:600,fontSize:".88rem"}}>Lista de Concursantes</div>
+                  <div style={{color:"#4B5A78",fontSize:".74rem"}}>{files.pax?"✓ "+files.pax.name:"Un nombre por línea, en orden de participación"}</div>
+                </div>
+              </div>
+            </label>
+            <button className="btn btn-ghost" style={{width:"100%"}} disabled={busy||!files.pax} onClick={doLoadContestants}>{busy?"⏳ Cargando...":"📥 Cargar Lista"}</button>
+            {gs?.contestants?.length>0 && (
+              <div style={{marginTop:12,display:"flex",flexWrap:"wrap",gap:5}}>
+                {gs.contestants.map((c,i)=>(
+                  <span key={c.id} style={{background:"rgba(232,162,0,.12)",border:"1px solid rgba(232,162,0,.25)",borderRadius:16,padding:"3px 10px",fontSize:".74rem",color:"#E8A200"}}>{i+1}. {c.name}</span>
+                ))}
+              </div>
+            )}
+          </div>
+          {status && <div style={{padding:"9px 13px",background:"rgba(255,255,255,.05)",borderRadius:10,color:"#E8EDF8",fontSize:".83rem",marginBottom:12}}>{status}</div>}
+          <button className="btn btn-gold" style={{width:"100%",padding:14,fontSize:"1rem"}} disabled={!gs?.contestants?.length||!gs?.banks?.basic?.length} onClick={doStart}>🚀 Iniciar Concurso</button>
+        </div>
+      )}
+    </div>
+  );
+
+  /* SETUP WAIT */
+  if (screen==="setup-wait") return (
+    <div className="sb" style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",gap:20,padding:24}}>
+      <style>{CSS}</style>
+      <div className="pulse" style={{fontSize:"3.5rem"}}>🐝</div>
+      <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"2.2rem",fontWeight:700}}>Esperando configuración...</h2>
+      {gs?.institution && <p style={{color:"#4B5A78"}}>{gs.institution}{gs?.level?" · "+gs.level:""}</p>}
+      <div className="card" style={{textAlign:"center"}}>
+        <p style={{color:"#4B5A78",fontSize:".76rem",fontWeight:700,letterSpacing:".05em",marginBottom:4}}>CONECTADO COMO</p>
+        <p style={{color:"#E8A200",fontSize:"1.15rem",fontWeight:700}}>{gs?.judges?.find(jj=>jj.id===role)?.name||gs?.host?.name||role}</p>
+        <p style={{color:"#2D3A55",fontSize:".72rem",marginTop:4}}>🟢 Firebase · Sala {roomId}</p>
+      </div>
+    </div>
+  );
+
+  /* RESULTS */
+  if (screen==="results") {
+    const getC = id => gs?.contestants?.find(c=>c.id===id);
+    const allDone = confirmedCount >= 4;
+    return (
+      <div className="sb" style={{maxWidth:600,margin:"0 auto",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:24,gap:20}}>
+        <style>{CSS}</style>
+        <div style={{textAlign:"center"}}>
+          <div style={{fontSize:"3rem"}}>🏆</div>
+          <h1 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"2.8rem",fontWeight:700}}>Resultados Finales</h1>
+          {gs?.institution && <p style={{color:"#4B5A78",fontSize:".85rem",marginTop:4}}>{gs.institution}{gs?.level?" · "+gs.level:""}</p>}
+        </div>
+        <div style={{display:"flex",flexDirection:"column",gap:12,width:"100%",maxWidth:420}}>
+          {[{key:"first",emoji:"🥇",label:"Primer Lugar",color:"#F2A900",bg:"rgba(242,169,0,.13)"},{key:"second",emoji:"🥈",label:"Segundo Lugar",color:"#B8B8B8",bg:"rgba(184,184,184,.09)"},{key:"third",emoji:"🥉",label:"Tercer Lugar",color:"#CD7F32",bg:"rgba(205,127,50,.09)"}].map(({key,emoji,label,color,bg})=>(
+            <div key={key} className="card fade-up" style={{background:bg,borderColor:color+"35",display:"flex",alignItems:"center",gap:14}}>
+              <span style={{fontSize:"2.5rem"}}>{emoji}</span>
+              <div>
+                <div style={{color:"#4B5A78",fontSize:".72rem",fontWeight:700,letterSpacing:".05em"}}>{label}</div>
+                <div style={{color,fontFamily:"'Cormorant Garamond',serif",fontSize:"1.55rem",fontWeight:700}}>{getC(gs?.results?.[key])?.name||"—"}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="card" style={{width:"100%",maxWidth:420,borderColor:"rgba(99,102,241,.35)"}}>
+          <p style={{color:"#a5b4fc",fontSize:".8rem",fontWeight:700,letterSpacing:".04em",marginBottom:6}}>🖨️ ACTAS PDF — TAMAÑO OFICIO HORIZONTAL</p>
+          {isJudge && (
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              <p style={{color:"#4B5A78",fontSize:".76rem",lineHeight:1.6}}>
+                Descarga tu acta PDF, guárdala o imprímela. Una vez que los 3 jurados confirmen, la sala se cierra automáticamente.
+              </p>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:4}}>
+                {["J1","J2","J3"].map(id=>(
+                  <span key={id} style={{fontSize:".74rem",padding:"3px 10px",borderRadius:12,
+                    background:gs?.pdfConfirmed?.[id]?"rgba(34,197,94,.15)":"rgba(255,255,255,.06)",
+                    color:gs?.pdfConfirmed?.[id]?"#22c55e":"#4B5A78",
+                    border:"1px solid "+(gs?.pdfConfirmed?.[id]?"rgba(34,197,94,.35)":"rgba(255,255,255,.1)")}}>
+                    {gs?.pdfConfirmed?.[id]?"✓ ":"○ "}Jurado {id.replace("J","")}
+                  </span>
+                ))}
+              </div>
+              {!gs?.pdfConfirmed?.[role] ? (
+                <button className="btn btn-pdf" style={{width:"100%",padding:13,fontSize:".95rem"}} onClick={doPrintAndConfirm}>
+                  📄 Descargar / Imprimir mi Acta y Confirmar
+                </button>
+              ) : (
+                <div style={{textAlign:"center",padding:"8px 0"}}>
+                  <p style={{color:"#22c55e",fontSize:".84rem",marginBottom:6}}>✅ Tu acta fue confirmada.</p>
+                  {!allDone && <p style={{color:"#4B5A78",fontSize:".76rem"}}>Esperando a los demás jurados ({confirmedCount}/3)...</p>}
+                  {allDone && <p style={{color:"#22c55e",fontSize:".84rem",fontWeight:700}}>✅ Todos confirmaron — cerrando sala...</p>}
+                </div>
+              )}
+            </div>
+          )}
+          {isHost && (
+            <div style={{textAlign:"center",padding:"8px 0"}}>
+              <p style={{color:"#4B5A78",fontSize:".82rem",lineHeight:1.6}}>
+                Puedes cerrar esta ventana cuando quieras.<br/>
+                <span style={{color:"#2D3A55",fontSize:".74rem"}}>La sala se cerrará automáticamente cuando los 3 jurados confirmen su acta.</span>
+              </p>
+              <p style={{color:"#4B5A78",fontSize:".74rem",marginTop:10}}>
+                Confirmaciones: {confirmedCount}/3 {confirmedCount===3?"✅":"⏳"}
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  /* COMPETITION */
+  if (!gs || screen!=="competition") return (
+    <div className="sb" style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh"}}>
+      <style>{CSS}</style>
+      <p className="pulse" style={{color:"#4B5A78"}}>Cargando...</p>
+    </div>
+  );
+
+  return (
+    <div className="sb" style={{maxWidth:680,margin:"0 auto",padding:"16px 14px 80px"}}>
+      <style>{CSS}</style>
+      {LtrModal}{OvrModal}{DisputeModal}
+
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18,paddingTop:6}}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <span>🐝</span>
+          <span style={{display:"inline-flex",alignItems:"center",gap:6,padding:"4px 13px",borderRadius:18,fontSize:".74rem",fontWeight:700,background:stCol+"1A",border:"1px solid "+stCol+"45",color:stCol}}>
+            Etapa {cfg?.label}
+            {gs.stage==="tiebreaker"&&gs.tbRound>0&&<span style={{opacity:.7}}> · Ronda {gs.tbRound+1}</span>}
+          </span>
+          {isHost&&<span style={{fontSize:".68rem",color:"#2D3A55",marginLeft:8}}>{active.length} activos</span>}
+        </div>
+        <div style={{color:"#4B5A78",fontSize:".76rem"}}>{isHost?"🎤 Monitor":gs.judges.find(jj=>jj.id===role)?.name||role}</div>
+      </div>
+
+      {/* Dispute indicator */}
+      {pendingDisputes.length>0 && (
+        <button className="btn" style={{width:"100%",marginBottom:10,background:"rgba(251,191,36,.15)",color:"#fbbf24",border:"1px solid rgba(251,191,36,.35)",padding:10,fontSize:".84rem"}} onClick={()=>setDisputeModal(true)}>
+          ⚠️ Hay {pendingDisputes.length} discrepancia(s) pendiente(s) — Clic para deliberar
+        </button>
+      )}
+      {/* Concursante actual */}
+      {cur && !gs.stageComplete && (
+        <div className="card fade-up" style={{marginBottom:14,borderColor:stCol+"35"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+            <div>
+              <p style={{color:"#4B5A78",fontSize:".68rem",fontWeight:700,letterSpacing:".07em",marginBottom:4}}>CONCURSANTE ACTUAL</p>
+              <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8EDF8",fontSize:"1.65rem",fontWeight:700}}>{cur.name}</h2>
+            </div>
+            <div style={{textAlign:"right"}}>
+              <p style={{color:"#4B5A78",fontSize:".68rem",fontWeight:700,letterSpacing:".07em",marginBottom:4}}>PALABRA</p>
+              <p style={{color:"#E8EDF8",fontWeight:700}}>{gs.stage==="tiebreaker"?"Desempate":(gs.slot+1)+" / "+wpr}</p>
+            </div>
+          </div>
+          {gs.stage!=="tiebreaker" && (
+            <div style={{display:"flex",gap:5,marginTop:10}}>
+              {Array.from({length:wpr}).map((_,i)=>{
+                const sv=gs.scores[gs.stage]?.[cur.id]?.v?.[i];
+                return <div key={i} className="dot" style={{background:sv==="correct"?"#22c55e":sv==="incorrect"?"#ef4444":i===gs.slot&&!aw?stCol+"60":"rgba(255,255,255,.1)"}}/>;
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Área de palabra */}
+      {!gs.stageComplete && (
+        <div className="card" style={{marginBottom:14,minHeight:220,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14}}>
+          {!aw && isJudge && (
+            <div style={{textAlign:"center"}}>
+              <p style={{color:"#4B5A78",marginBottom:22,fontSize:".9rem"}}>
+                {cur ? cur.name+" — lista para "+(gs.stage==="tiebreaker"?"la palabra de desempate":"la palabra "+(gs.slot+1)) : "Etapa completada"}
+              </p>
+              {cur && <button className="btn spin-btn" onClick={doSpin}>🎰 SPIN</button>}
+            </div>
+          )}
+          {!aw && isHost && (
+            <p style={{color:"#4B5A78",textAlign:"center"}}>{cur?"⏳ Esperando que un jurado gire...":"Todos los concursantes completaron esta etapa"}</p>
+          )}
+          {aw && (
+            <div key={wordKey} className="pop" style={{width:"100%",textAlign:"center"}}>
+              <div style={{display:"flex",gap:10,marginBottom:20,justifyContent:"center",flexWrap:"wrap"}}>
+                <div className={"check "+(j?.start?"on":"")} onClick={()=>isJudge&&doToggle("start")} style={{cursor:isJudge?"pointer":"default",minWidth:155}}>
+                  <span style={{fontSize:"1.1rem"}}>{j?.start?"✅":"☐"}</span>
+                  <span style={{fontSize:".8rem",color:j?.start?"#22c55e":"#6B7FA3"}}>Pronunció al inicio</span>
+                </div>
+                <div className={"check "+(j?.end?"on":"")} onClick={()=>isJudge&&doToggle("end")} style={{cursor:isJudge?"pointer":"default",minWidth:155}}>
+                  <span style={{fontSize:"1.1rem"}}>{j?.end?"✅":"☐"}</span>
+                  <span style={{fontSize:".8rem",color:j?.end?"#22c55e":"#6B7FA3"}}>Pronunció al final</span>
+                </div>
+              </div>
+              <div className="word-font" style={{fontSize:"clamp(2.2rem,7vw,4rem)",marginBottom:10,color:wColor}}>
+                {aw.word.split("").map((ltr,i)=>{
+                  const e=j?.err, isErr=e?.index===i;
+                  return (
+                    <span key={i} className={"ltr "+(isErr&&e.type==="skipped"?"skip":"")+" "+(isErr&&e.type==="misspelled"?"bad":"")}
+                      onClick={()=>isJudge&&doLetterClick(i,ltr)} title={isJudge?"Clic para marcar error en esta letra":""}>
+                      {ltr}
+                    </span>
+                  );
+                })}
+              </div>
+              {aw.phonetic
+                ? <div className="ph-font" style={{fontSize:"1.15rem",marginBottom:14}}>{aw.phonetic}</div>
+                : <div style={{fontSize:".78rem",color:"#3B4B6A",marginBottom:14,fontStyle:"italic"}}>Sin fonética registrada</div>}
+              <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap",marginBottom:16}}>
+                {j?.err && (
+                  <span style={{fontSize:".76rem",padding:"4px 10px",borderRadius:16,background:j.err.type==="skipped"?"rgba(251,191,36,.15)":"rgba(248,113,113,.15)",color:j.err.type==="skipped"?"#fbbf24":"#f87171",border:"1px solid "+(j.err.type==="skipped"?"rgba(251,191,36,.35)":"rgba(248,113,113,.35)")}}>
+                    {j.err.type==="skipped"?"⚡ Omitida":"❌ Mal deletreada"}: «{j.err.letter.toUpperCase()}»
+                  </span>
+                )}
+                {j?.override!=null && (
+                  <span style={{fontSize:".76rem",padding:"4px 10px",borderRadius:16,background:j.override==="correct"?"rgba(34,197,94,.15)":"rgba(248,113,113,.15)",color:j.override==="correct"?"#22c55e":"#f87171",border:"1px solid "+(j.override==="correct"?"rgba(34,197,94,.35)":"rgba(248,113,113,.35)")}}>
+                    ✏️ Consenso: {j.override==="correct"?"Correcto":"Incorrecto"}
+                  </span>
+                )}
+                {isJudge && (
+                  <button className="btn btn-ghost" style={{padding:"4px 10px",fontSize:".76rem"}} onClick={()=>setOvrModal(true)}>✏️ Corregir por consenso</button>
+                )}
+                {isJudge && (
+                  <button className="btn btn-ghost" style={{padding:"4px 10px",fontSize:".76rem",color:"#fbbf24",borderColor:"rgba(251,191,36,.35)"}} onClick={doFlagDispute}>⚠️ Marcar discrepancia</button>
+                )}
+              </div>
+              {isJudge && (
+                <button className="btn" style={{background:stCol+"CC",color:"white",padding:"12px 32px",fontSize:".95rem"}} onClick={doNext}>
+                  {gs.slot>=wpr-1||gs.stage==="tiebreaker" ? "→ Siguiente Concursante" : "→ Palabra "+(gs.slot+2)+" de "+wpr}
+                </button>
+              )}
+              {isHost && <p style={{color:"#4B5A78",fontSize:".82rem"}}>Vista en tiempo real · Solo lectura</p>}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Etapa completa */}
+      {gs.stageComplete && (
+        <div className="card fade-up" style={{marginBottom:14,borderColor:"rgba(232,162,0,.5)"}}>
+          <h3 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.4rem",marginBottom:14}}>
+            Etapa {cfg?.label} — {gs.stage==="tiebreaker"?"Ronda "+(gs.tbRound+1)+" completada":"Resultados"}
+          </h3>
+
+          {/* ── HOST: animated reveal ── */}
+          {isHost && !gs.advancing.length && (
+            <p style={{color:"#4B5A78",fontSize:".84rem",textAlign:"center"}}>⏳ Esperando que los jurados entreguen resultados...</p>
+          )}
+          {isHost && gs.advancing.length>0 && !revealAdvancing && (
+            <div style={{textAlign:"center",padding:"20px 0"}}>
+              <p style={{color:"#4B5A78",fontSize:".82rem",marginBottom:16}}>
+                {gs.stage==="tiebreaker"?"Los jurados han definido el desempate.":"Los jurados entregaron los resultados de esta etapa."}
+              </p>
+              <button className="btn" onClick={()=>setRevealAdvancing(true)} style={{
+                background:"linear-gradient(135deg,#E8A200,#FF7700)",color:"#0C1628",
+                padding:"18px 44px",fontSize:"1.1rem",letterSpacing:".08em",borderRadius:16,
+                boxShadow:"0 5px 28px rgba(232,162,0,.45)",animation:"pulse 1.5s infinite"
+              }}>
+                {gs.stage==="tiebreaker"
+                  ?(canResolveTop3(ranked)?"🏆 Ver Resultado Final":"➕ Nueva Ronda de Desempate")
+                  :"➡️ Ver Siguiente Etapa"}
+              </button>
+            </div>
+          )}
+          {isHost && gs.advancing.length>0 && revealAdvancing && (
+            <div className="fade-up">
+              {gs.stage!=="tiebreaker" && (
+                <div style={{marginBottom:14}}>
+                  <p style={{color:"#22c55e",fontWeight:700,fontSize:".8rem",marginBottom:8,letterSpacing:".04em"}}>
+                    ✅ PARTICIPANTES QUE AVANZAN A {nextCfg?.label?.toUpperCase()||"LA SIGUIENTE ETAPA"}
+                  </p>
+                  {gs.advancing.map(id=>{
+                    const c=gs.contestants.find(x=>x.id===id);
+                    return c?(<div key={id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",background:"rgba(34,197,94,.1)",borderRadius:10,marginBottom:6,border:"1px solid rgba(34,197,94,.25)"}}>
+                      <span style={{color:"#22c55e",fontSize:"1.1rem"}}>✅</span>
+                      <span style={{color:"#E8EDF8",fontWeight:600}}>{c.name}</span>
+                    </div>):null;
+                  })}
+                  {ranked.filter(c=>!gs.advancing.includes(c.id)).length>0&&(
+                    <div style={{marginTop:10}}>
+                      <p style={{color:"#ef4444",fontWeight:700,fontSize:".8rem",marginBottom:8,letterSpacing:".04em"}}>❌ ELIMINADOS EN ESTA ETAPA</p>
+                      {ranked.filter(c=>!gs.advancing.includes(c.id)).map(c=>(
+                        <div key={c.id} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 14px",background:"rgba(239,68,68,.07)",borderRadius:10,marginBottom:5,border:"1px solid rgba(239,68,68,.2)"}}>
+                          <span style={{color:"#ef4444",fontSize:"1rem"}}>❌</span>
+                          <span style={{color:"#6B7FA3"}}>{c.name}</span>
+                          <span style={{marginLeft:"auto",color:"#4B5A78",fontSize:".78rem"}}>{c.correct}/{c.total||wpr} correctas</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {gs.stage==="tiebreaker" && (
+                <div style={{marginBottom:14}}>
+                  <p style={{color:"#a78bfa",fontWeight:700,fontSize:".8rem",marginBottom:8}}>⚡ RONDA DE DESEMPATE {gs.tbRound+1}</p>
+                  {ranked.map((c,i)=>(
+                    <div key={c.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",background:"rgba(167,139,250,.08)",borderRadius:10,marginBottom:5,border:"1px solid rgba(167,139,250,.2)"}}>
+                      <span style={{color:"#a78bfa",minWidth:20,fontWeight:700}}>{i+1}°</span>
+                      <span style={{color:"#E8EDF8",fontWeight:600,flex:1}}>{c.name}</span>
+                      <span style={{color:"#a78bfa",fontSize:".78rem"}}>{c.correct}/{c.total||1} correctas</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <button className="btn btn-gold" style={{width:"100%"}} onClick={doAdvance}>
+                {gs.stage==="tiebreaker"
+                  ?(canResolveTop3(ranked)?"🏆 Confirmar y Ver Resultados Finales":"➕ Iniciar Nueva Ronda de Desempate")
+                  :"🚀 Iniciar Etapa "+( nextCfg?.label||"Siguiente")}
+              </button>
+            </div>
+          )}
+
+          {/* ── JUDGES: results + tiebreaker controls ── */}
+          {isJudge && (
+            <div>
+              <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:12}}>
+                {ranked.map((c,i)=>(
+                  <div key={c.id} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",background:"rgba(255,255,255,.04)",borderRadius:10}}>
+                    <span style={{color:"#4B5A78",fontSize:".78rem",width:18,textAlign:"right"}}>{i+1}</span>
+                    <span style={{flex:1,fontSize:".88rem"}}>{c.name}</span>
+                    <div style={{display:"flex",gap:3}}>{(c.words||[]).slice(0,wpr).map((vv,vi)=><div key={vi} className="dot" style={{background:vv==="correct"?"#22c55e":vv==="incorrect"?"#ef4444":"rgba(255,255,255,.1)"}}/>)}</div>
+                    <span style={{fontSize:".84rem",fontWeight:700,minWidth:32,textAlign:"right",color:c.correct>=2?"#22c55e":c.correct===1?"#f59e0b":"#ef4444"}}>{c.correct}/{c.total||wpr}</span>
+                  </div>
+                ))}
+              </div>
+              {!gs.advancing.length && (
+                <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                  {gs.stage==="tiebreaker" ? (
+                    <>
+                      <p style={{color:"#4B5A78",fontSize:".78rem",textAlign:"center",marginBottom:4}}>
+                        Ronda {gs.tbRound+1} completada. ¿Qué desean hacer?
+                      </p>
+                      <button className="btn" style={{width:"100%",background:"rgba(167,139,250,.18)",color:"#a78bfa",border:"1px solid rgba(167,139,250,.35)"}}
+                        onClick={()=>upd(prev=>({...prev,advancing:ranked.map(c=>c.id),tbRound:prev.tbRound}))}>
+                        ➕ Agregar otra ronda de desempate
+                      </button>
+                      <button className="btn btn-gold" style={{width:"100%"}} onClick={doSubmit}>
+                        🏆 Finalizar desempate — Entregar al Monitor
+                      </button>
+                    </>
+                  ) : (
+                    <button className="btn btn-gold" style={{width:"100%"}} onClick={doSubmit}>
+                      📤 Entregar Resultados al Monitor
+                    </button>
+                  )}
+                </div>
+              )}
+              {gs.advancing.length>0 && (
+                <p style={{color:"#22c55e",fontSize:".84rem",textAlign:"center"}}>✅ Resultados enviados. Esperando al Monitor...</p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Marcador */}
+      <div className="card">
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:10}}>
+          <p style={{color:"#4B5A78",fontSize:".72rem",fontWeight:700,letterSpacing:".06em"}}>
+            CONCURSANTES — {cfg?.label?.toUpperCase()}
+            {gs.stage==="tiebreaker"&&gs.tbLen&&<span style={{color:stCol,marginLeft:6,textTransform:"none",fontWeight:400,letterSpacing:0}}>· {gs.tbLen} letras</span>}
+          </p>
+          <span style={{color:"#2D3A55",fontSize:".68rem"}}>{active.length} participante{active.length!==1?"s":""}</span>
+        </div>
+        {ranked.map((c,i)=>(
+          <div key={c.id} style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+            <span style={{color:"#2D3A55",fontSize:".76rem",width:16,textAlign:"right"}}>{i+1}</span>
+            <span style={{flex:1,fontSize:".84rem",color:"#E8EDF8"}}>
+              {c.name}
+              {cur?.id===c.id&&!gs.stageComplete&&<span style={{marginLeft:6,fontSize:".64rem",background:stCol+"25",color:stCol,padding:"1px 6px",borderRadius:8}}>activo</span>}
+            </span>
+            <div style={{display:"flex",gap:3}}>{Array.from({length:wpr}).map((_,wi)=>{const vv=(c.words||[])[wi];return <div key={wi} className="dot" style={{width:9,height:9,background:vv==="correct"?"#22c55e":vv==="incorrect"?"#ef4444":"rgba(255,255,255,.1)"}}/>;})}</div>
+            <span style={{fontSize:".8rem",color:"#4B5A78",minWidth:28,textAlign:"right"}}>{c.correct}/{c.total||0}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
