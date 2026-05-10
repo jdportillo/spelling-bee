@@ -34,14 +34,28 @@ const FIREBASE_CONFIG = {
   appId:             "1:77310918785:web:a107af7e10c538abc08d80"
 };
 window.FIREBASE_OK = false;
-try {
-  firebase.initializeApp(FIREBASE_CONFIG);
-  window.rtdb   = firebase.database();
-  window.fbAuth = firebase.auth();
-  window.fbAuth.useDeviceLanguage();
-  window.gProvider = new firebase.auth.GoogleAuthProvider();
-  window.FIREBASE_OK = true;
-} catch(e) { console.error("Firebase:", e); }
+
+/* Safe init: retries every 50ms until the Firebase SDK is loaded */
+(function tryInitFirebase() {
+  if (typeof firebase === 'undefined') {
+    setTimeout(tryInitFirebase, 50);
+    return;
+  }
+  try {
+    if (!firebase.apps.length) {          /* Avoid "already initialized" on hot-reload */
+      firebase.initializeApp(FIREBASE_CONFIG);
+    }
+    window.rtdb   = firebase.database();
+    window.fbAuth = firebase.auth();
+    window.fbAuth.useDeviceLanguage();
+    window.gProvider = new firebase.auth.GoogleAuthProvider();
+    window.FIREBASE_OK = true;
+    /* Notify React that Firebase is ready */
+    window.dispatchEvent(new Event('firebase-ready'));
+  } catch(e) {
+    console.error("Firebase init error:", e);
+  }
+})();
 </script>
 
 <script type="text/babel">
@@ -715,7 +729,18 @@ function App() {
     const room = new URLSearchParams(window.location.search).get("room");
     if (!room) { setScreen("landing"); return; }
     setRoomId(room); roomRef.current = room;
-    if (!window.FIREBASE_OK) { setScreen("firebase-error"); return; }
+    if (!window.FIREBASE_OK) {
+      /* Firebase still initializing — wait for it */
+      const waitAndCheck = () => {
+        if (window.FIREBASE_OK) {
+          checkRoom(room);
+        } else {
+          setTimeout(waitAndCheck, 80);
+        }
+      };
+      waitAndCheck();
+      return;
+    }
     setScreen("checking");
     window.rtdb.ref("spellingbee/rooms/"+room+"/state").once("value").then(snap => {
       const s = snap.val();
@@ -753,6 +778,18 @@ function App() {
     window.addEventListener("resize",h);
     return()=>window.removeEventListener("resize",h);
   },[]);
+
+  /* Force re-check FIREBASE_OK once Firebase finishes async init */
+  useEffect(() => {
+    if (window.FIREBASE_OK) return;
+    const onReady = () => { setScreen(s => s); };
+    window.addEventListener('firebase-ready', onReady);
+    // After 12s, if still not ready, show error
+    const timeout = setTimeout(() => {
+      if (!window.FIREBASE_OK) setScreen("firebase-error");
+    }, 12000);
+    return () => { window.removeEventListener('firebase-ready', onReady); clearTimeout(timeout); };
+  }, []);
 
   const upd = useCallback(fn => {
     setGs(prev => {
@@ -846,7 +883,10 @@ function App() {
   /* ── CREATE ROOM ── */
   const doCreateRoom = async () => {
     if (!inst.trim()) return;
-    if (!window.FIREBASE_OK) { alert("Configura Firebase primero — ver SETUP.md"); return; }
+    if (!window.FIREBASE_OK) {
+      setAdminStatus("⏳ Firebase aún inicializando. Espera un momento e intenta de nuevo.");
+      return;
+    }
     if (!adminUser) { setShowAdmin(true); setAdminView("login"); return; }
     // Check room limit for operators
     if (adminUser.type==="operator") {
@@ -1322,15 +1362,13 @@ function App() {
   if (screen==="firebase-error") return (
     <div className="sb" style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:20}}>
       <style>{CSS}</style>
-      <div className="card" style={{maxWidth:500,width:"100%",textAlign:"center"}}>
-        <div style={{fontSize:"3rem",marginBottom:12}}>⚙️</div>
-        <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.6rem",marginBottom:12}}>Configura Firebase primero</h2>
-        <p style={{color:"#6B7FA3",fontSize:".88rem",lineHeight:1.8,marginBottom:16}}>
-          Abre <code style={{background:"rgba(255,255,255,.1)",padding:"2px 6px",borderRadius:4}}>index.html</code> con un editor de texto y reemplaza los valores de <strong style={{color:"#E8EDF8"}}>FIREBASE_CONFIG</strong> con los de tu proyecto.
+      <div className="card" style={{maxWidth:500,width:"100%",textAlign:"center",gap:14,display:"flex",flexDirection:"column"}}>
+        <div className="pulse" style={{fontSize:"3rem"}}>🐝</div>
+        <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.6rem"}}>Conectando con Firebase...</h2>
+        <p style={{color:"#6B7FA3",fontSize:".88rem",lineHeight:1.7}}>
+          Si este mensaje no desaparece en 10 segundos, verifica tu conexión a internet o que Firebase esté habilitado en el archivo <code style={{background:"rgba(255,255,255,.1)",padding:"2px 6px",borderRadius:4}}>index.html</code>.
         </p>
-        <div style={{background:"rgba(232,162,0,.1)",border:"1px solid rgba(232,162,0,.3)",borderRadius:10,padding:14,fontSize:".82rem",color:"#E8A200"}}>
-          📖 Sigue el archivo <strong>SETUP.md</strong> incluido (5-10 minutos)
-        </div>
+        <button className="btn btn-ghost" style={{alignSelf:"center"}} onClick={()=>window.location.reload()}>🔄 Recargar página</button>
       </div>
     </div>
   );
