@@ -698,7 +698,7 @@ function App() {
   const [files,    setFiles]    = useState({basic:null,inter:null,adv:null,pax:null});
   const [status,   setStatus]   = useState("");
   const [busy,     setBusy]     = useState(false);
-  const [tab,      setTab]      = useState("judges");
+  const [tab,      setTab]      = useState("banks");
   const [editBanks,setEditBanks]= useState({basic:[],intermediate:[],advanced:[]});
   const [progress, setProgress] = useState(null);
   const [ltrModal, setLtrModal] = useState(null);
@@ -990,7 +990,7 @@ function App() {
     upd(prev => ({
       ...prev,
       banks:{basic:editBanks.basic, intermediate:editBanks.intermediate, advanced:editBanks.advanced},
-      judges:prev.judges.map(j=>({...j, name:jNames[j.id]||j.name, order:jOrders[j.id]})),
+      // judges names are set at login; preserve existing
     }));
     setStatus("✅ Bancos y jurados guardados.");
     setTab("contestants");
@@ -1164,9 +1164,9 @@ function App() {
     printReport(gsRef.current, role, () => {
       upd(prev=>{
         const confirmed={...prev.pdfConfirmed,[role]:true};
-        const totalJudges=(prev.judges||[]).length||3;
+        const totalJudges=Math.max((prev.judges||[]).length,1);
         const judgesConfirmed=(prev.judges||[]).filter(j=>confirmed[j.id]).length;
-        const shouldArchive=totalJudges>0&&judgesConfirmed>=totalJudges;
+        const shouldArchive=judgesConfirmed>0&&judgesConfirmed>=totalJudges;
         return {...prev, pdfConfirmed:confirmed, phase:shouldArchive?"archived":prev.phase};
       });
     });
@@ -1182,7 +1182,7 @@ function App() {
   const active=gs?.contestants?.filter(c=>c.active)||[];
   const cur=active[gs?.cIdx??0];
   const j=gs?.judgment, aw=gs?.activeWord;
-  const cfg=gs?.stage?STAGES[gs.stage]:null;
+  const cfg=gs?.stage&&STAGES[gs.stage]?STAGES[gs.stage]:null;
   const stCol=cfg?.color||"#E8A200", wpr=cfg?.wpr??3;
   const ranked=gs?rankActive(active,gs.scores,gs.stage):[];
   const verdict=computeVerdict(j);
@@ -1191,7 +1191,7 @@ function App() {
   const shareUrl=roomId?getShareUrl(roomId):"";
   const qrUrl=roomId?"https://api.qrserver.com/v1/create-qr-code/?size=180x180&data="+encodeURIComponent(shareUrl)+"&color=E8EDF8&bgcolor=162038":"";
   const confirmedCount=(gs?.judges||[]).filter(j=>gs?.pdfConfirmed?.[j.id]).length;
-  const allConfirmed=confirmedCount>=4;
+  const judgeCount=Math.max((gs?.judges||[]).length,1);
 
   /* ── DISPUTE MODAL ── */
   const pendingDisputes = Object.entries(gs?.disputedWords||{}).filter(([k,d])=>!d.resolved);
@@ -1588,25 +1588,34 @@ function App() {
 
       {tab==="judges" && (
         <div className="card fade-up" style={{marginBottom:14}}>
-          <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:14}}>👥 REGISTRO DE JURADOS</p>
-          {["J1","J2","J3"].map((id,i)=>(
-            <div key={id} style={{display:"flex",gap:8,marginBottom:8,alignItems:"center"}}>
-              <span style={{color:"#4B5A78",fontSize:".78rem",minWidth:58,flexShrink:0}}>Jurado {i+1}</span>
-              <input className="field" placeholder={"Nombre del Jurado "+(i+1)} value={jNames[id]} onChange={e=>setJNames(p=>({...p,[id]:e.target.value}))} style={{flex:1,fontSize:".88rem"}}/>
-              <select className="field" value={jOrders[id]} onChange={e=>setJOrders(p=>({...p,[id]:+e.target.value}))} style={{width:100,flexShrink:0}}>
-                <option value={1}>Orden 1°</option><option value={2}>Orden 2°</option><option value={3}>Orden 3°</option>
-              </select>
-            </div>
-          ))}
+          <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:4}}>👥 JURADOS CONECTADOS</p>
+          <p style={{color:"#4B5A78",fontSize:".76rem",marginBottom:14}}>Los jurados se conectan solos al abrir el enlace y elegir "Jurado". Aquí ves el estado en tiempo real.</p>
+          <div style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",background:"rgba(255,255,255,.04)",borderRadius:10,marginBottom:6}}>
+            <span style={{fontSize:"1.1rem"}}>🎤</span>
+            <span style={{flex:1,fontSize:".88rem",color:"#E8EDF8",fontWeight:600}}>Monitor</span>
+            {gs?.host?.name
+              ? <span style={{fontSize:".76rem",background:"rgba(34,197,94,.15)",color:"#22c55e",padding:"2px 9px",borderRadius:10,border:"1px solid rgba(34,197,94,.3)"}}>✅ {gs.host.name}</span>
+              : <span style={{fontSize:".76rem",color:"#3B4B6A"}}>Sin conectar</span>}
+          </div>
+          {[0,1,2].map(i=>{
+            const jj=(gs?.judges||[])[i];
+            return(<div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",background:"rgba(255,255,255,.04)",borderRadius:10,marginBottom:6}}>
+              <span style={{fontSize:"1.1rem"}}>⚖️</span>
+              <span style={{flex:1,fontSize:".88rem",color:"#4B5A78"}}>Jurado {i+1}</span>
+              {jj?<span style={{fontSize:".76rem",background:"rgba(34,197,94,.15)",color:"#22c55e",padding:"2px 9px",borderRadius:10,border:"1px solid rgba(34,197,94,.3)"}}>✅ {jj.name}</span>
+                 :<span style={{fontSize:".76rem",color:"#3B4B6A"}}>Sin conectar</span>}
+            </div>);
+          })}
+          <div style={{marginTop:10,padding:"8px 12px",background:"rgba(167,139,250,.08)",border:"1px solid rgba(167,139,250,.2)",borderRadius:8}}>
+            <p style={{color:"#a78bfa",fontSize:".74rem"}}>💡 Comparte el código <strong style={{letterSpacing:".06em"}}>{gs?.roomId}</strong> para que los jurados entren.</p>
+          </div>
           <div style={{marginTop:14,paddingTop:12,borderTop:"1px solid rgba(255,255,255,.07)"}}>
             <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:8}}>🏫 LOGO DE LA INSTITUCIÓN</p>
-            <p style={{color:"#4B5A78",fontSize:".74rem",marginBottom:8}}>Aparecerá en la esquina superior izquierda del acta PDF (3×3 cm). Cualquier formato de imagen.</p>
+            <p style={{color:"#4B5A78",fontSize:".74rem",marginBottom:8}}>Aparece en la esquina superior izquierda del acta PDF (3×3 cm).</p>
             <label className={"upzone "+(logoB64?"ok":"")} style={{display:"block",marginBottom:8}}>
               <input type="file" accept="image/*" onChange={e=>doLogoUpload(e.target.files[0])}/>
               <div style={{display:"flex",alignItems:"center",gap:10}}>
-                {logoB64
-                  ? <img src={logoB64} style={{width:48,height:48,objectFit:"contain",borderRadius:6,border:"1px solid rgba(255,255,255,.1)"}} alt="Logo"/>
-                  : <span style={{fontSize:"1.3rem"}}>🏫</span>}
+                {logoB64?<img src={logoB64} style={{width:48,height:48,objectFit:"contain",borderRadius:6,border:"1px solid rgba(255,255,255,.1)"}} alt="Logo"/>:<span style={{fontSize:"1.3rem"}}>🏫</span>}
                 <div>
                   <div style={{color:logoB64?"#22c55e":"#E8EDF8",fontWeight:600,fontSize:".88rem"}}>{logoB64?"✓ Logo cargado":"Subir logo (opcional)"}</div>
                   <div style={{color:"#4B5A78",fontSize:".74rem"}}>PNG, JPG, SVG — Click para seleccionar</div>
@@ -1614,7 +1623,7 @@ function App() {
               </div>
             </label>
           </div>
-          <button className="btn btn-gold" style={{marginTop:8}} onClick={()=>setTab("banks")}>Continuar → Palabras</button>
+          <button className="btn btn-gold" style={{width:"100%",marginTop:8}} onClick={()=>setTab("banks")}>Continuar → Palabras</button>
         </div>
       )}
 
@@ -1787,7 +1796,7 @@ actually | /ˈæktʃuəli/
   /* RESULTS */
   if (screen==="results") {
     const getC = id => gs?.contestants?.find(c=>c.id===id);
-    const allDone = confirmedCount >= 4;
+    const allDone = judgeCount>0 && confirmedCount>=judgeCount;
     return (
       <div className="sb" style={{maxWidth:600,margin:"0 auto",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:24,gap:20}}>
         <style>{CSS}</style>
@@ -1816,12 +1825,12 @@ actually | /ˈæktʃuəli/
                 Descarga tu acta PDF, guárdala o imprímela. Una vez que los 3 jurados confirmen, la sala se cierra automáticamente.
               </p>
               <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:4}}>
-                {(gs?.judges||[]).map(j=>j.id).map(id=>(
+                {(gs?.judges||[]).map(j=>({id:j.id,name:j.name})).map(({id,name})=>(
                   <span key={id} style={{fontSize:".74rem",padding:"3px 10px",borderRadius:12,
                     background:gs?.pdfConfirmed?.[id]?"rgba(34,197,94,.15)":"rgba(255,255,255,.06)",
                     color:gs?.pdfConfirmed?.[id]?"#22c55e":"#4B5A78",
                     border:"1px solid "+(gs?.pdfConfirmed?.[id]?"rgba(34,197,94,.35)":"rgba(255,255,255,.1)")}}>
-                    {gs?.pdfConfirmed?.[id]?"✓ ":"○ "}Jurado {id.replace("J","")}
+                    {gs?.pdfConfirmed?.[id]?"✓ ":"○ "}{name}
                   </span>
                 ))}
               </div>
@@ -2111,7 +2120,7 @@ actually | /ˈæktʃuəli/
             <span style={{color:"#2D3A55",fontSize:".76rem",width:16,textAlign:"right"}}>{i+1}</span>
             <span style={{flex:1,fontSize:".84rem",color:"#E8EDF8"}}>
               {c.name}
-              {cur?.id===c.id&&!gs.stageComplete&&<span style={{marginLeft:6,fontSize:".64rem",background:stCol+"25",color:stCol,padding:"1px 6px",borderRadius:8}}>activo</span>}
+              {cur&&cur?.id===c.id&&!gs.stageComplete&&<span style={{marginLeft:6,fontSize:".64rem",background:stCol+"25",color:stCol,padding:"1px 6px",borderRadius:8}}>activo</span>}
             </span>
             <div style={{display:"flex",gap:3}}>{Array.from({length:wpr}).map((_,wi)=>{const vv=(c.words||[])[wi];return <div key={wi} className="dot" style={{width:9,height:9,background:vv==="correct"?"#22c55e":vv==="incorrect"?"#ef4444":"rgba(255,255,255,.1)"}}/>;})}</div>
             <span style={{fontSize:".8rem",color:"#4B5A78",minWidth:28,textAlign:"right"}}>{c.correct}/{c.total||0}</span>
