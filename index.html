@@ -13,7 +13,6 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-database-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-auth-compat.js"></script>
   <style>body{margin:0;padding:0;background:#0C1628;}</style>
 </head>
 <body>
@@ -48,9 +47,9 @@ window.FIREBASE_OK = false;
     window.rtdb   = firebase.database();
     window.fbAuth = firebase.auth();
     window.fbAuth.useDeviceLanguage();
-    window.gProvider = new firebase.auth.GoogleAuthProvider();
     window.FIREBASE_OK = true;
     /* Notify React that Firebase is ready */
+    ensureMasterExists().catch(console.error);
     window.dispatchEvent(new Event('firebase-ready'));
   } catch(e) {
     console.error("Firebase init error:", e);
@@ -81,15 +80,32 @@ const STAGES = {
 /* ── INITIAL STATE ── */
 function initState() {
   return {
-    phase:"setup", host:{name:"Monitor",ts:0},
-    judges:[], // Filled as judges claim slots
+    phase:"setup",
+    /* Roles */
+    mc:{name:"", ts:0},                 // Maestro de Ceremonia (ex-Monitor)
+    presenter:{name:"", ts:0},          // Presentador (lee las palabras)
+    judges:[],                          // Jurados (2-4, claimed at login)
+    judgeCount:3,                       // Configured by creator (2-4)
+    /* Data */
     contestants:[], banks:{basic:[],intermediate:[],advanced:[]},
     usedWords:{basic:[],intermediate:[],advanced:[]},
-    stage:"basic", cIdx:0, slot:0, activeWord:null, judgment:null,
+    /* Game flow */
+    stage:"basic", cIdx:0,
+    /* New word-by-word flow */
+    wordPhase:"idle",  // "contestant_reveal"|"ready_wait"|"word_show"|"deliberation"|"stage_end"
+    currentWordIdx:0,  // 0,1,2 within the 3-word set
+    currentWords:[],   // [{word,phonetic}] — 3 words pre-drawn for current contestant
+    wordJudgments:{},  // { wordIdx: { J1:{verdict,err,start,end}, J2:…, J3:… } }
+    judgesReady:{},    // { J1:true, J2:true } — ready signal per word-reveal
+    discrepancies:[],  // [{wordIdx, word, phonetic, votes:{J1:v,J2:v}, resolved:false, final:null}]
+    /* Legacy compat */
+    slot:0, activeWord:null, judgment:null,
     scores:{basic:{},intermediate:{},advanced:{},tiebreaker:{}},
     history:[], stageComplete:false, advancing:[],
     tbLen:null, tbRound:0, results:null, setupComplete:false,
-    institution:"", level:"", roomId:"", pdfConfirmed:{}, logoB64:"", disputedWords:{}, contestantsConfirmed:false,
+    institution:"", level:"", roomId:"", pdfConfirmed:{},
+    logoB64:"", disputedWords:{}, contestantsConfirmed:false,
+    actasClosedAt:null,   // timestamp when all judges downloaded — room closes 36h later
   };
 }
 
@@ -317,9 +333,13 @@ function reasonText(reasons, result) {
 
 /* ── PDF REPORT v4 — Landscape oficio, 2-section layout ── */
 function printReport(gs, role, onDone) {
-  const judge = role==="host" ? gs.host : gs.judges.find(j=>j.id===role);
+  const judge = role==="mc" ? gs.mc
+    : role==="presenter" ? gs.presenter
+    : (gs.judges||[]).find(j=>j.id===role);
   const name = judge?.name || role;
-  const roleLabel = role==="host" ? "Monitor / Host" : "Judge "+role.replace("J","")+", Order "+judge?.order;
+  const roleLabel = role==="mc" ? "Maestro de Ceremonia"
+    : role==="presenter" ? "Presentador"
+    : "Judge "+role.replace("J","")+", Order "+judge?.order;
   const date = new Date().toLocaleDateString("en-US",{year:"numeric",month:"long",day:"numeric"});
   const getC = id => gs.contestants.find(c=>c.id===id);
 
@@ -602,26 +622,39 @@ async function toggleAdminUser(username, active) {
 
 /* Login de operador */
 async function loginOperator(username, password) {
+  // Check if it's master
+  const masterLogin = await loginMaster(username, password);
+  if (masterLogin.ok) return {ok:true, user:{type:"master", username}};
+  // Check operator
   const snap = await window.rtdb.ref(ADMIN_PATH+"/users/"+username).once("value");
   const u = snap.val();
   if (!u||!u.active) return {ok:false, err:"Usuario no encontrado o desactivado"};
   const hash = await hashPwd(password);
   if (hash !== u.passwordHash) return {ok:false, err:"Contraseña incorrecta"};
   const active = await countActiveRooms(username);
-  return {ok:true, user:{type:"operator",username,roomLimit:u.roomLimit,activeRooms:active}};
+  return {ok:true, user:{type:"operator",username,roomLimit:u.roomLimit||6,activeRooms:active}};
 }
 
-/* Verificar/registrar master de Google */
-async function verifyOrRegisterMaster(uid, email) {
-  const snap = await window.rtdb.ref(ADMIN_PATH+"/masterUID").once("value");
-  const storedUID = snap.val();
-  if (!storedUID) {
-    // First time — register this Google account as master
-    await window.rtdb.ref(ADMIN_PATH+"/masterUID").set(uid);
-    await window.rtdb.ref(ADMIN_PATH+"/masterEmail").set(email);
-    return true;
+/* Seed master user on first load */
+async function ensureMasterExists() {
+  const snap = await window.rtdb.ref(ADMIN_PATH+"/master").once("value");
+  if (!snap.val()) {
+    await window.rtdb.ref(ADMIN_PATH+"/master").set({
+      username:"dportillo",
+      passwordHash:"cd4de9b2e93337282a109a4b1519e25d106517bde46cccc07ff06920ec8bbc9a",
+      createdAt:Date.now()
+    });
   }
-  return storedUID === uid;
+}
+
+/* Login master with username/password */
+async function loginMaster(username, password) {
+  const snap = await window.rtdb.ref(ADMIN_PATH+"/master").once("value");
+  const m = snap.val();
+  if (!m || m.username !== username) return {ok:false, err:"Usuario maestro no encontrado"};
+  const hash = await hashPwd(password);
+  if (hash !== m.passwordHash) return {ok:false, err:"Contraseña incorrecta"};
+  return {ok:true};
 }
 
 /* ── CSS ── */
@@ -748,7 +781,10 @@ function App() {
       if (s.phase==="archived") { setScreen("room-closed"); return; }
       // Auto-expire after 72 hours of inactivity
       const last = s.lastActivity || s.expiresAt - 72*3600*1000 || 0;
-      const expired = s.expiresAt ? Date.now() > s.expiresAt : (Date.now() - last > 72*3600*1000);
+      // 36h after all actas downloaded
+      const actaExpired = s.actasClosedAt && (Date.now()-s.actasClosedAt > 36*3600*1000);
+      // 72h inactivity
+      const expired = actaExpired || (s.expiresAt ? Date.now()>s.expiresAt : (Date.now()-last>72*3600*1000));
       if (expired) {
         window.rtdb.ref("spellingbee/rooms/"+room+"/state/phase").set("archived");
         setScreen("room-closed"); return;
@@ -802,24 +838,7 @@ function App() {
   }, []);
 
   /* ── ADMIN HANDLERS ── */
-  const doGoogleLogin = async () => {
-    setAdminBusy(true); setAdminStatus("");
-    try {
-      const result = await window.fbAuth.signInWithPopup(window.gProvider);
-      const { uid, email } = result.user;
-      const isMaster = await verifyOrRegisterMaster(uid, email);
-      if (isMaster) {
-        setAdminUser({type:"master", uid, email});
-        const users = await loadAdminUsers();
-        setAdminUsers(users);
-        setAdminView("dashboard");
-      } else {
-        setAdminStatus("⚠ Esta cuenta de Google no es la cuenta maestra registrada.");
-        await window.fbAuth.signOut();
-      }
-    } catch(e) { setAdminStatus("❌ Error: "+e.message); }
-    setAdminBusy(false);
-  };
+  // Google login removed;
 
   const doOperatorLogin = async () => {
     if (!operLogin.username||!operLogin.password) return;
@@ -827,7 +846,13 @@ function App() {
     const res = await loginOperator(operLogin.username, operLogin.password);
     if (res.ok) {
       setAdminUser(res.user);
-      setShowAdmin(false);
+      if (res.user.type==="master") {
+        const users = await loadAdminUsers();
+        setAdminUsers(users);
+        setAdminView("dashboard");
+      } else {
+        setShowAdmin(false);
+      }
     } else {
       setAdminStatus("❌ "+res.err);
     }
@@ -914,16 +939,18 @@ function App() {
     if (!role||!nameIn.trim()) return;
     const snap = await window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").once("value");
     let s = snap.val() || gs || initState();
-    if (role==="host") {
-      s = {...s, host:{name:nameIn.trim(),ts:Date.now()}};
+    if (role==="mc") {
+      s = {...s, mc:{name:nameIn.trim(),ts:Date.now()}};
+    } else if (role==="presenter") {
+      s = {...s, presenter:{name:nameIn.trim(),ts:Date.now()}};
     } else if (role==="judge") {
-      // Claim next available slot
       const taken=(s.judges||[]).map(j=>j.id);
-      const available=["J1","J2","J3"].find(id=>!taken.includes(id));
-      if(!available){alert("No hay más lugares disponibles para jurados.");return;}
+      const maxSlots=["J1","J2","J3","J4"].slice(0,s.judgeCount||3);
+      const available=maxSlots.find(id=>!taken.includes(id));
+      if(!available){alert("No hay más lugares de jurado disponibles.");return;}
       const newJudge={id:available,name:nameIn.trim(),order:taken.length+1,ts:Date.now()};
       s={...s,judges:[...(s.judges||[]),newJudge]};
-      setRole(available); // Update local role to actual slot
+      setRole(available);
     }
     window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").set(s); setGs(s);
     const isCreator = sessionStorage.getItem("creator-"+roomId)==="1";
@@ -936,11 +963,14 @@ function App() {
   const doLoginCreator = async () => {
     if (!role||!nameIn.trim()) return;
     let s = gs || initState();
-    if (role==="host") {
-      s={...s,host:{name:nameIn.trim(),ts:Date.now()}};
+    if (role==="mc") {
+      s={...s,mc:{name:nameIn.trim(),ts:Date.now()}};
+    } else if (role==="presenter") {
+      s={...s,presenter:{name:nameIn.trim(),ts:Date.now()}};
     } else if(role==="judge"){
       const taken=(s.judges||[]).map(j=>j.id);
-      const available=["J1","J2","J3"].find(id=>!taken.includes(id));
+      const maxSlots=["J1","J2","J3","J4"].slice(0,s.judgeCount||3);
+      const available=maxSlots.find(id=>!taken.includes(id));
       if(!available){alert("No hay más lugares disponibles.");return;}
       const newJudge={id:available,name:nameIn.trim(),order:taken.length+1,ts:Date.now()};
       s={...s,judges:[...(s.judges||[]),newJudge]};
@@ -995,6 +1025,134 @@ function App() {
     setStatus("✅ Bancos y jurados guardados.");
     setTab("contestants");
   };
+
+
+  /* ══════════════════════════════════════════
+     NEW WORD-BY-WORD FLOW HANDLERS
+  ══════════════════════════════════════════ */
+
+  /* All judges pressed "Listo" — pre-draw 3 words */
+  const doJudgeReady = useCallback(() => {
+    const s=gsRef.current; if(!s) return;
+    upd(prev=>{
+      const newReady={...prev.judgesReady,[role]:true};
+      const numJudges=(prev.judges||[]).length||prev.judgeCount||3;
+      const allReady=Object.keys(newReady).length>=numJudges;
+      if(!allReady) return {...prev,judgesReady:newReady};
+      // Draw 3 words for current contestant
+      const cfg=STAGES[prev.stage];
+      const used=[...prev.usedWords[cfg.bank]];
+      const drawn=[];
+      const pool=prev.banks[cfg.bank].filter(w=>!used.includes(w.word));
+      for(let i=0;i<3&&pool.length>0;i++){
+        const idx=Math.floor(Math.random()*pool.length);
+        drawn.push(pool[idx]);
+        pool.splice(idx,1);
+      }
+      const newUsed=[...used,...drawn.map(w=>w.word)];
+      return {...prev,judgesReady:newReady,currentWords:drawn,currentWordIdx:0,
+        wordJudgments:{},wordPhase:"word_show",
+        usedWords:{...prev.usedWords,[cfg.bank]:newUsed}};
+    });
+  },[role]);
+
+  /* Judge submits verdict for current word */
+  const doJudgeWordVerdict = useCallback((verdict, errInfo) => {
+    const s=gsRef.current; if(!s) return;
+    const wi=s.currentWordIdx;
+    upd(prev=>{
+      const prevWJ=prev.wordJudgments||{};
+      const prevWord=prevWJ[wi]||{};
+      const myVote={verdict, err:errInfo||null, ts:Date.now()};
+      const updWord={...prevWord,[role]:myVote};
+      const newWJ={...prevWJ,[wi]:updWord};
+      const numJudges=(prev.judges||[]).length||prev.judgeCount||3;
+      const allVoted=Object.keys(updWord).length>=numJudges;
+      if(!allVoted) return {...prev,wordJudgments:newWJ};
+      // All judges voted — check discrepancies
+      const votes=Object.values(updWord);
+      const verdicts=votes.map(v=>v.verdict);
+      const hasDisc=verdicts.some(v=>v!==verdicts[0]);
+      const word=prev.currentWords[wi];
+      // Record to history if all agree
+      if(!hasDisc){
+        const finalV=verdicts[0];
+        const active=prev.contestants.filter(c=>c.active);
+        const cur=active[prev.cIdx];
+        const hEntry={stage:prev.stage,stageLabel:STAGES[prev.stage].label,
+          cId:cur?.id,cName:cur?.name,word:word?.word||"",phonetic:word?.phonetic||"",
+          result:finalV,reasons:{override:null,err:errInfo,start:true,end:true}};
+        const ns={...prev.scores};
+        const pv=ns[prev.stage]?.[cur?.id]?.v||[];
+        const nv=[...pv]; nv[wi]=finalV;
+        ns[prev.stage]={...ns[prev.stage],[cur?.id]:{v:nv}};
+        // Move to next word or stage_end
+        const nextWi=wi+1;
+        const isLast=nextWi>=prev.currentWords.length;
+        return {...prev,wordJudgments:newWJ,
+          history:[...prev.history,hEntry],scores:ns,
+          wordPhase:isLast?"stage_end":"word_show",
+          currentWordIdx:isLast?wi:nextWi,
+          judgesReady:isLast?{}:prev.judgesReady};
+      }
+      // Has discrepancy — add to list
+      const disc={wordIdx:wi,word:word?.word,phonetic:word?.phonetic,
+        votes:Object.fromEntries(Object.entries(updWord).map(([jid,v])=>[jid,v.verdict])),
+        resolved:false,final:null};
+      return {...prev,wordJudgments:newWJ,
+        discrepancies:[...prev.discrepancies,disc],
+        wordPhase:"deliberation"};
+    });
+  },[role]);
+
+  /* Resolve discrepancy — pick one judge's verdict or custom */
+  const doResolveDiscrepancy = useCallback((discIdx, finalVerdict) => {
+    const s=gsRef.current; if(!s) return;
+    upd(prev=>{
+      const discs=[...prev.discrepancies];
+      discs[discIdx]={...discs[discIdx],resolved:true,final:finalVerdict};
+      const allResolved=discs.every(d=>d.resolved);
+      if(!allResolved) return {...prev,discrepancies:discs};
+      // All resolved — write to history and scores
+      const active=prev.contestants.filter(c=>c.active);
+      const cur=active[prev.cIdx];
+      let newHistory=[...prev.history];
+      const ns={...prev.scores};
+      for(const d of discs){
+        const hEntry={stage:prev.stage,stageLabel:STAGES[prev.stage].label,
+          cId:cur?.id,cName:cur?.name,
+          word:d.word||"",phonetic:d.phonetic||"",
+          result:d.final,reasons:{override:d.final,err:null,start:true,end:true}};
+        newHistory=[...newHistory,hEntry];
+        const pv=ns[prev.stage]?.[cur?.id]?.v||[];
+        const nv=[...pv]; nv[d.wordIdx]=d.final;
+        ns[prev.stage]={...ns[prev.stage],[cur?.id]:{v:nv}};
+      }
+      // Also add non-discrepancy words already in wordJudgments
+      return {...prev,discrepancies:discs,history:newHistory,scores:ns,
+        wordPhase:"stage_end",judgesReady:{}};
+    });
+  },[]);
+
+  /* Advance to next contestant (after stage_end) */
+  const doNextContestant = useCallback(() => {
+    const s=gsRef.current; if(!s) return;
+    const active=s.contestants.filter(c=>c.active);
+    const nextIdx=s.cIdx+1;
+    if(nextIdx>=active.length){
+      upd(prev=>({...prev,cIdx:0,wordPhase:"idle",stageComplete:true,
+        currentWords:[],wordJudgments:{},discrepancies:[],judgesReady:{}}));
+    } else {
+      upd(prev=>({...prev,cIdx:nextIdx,wordPhase:"contestant_reveal",
+        currentWords:[],wordJudgments:{},discrepancies:[],judgesReady:{},currentWordIdx:0}));
+    }
+  },[]);
+
+  /* MC/Presenter starts the first contestant */
+  const doStartContestants = useCallback(() => {
+    upd(prev=>({...prev,wordPhase:"contestant_reveal",cIdx:0,
+      currentWords:[],wordJudgments:{},discrepancies:[],judgesReady:{}}));
+  },[]);
 
   const doConfirmContestants = () => {
     upd(prev=>({...prev, contestantsConfirmed:true}));
@@ -1166,10 +1324,18 @@ function App() {
         const confirmed={...prev.pdfConfirmed,[role]:true};
         const totalJudges=Math.max((prev.judges||[]).length,1);
         const judgesConfirmed=(prev.judges||[]).filter(j=>confirmed[j.id]).length;
-        const shouldArchive=judgesConfirmed>0&&judgesConfirmed>=totalJudges;
-        return {...prev, pdfConfirmed:confirmed, phase:shouldArchive?"archived":prev.phase};
+        const allDone=judgesConfirmed>0&&judgesConfirmed>=totalJudges;
+        // Set actasClosedAt timestamp — room archives 36h later
+        const actasClosedAt=allDone&&!prev.actasClosedAt?Date.now():prev.actasClosedAt;
+        return {...prev,pdfConfirmed:confirmed,actasClosedAt};
       });
     });
+  };
+
+  /* Configurator can print ANY judge's acta */
+  const doPrintJudgeActa = (judgeId) => {
+    const s=gsRef.current; if(!s) return;
+    printReport(s, judgeId, null);
   };
 
   const doArchive = () => {
@@ -1178,7 +1344,14 @@ function App() {
   };
 
   /* ── DERIVED ── */
-  const isHost=role==="host", isJudge=role&&role!=="host";
+  const isMC        = role==="mc";
+  const isPresenter = role==="presenter";
+  const isJudge     = role && ["J1","J2","J3","J4"].includes(role);
+  const isCreator   = !!sessionStorage.getItem("creator-"+roomId);
+  const myJudge     = (gs?.judges||[]).find(j=>j.id===role);
+  const numJudges   = gs?.judgeCount||3;
+  const allJudgesReady = (gs?.judges||[]).length>=numJudges && 
+    (gs?.judges||[]).every(j=>(gs?.judgesReady||{})[j.id]);
   const active=gs?.contestants?.filter(c=>c.active)||[];
   const cur=active[gs?.cIdx??0];
   const j=gs?.judgment, aw=gs?.activeWord;
@@ -1263,28 +1436,23 @@ function App() {
         {/* ── LOGIN VIEW ── */}
         {adminView==="login" && (
           <div style={{display:"flex",flexDirection:"column",gap:12}}>
-            {/* Google login for master */}
-            <div style={{borderBottom:"1px solid rgba(255,255,255,.08)",paddingBottom:14}}>
-              <p style={{color:"#4B5A78",fontSize:".78rem",marginBottom:10}}>Si eres el <strong style={{color:"#E8A200"}}>usuario maestro</strong>, inicia sesión con tu cuenta de Google:</p>
-              <button className="btn" style={{width:"100%",padding:12,background:"#fff",color:"#111",gap:10,fontSize:".9rem"}} disabled={adminBusy} onClick={doGoogleLogin}>
-                <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
-                {adminBusy?"Conectando...":"Iniciar sesión con Google"}
-              </button>
-            </div>
-            {/* Operator login */}
-            <p style={{color:"#4B5A78",fontSize:".78rem",marginTop:2}}>O si eres un <strong style={{color:"#a78bfa"}}>usuario operador</strong>:</p>
-            <input className="field" placeholder="Nombre de usuario" value={operLogin.username} onChange={e=>setOperLogin(p=>({...p,username:e.target.value}))} style={{fontSize:".88rem"}}/>
-            <input className="field" placeholder="Contraseña" type="password" value={operLogin.password} onChange={e=>setOperLogin(p=>({...p,password:e.target.value}))}
-              onKeyDown={e=>e.key==="Enter"&&doOperatorLogin()} style={{fontSize:".88rem"}}/>
-            <button className="btn btn-gold" style={{width:"100%"}} disabled={adminBusy||!operLogin.username||!operLogin.password} onClick={doOperatorLogin}>
-              {adminBusy?"Verificando...":"Entrar como Operador"}
+            <p style={{color:"#4B5A78",fontSize:".80rem",lineHeight:1.6}}>Ingresa con tu nombre de usuario y contraseña para acceder al sistema.</p>
+            <input className="field" placeholder="Nombre de usuario" value={operLogin.username}
+              onChange={e=>setOperLogin(p=>({...p,username:e.target.value}))} style={{fontSize:".90rem"}}
+              autoComplete="username"/>
+            <input className="field" placeholder="Contraseña" type="password" value={operLogin.password}
+              onChange={e=>setOperLogin(p=>({...p,password:e.target.value}))}
+              onKeyDown={e=>e.key==="Enter"&&doOperatorLogin()} style={{fontSize:".90rem"}}
+              autoComplete="current-password"/>
+            <button className="btn btn-gold" style={{width:"100%",padding:13}} disabled={adminBusy||!operLogin.username||!operLogin.password} onClick={doOperatorLogin}>
+              {adminBusy?"Verificando...":"Iniciar Sesión"}
             </button>
             {adminStatus && <p style={{color:adminStatus.startsWith("✅")?"#22c55e":"#f87171",fontSize:".82rem"}}>{adminStatus}</p>}
           </div>
         )}
 
         {/* ── DASHBOARD VIEW (master only) ── */}
-        {adminView==="dashboard" && adminUser?.type==="master" && (
+        {adminView==="dashboard" && (adminUser?.type==="master") && (
           <div style={{display:"flex",flexDirection:"column",gap:14}}>
             <div style={{padding:"8px 12px",background:"rgba(232,162,0,.1)",border:"1px solid rgba(232,162,0,.25)",borderRadius:10}}>
               <p style={{color:"#E8A200",fontSize:".78rem",fontWeight:700}}>👑 Maestro: {adminUser.email}</p>
@@ -1445,7 +1613,7 @@ function App() {
         {adminUser ? (
           <div style={{display:"flex",alignItems:"center",gap:8,padding:"5px 12px",background:"rgba(34,197,94,.1)",border:"1px solid rgba(34,197,94,.25)",borderRadius:16}}>
             <span style={{fontSize:".72rem",color:"#22c55e"}}>
-              {adminUser.type==="master"?"👑 Maestro: "+adminUser.email:"⚙️ "+adminUser.username+" · "+adminUser.activeRooms+"/"+adminUser.roomLimit+" salas"}
+              {adminUser.type==="master"?"👑 Maestro: "+adminUser.username:"⚙️ "+adminUser.username+" · "+adminUser.activeRooms+"/"+adminUser.roomLimit+" salas"}
             </span>
             <button className="btn btn-ghost" style={{padding:"2px 8px",fontSize:".68rem"}} onClick={doAdminLogout}>Salir</button>
             {adminUser.type==="master" && <button className="btn btn-ghost" style={{padding:"2px 8px",fontSize:".68rem"}} onClick={()=>{setAdminView("dashboard");setShowAdmin(true);}}>Panel</button>}
@@ -1483,7 +1651,7 @@ function App() {
         <p style={{color:"#4B5A78",fontSize:".78rem",marginBottom:12}}>Selecciona el rol que deseas tener. Puedes ser Monitor, o también cualquiera de los jurados.</p>
         <input className="field" placeholder="Tu nombre completo" value={nameIn} onChange={e=>setNameIn(e.target.value)} style={{marginBottom:10}}/>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
-          {[{id:"host",icon:"🎤",l:"Monitor"},{id:"judge",icon:"⚖️",l:"Jurado"}].map(r=>(
+          {[{id:"mc",icon:"🎙",l:"M. de Ceremonia"},{id:"presenter",icon:"🎤",l:"Presentador"},{id:"judge",icon:"⚖️",l:"Jurado"}].map(r=>(
             <button key={r.id} className="btn" onClick={()=>setRole(r.id)} style={{padding:"10px 8px",fontSize:".82rem",flexDirection:"column",gap:3,background:role===r.id?"#E8A200":"rgba(255,255,255,.05)",color:role===r.id?"#0C1628":"#E8EDF8",border:role===r.id?"none":"1px solid rgba(255,255,255,.1)"}}>
               <span style={{fontSize:"1.1rem"}}>{r.icon}</span><span style={{fontWeight:700}}>{r.l}</span>
             </button>
@@ -1514,44 +1682,51 @@ function App() {
         <div>
           <p style={{color:"#6B7FA3",fontSize:".72rem",fontWeight:700,letterSpacing:".06em",marginBottom:7}}>SELECCIONA TU ROL</p>
             <div style={{display:"flex",flexDirection:"column",gap:8}}>
-            {/* Monitor slot */}
-            {(() => {
-              const hostName=gs?.host?.name;
-              const occupied=!!hostName;
-              return (
-                <button className="btn" onClick={()=>!occupied&&setRole("host")} style={{flexDirection:"row",gap:10,padding:"12px 14px",fontSize:".86rem",background:role==="host"?"#E8A200":occupied?"rgba(255,255,255,.03)":"rgba(255,255,255,.05)",color:role==="host"?"#0C1628":occupied?"#3B4B6A":"#E8EDF8",border:role==="host"?"none":"1px solid rgba(255,255,255,.1)",cursor:occupied?"not-allowed":"pointer",opacity:occupied?0.7:1,justifyContent:"flex-start"}}>
-                  <span style={{fontSize:"1.3rem"}}>🎤</span>
-                  <div style={{textAlign:"left"}}>
-                    <div style={{fontWeight:700}}>Monitor</div>
-                    <div style={{fontSize:".72rem",opacity:.75}}>{occupied?"Ocupado: "+hostName:"Deseo ser el Monitor"}</div>
+            {[
+              {id:"mc",       icon:"🎙", label:"Maestro de Ceremonia", field:"mc"},
+              {id:"presenter",icon:"🎤", label:"Presentador",          field:"presenter"},
+            ].map(({id,icon,label,field})=>{
+              const occupied=!!(gs?.[field]?.name);
+              const takenName=gs?.[field]?.name;
+              return(
+                <button key={id} className="btn" onClick={()=>!occupied&&setRole(id)} style={{
+                  flexDirection:"row",gap:10,padding:"11px 14px",fontSize:".86rem",textAlign:"left",
+                  background:role===id?"#E8A200":occupied?"rgba(255,255,255,.02)":"rgba(255,255,255,.05)",
+                  color:role===id?"#0C1628":occupied?"#3B4B6A":"#E8EDF8",
+                  border:role===id?"none":"1px solid rgba(255,255,255,.1)",
+                  cursor:occupied?"not-allowed":"pointer",opacity:occupied?0.65:1,justifyContent:"flex-start"}}>
+                  <span style={{fontSize:"1.2rem"}}>{icon}</span>
+                  <div style={{flex:1}}>
+                    <div style={{fontWeight:700,fontSize:".84rem"}}>{label}</div>
+                    <div style={{fontSize:".70rem",opacity:.75}}>{occupied?"Ocupado: "+takenName:"Deseo ser "+label}</div>
                   </div>
-                  {occupied&&<span style={{marginLeft:"auto",fontSize:".68rem",color:"#ef4444",fontWeight:700}}>OCUPADO</span>}
+                  {occupied&&<span style={{fontSize:".66rem",color:"#ef4444",fontWeight:700}}>OCUPADO</span>}
                 </button>
               );
-            })()}
+            })}
             {/* Judge slots */}
-            {(() => {
-              const takenSlots=(gs?.judges||[]).map(j=>({id:j.id,name:j.name}));
-              const availableCount=3-takenSlots.length;
-              return (
-                <button className="btn" onClick={()=>availableCount>0&&setRole("judge")} style={{flexDirection:"row",gap:10,padding:"12px 14px",fontSize:".86rem",background:role==="judge"?"#E8A200":availableCount===0?"rgba(255,255,255,.03)":"rgba(255,255,255,.05)",color:role==="judge"?"#0C1628":availableCount===0?"#3B4B6A":"#E8EDF8",border:role==="judge"?"none":"1px solid rgba(255,255,255,.1)",cursor:availableCount===0?"not-allowed":"pointer",justifyContent:"flex-start",flexDirection:"column",alignItems:"flex-start"}}>
+            {(()=>{
+              const taken=(gs?.judges||[]);
+              const maxSlots=gs?.judgeCount||3;
+              const avail=maxSlots-taken.length;
+              return(
+                <button className="btn" onClick={()=>avail>0&&setRole("judge")} style={{
+                  flexDirection:"column",gap:4,padding:"11px 14px",fontSize:".86rem",
+                  background:role==="judge"?"#E8A200":avail===0?"rgba(255,255,255,.02)":"rgba(255,255,255,.05)",
+                  color:role==="judge"?"#0C1628":avail===0?"#3B4B6A":"#E8EDF8",
+                  border:role==="judge"?"none":"1px solid rgba(255,255,255,.1)",
+                  cursor:avail===0?"not-allowed":"pointer",alignItems:"flex-start"}}>
                   <div style={{display:"flex",alignItems:"center",gap:8,width:"100%"}}>
-                    <span style={{fontSize:"1.3rem"}}>⚖️</span>
-                    <div style={{textAlign:"left",flex:1}}>
-                      <div style={{fontWeight:700}}>Jurado</div>
-                      <div style={{fontSize:".72rem",opacity:.75}}>{availableCount===0?"No hay lugares disponibles":`${availableCount} lugar${availableCount!==1?"es":""} disponible${availableCount!==1?"s":""}`}</div>
+                    <span style={{fontSize:"1.2rem"}}>⚖️</span>
+                    <div style={{flex:1,textAlign:"left"}}>
+                      <div style={{fontWeight:700,fontSize:".84rem"}}>Jurado</div>
+                      <div style={{fontSize:".70rem",opacity:.75}}>{avail===0?"No hay lugares":""+avail+" lugar"+(avail!==1?"es":"")+" disponible"+(avail!==1?"s":"")+" de "+maxSlots}</div>
                     </div>
-                    {availableCount===0&&<span style={{fontSize:".68rem",color:"#ef4444",fontWeight:700}}>LLENO</span>}
+                    {avail===0&&<span style={{fontSize:".66rem",color:"#ef4444",fontWeight:700}}>LLENO</span>}
                   </div>
-                  {takenSlots.length>0&&(
-                    <div style={{display:"flex",gap:4,flexWrap:"wrap",marginTop:5,paddingLeft:30}}>
-                      {takenSlots.map(j=>(
-                        <span key={j.id} style={{fontSize:".65rem",background:"rgba(34,197,94,.15)",color:"#22c55e",padding:"1px 7px",borderRadius:10,border:"1px solid rgba(34,197,94,.25)"}}>
-                          ✅ {j.name}
-                        </span>
-                      ))}
-                    </div>
-                  )}
+                  {taken.length>0&&<div style={{display:"flex",gap:4,flexWrap:"wrap",paddingLeft:28}}>
+                    {taken.map(j=><span key={j.id} style={{fontSize:".64rem",background:"rgba(34,197,94,.15)",color:"#22c55e",padding:"1px 6px",borderRadius:8}}>✅ {j.name}</span>)}
+                  </div>}
                 </button>
               );
             })()}
@@ -1623,7 +1798,22 @@ function App() {
               </div>
             </label>
           </div>
-          <button className="btn btn-gold" style={{width:"100%",marginTop:8}} onClick={()=>setTab("banks")}>Continuar → Palabras</button>
+          <div style={{marginTop:14,padding:"10px 14px",background:"rgba(255,255,255,.04)",borderRadius:10,border:"1px solid rgba(255,255,255,.07)"}}>
+            <p style={{color:"#E8A200",fontWeight:700,fontSize:".74rem",letterSpacing:".05em",marginBottom:8}}>NÚMERO DE JURADOS</p>
+            <div style={{display:"flex",gap:8}}>
+              {[2,3,4].map(n=>(
+                <button key={n} className="btn" onClick={()=>upd(prev=>({...prev,judgeCount:n}))} style={{
+                  flex:1,padding:"9px 0",fontWeight:700,fontSize:".9rem",
+                  background:((gs?.judgeCount||3)===n)?"#E8A200":"rgba(255,255,255,.06)",
+                  color:((gs?.judgeCount||3)===n)?"#0C1628":"#E8EDF8",
+                  border:((gs?.judgeCount||3)===n)?"none":"1px solid rgba(255,255,255,.1)"}}>
+                  {n}
+                </button>
+              ))}
+            </div>
+            <p style={{color:"#4B5A78",fontSize:".72rem",marginTop:5}}>Mínimo 2, máximo 4 jurados</p>
+          </div>
+          <button className="btn btn-gold" style={{width:"100%",marginTop:12}} onClick={()=>setTab("banks")}>Continuar → Palabras</button>
         </div>
       )}
 
@@ -1787,7 +1977,7 @@ actually | /ˈæktʃuəli/
       {gs?.institution && <p style={{color:"#4B5A78"}}>{gs.institution}{gs?.level?" · "+gs.level:""}</p>}
       <div className="card" style={{textAlign:"center"}}>
         <p style={{color:"#4B5A78",fontSize:".76rem",fontWeight:700,letterSpacing:".05em",marginBottom:4}}>CONECTADO COMO</p>
-        <p style={{color:"#E8A200",fontSize:"1.15rem",fontWeight:700}}>{gs?.judges?.find(jj=>jj.id===role)?.name||(role==="host"?gs?.host?.name:null)||nameIn||role}</p>
+        <p style={{color:"#E8A200",fontSize:"1.15rem",fontWeight:700}}>{gs?.judges?.find(jj=>jj.id===role)?.name||(role==="mc"?gs?.mc?.name:null)||(role==="presenter"?gs?.presenter?.name:null)||nameIn||role}</p>
         <p style={{color:"#2D3A55",fontSize:".72rem",marginTop:4}}>🟢 Firebase · Sala {roomId}</p>
       </div>
     </div>
@@ -1822,7 +2012,7 @@ actually | /ˈæktʃuəli/
           {isJudge && (
             <div style={{display:"flex",flexDirection:"column",gap:10}}>
               <p style={{color:"#4B5A78",fontSize:".76rem",lineHeight:1.6}}>
-                Descarga tu acta PDF, guárdala o imprímela. Una vez que los 3 jurados confirmen, la sala se cierra automáticamente.
+                Descarga tu acta, guárdala o imprímela. La sala se cerrará 36 horas después de que todos confirmen.
               </p>
               <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:4}}>
                 {(gs?.judges||[]).map(j=>({id:j.id,name:j.name})).map(({id,name})=>(
@@ -1842,20 +2032,27 @@ actually | /ˈæktʃuəli/
                 <div style={{textAlign:"center",padding:"8px 0"}}>
                   <p style={{color:"#22c55e",fontSize:".84rem",marginBottom:6}}>✅ Tu acta fue confirmada.</p>
                   {!allDone && <p style={{color:"#4B5A78",fontSize:".76rem"}}>Esperando a los demás jurados ({confirmedCount}/{judgeCount})...</p>}
-                  {allDone && <p style={{color:"#22c55e",fontSize:".84rem",fontWeight:700}}>✅ Todos confirmaron — cerrando sala...</p>}
+                  {allDone && <p style={{color:"#22c55e",fontSize:".84rem",fontWeight:700}}>✅ Todos confirmaron — sala cierra en 36h.</p>}
                 </div>
               )}
             </div>
+
           )}
-          {isHost && (
-            <div style={{textAlign:"center",padding:"8px 0"}}>
+          {(isMC||isPresenter||isCreator) && !isJudge && (
+            <div style={{display:"flex",flexDirection:"column",gap:10,padding:"8px 0"}}>
               <p style={{color:"#4B5A78",fontSize:".82rem",lineHeight:1.6}}>
-                Puedes cerrar esta ventana cuando quieras.<br/>
-                <span style={{color:"#2D3A55",fontSize:".74rem"}}>La sala se cerrará automáticamente cuando los 3 jurados confirmen su acta.</span>
+                {isCreator?"Como configurador puedes descargar el acta de cada jurado:":""}
               </p>
-              <p style={{color:"#4B5A78",fontSize:".74rem",marginTop:10}}>
-                Confirmaciones: {confirmedCount}/3 {confirmedCount===3?"✅":"⏳"}
+              {isCreator && (gs?.judges||[]).map(j=>(
+                <button key={j.id} className="btn btn-pdf" style={{width:"100%",padding:10,justifyContent:"flex-start",gap:10,fontSize:".84rem"}}
+                  onClick={()=>doPrintJudgeActa(j.id)}>
+                  📄 Acta de {j.name}
+                </button>
+              ))}
+              <p style={{color:"#4B5A78",fontSize:".74rem",marginTop:6}}>
+                Confirmaciones de jurados: {confirmedCount}/{judgeCount} {allDone?"✅":"⏳"}
               </p>
+              {allDone && <p style={{color:"#22c55e",fontSize:".78rem"}}>La sala se cerrará 36 horas después de la última confirmación.</p>}
             </div>
           )}
         </div>
@@ -1884,9 +2081,9 @@ actually | /ˈæktʃuəli/
             Etapa {cfg?.label}
             {gs.stage==="tiebreaker"&&gs.tbRound>0&&<span style={{opacity:.7}}> · Ronda {gs.tbRound+1}</span>}
           </span>
-          {isHost&&<span style={{fontSize:".68rem",color:"#2D3A55",marginLeft:8}}>{active.length} activos</span>}
+          {(isMC||isCreator)&&<span style={{fontSize:".68rem",color:"#2D3A55",marginLeft:8}}>{active.length} activos</span>}
         </div>
-        <div style={{color:"#4B5A78",fontSize:".76rem"}}>{isHost?"🎤 Monitor":gs.judges.find(jj=>jj.id===role)?.name||"Jurado"}</div>
+        <div style={{color:"#4B5A78",fontSize:".76rem"}}>{isMC?(gs?.mc?.name||"Maestro de Ceremonia"):isPresenter?(gs?.presenter?.name||"Presentador"):myJudge?.name||"Jurado"}</div>
       </div>
 
       {/* Dispute indicator */}
@@ -1930,7 +2127,7 @@ actually | /ˈæktʃuəli/
               {cur && <button className="btn spin-btn" onClick={doSpin}>🎰 SPIN</button>}
             </div>
           )}
-          {!aw && isHost && (
+          {!aw && (isMC||isCreator) && (
             <p style={{color:"#4B5A78",textAlign:"center"}}>{cur?"⏳ Esperando que un jurado gire...":"Todos los concursantes completaron esta etapa"}</p>
           )}
           {aw && (
@@ -1982,7 +2179,7 @@ actually | /ˈæktʃuəli/
                   {gs.slot>=wpr-1||gs.stage==="tiebreaker" ? "→ Siguiente Concursante" : "→ Palabra "+(gs.slot+2)+" de "+wpr}
                 </button>
               )}
-              {isHost && <p style={{color:"#4B5A78",fontSize:".82rem"}}>Vista en tiempo real · Solo lectura</p>}
+              {(isMC||isPresenter||isCreator) && <p style={{color:"#4B5A78",fontSize:".82rem"}}>Vista en tiempo real · Solo lectura</p>}
             </div>
           )}
         </div>
@@ -1996,10 +2193,10 @@ actually | /ˈæktʃuəli/
           </h3>
 
           {/* ── HOST: animated reveal ── */}
-          {isHost && !gs.advancing.length && (
+          {(isMC||isCreator) && !gs.advancing.length && (
             <p style={{color:"#4B5A78",fontSize:".84rem",textAlign:"center"}}>⏳ Esperando que los jurados entreguen resultados...</p>
           )}
-          {isHost && gs.advancing.length>0 && !revealAdvancing && (
+          {(isMC||isCreator) && gs.advancing.length>0 && !revealAdvancing && (
             <div style={{textAlign:"center",padding:"20px 0"}}>
               <p style={{color:"#4B5A78",fontSize:".82rem",marginBottom:16}}>
                 {gs.stage==="tiebreaker"?"Los jurados han definido el desempate.":"Los jurados entregaron los resultados de esta etapa."}
@@ -2015,7 +2212,7 @@ actually | /ˈæktʃuəli/
               </button>
             </div>
           )}
-          {isHost && gs.advancing.length>0 && revealAdvancing && (
+          {(isMC||isCreator) && gs.advancing.length>0 && revealAdvancing && (
             <div className="fade-up">
               {gs.stage!=="tiebreaker" && (
                 <div style={{marginBottom:14}}>
