@@ -164,10 +164,7 @@ function parseTextBank(text) {
 
 /* Parse plain text for contestant names */
 function parseTextNames(text) {
-  return text.split(/[
-]+/)
-    .map(l=>l.replace(/^\d+[\.\)\-]\s*/,"").trim())
-    .filter(n=>n.length>1&&n.length<80);
+  return text.split(/[\r\n]+/).map(l=>l.replace(/^\d+[\.\)\-]\s*/,"").trim()).filter(n=>n.length>1&&n.length<80);
 }
 
 /* Parse PDF word bank */
@@ -184,8 +181,7 @@ async function parsePDFWordBank(file) {
           const content=await page.getTextContent();
           // Extract text items sorted by position (top-to-bottom, left-to-right)
           const items=content.items.map(i=>({str:i.str,x:i.transform[4],y:i.transform[5]}));
-          fullText+=items.map(i=>i.str).join(" ")+"
-";
+          fullText+=items.map(i=>i.str).join(" ")+"\n";
         }
         resolve(parseTextBank(fullText));
       } catch(err){resolve([]);}
@@ -206,9 +202,7 @@ async function parsePDFNames(file) {
         for(let p=1;p<=pdf.numPages;p++){
           const page=await pdf.getPage(p);
           const content=await page.getTextContent();
-          text+=content.items.map(i=>i.str).join("
-")+"
-";
+          text+=content.items.map(i=>i.str).join("\n")+"\n";
         }
         resolve(parseTextNames(text));
       } catch{resolve([]);}
@@ -597,10 +591,10 @@ async function loadAdminUsers() {
 }
 
 /* Crear usuario operador */
-async function createAdminUser(username, roomLimit, masterUID) {
+async function createAdminUser(username, roomLimit, createdBy) {
   const pwdHash = await hashPwd(DEFAULT_PWD);
-  const user = { passwordHash:pwdHash, roomLimit:roomLimit||5, active:true,
-    createdAt:Date.now(), createdBy:masterUID, totalCreated:0 };
+  const user = { passwordHash:pwdHash, roomLimit:roomLimit||6, active:true,
+    createdAt:Date.now(), createdBy:createdBy||'master', totalCreated:0 };
   await window.rtdb.ref(ADMIN_PATH+"/users/"+username).set(user);
 }
 
@@ -860,15 +854,14 @@ function App() {
   };
 
   const doAdminLogout = async () => {
-    await window.fbAuth?.signOut().catch(()=>{});
-    setAdminUser(null); setShowAdmin(false); setAdminView("login");
+    setAdminUser(null); setShowAdmin(false); setAdminView("login"); setOperLogin({username:"",password:""});
   };
 
   const doCreateAdminUser = async () => {
-    if (!newUserForm.username.trim()||!adminUser?.uid) return;
+    if (!newUserForm.username.trim()||!adminUser) return;
     setAdminBusy(true); setAdminStatus("");
     try {
-      await createAdminUser(newUserForm.username.trim(), +newUserForm.limit||5, adminUser.uid);
+      await createAdminUser(newUserForm.username.trim(), +newUserForm.limit||6, adminUser.username||'master');
       const users = await loadAdminUsers();
       setAdminUsers(users);
       setNewUserForm({username:"",limit:5});
@@ -2116,77 +2109,138 @@ actually | /ˈæktʃuəli/
         </div>
       )}
 
-      {/* Área de palabra */}
+      {/* Área de Concurso — Flujo por fases */}
       {!gs.stageComplete && (
-        <div className="card" style={{marginBottom:14,minHeight:220,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14}}>
-          {!aw && isJudge && (
+        <div className="card" style={{marginBottom:14,minHeight:220,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14,padding:18}}>
+
+          {/* IDLE */}
+          {(!gs.wordPhase||gs.wordPhase==="idle") && (
             <div style={{textAlign:"center"}}>
-              <p style={{color:"#4B5A78",marginBottom:22,fontSize:".9rem"}}>
-                {cur ? cur.name+" — lista para "+(gs.stage==="tiebreaker"?"la palabra de desempate":"la palabra "+(gs.slot+1)) : "Etapa completada"}
-              </p>
-              {cur && <button className="btn spin-btn" onClick={doSpin}>🎰 SPIN</button>}
+              <p style={{color:"#4B5A78",marginBottom:18}}>El concurso está listo para comenzar.</p>
+              {(isMC||isCreator) && <button className="btn btn-gold" style={{padding:"12px 32px"}} onClick={doStartContestants}>▶ Iniciar Concurso</button>}
+              {!isMC&&!isCreator&&<p style={{color:"#2D3A55"}}>Esperando al Maestro de Ceremonia...</p>}
             </div>
           )}
-          {!aw && (isMC||isCreator) && (
-            <p style={{color:"#4B5A78",textAlign:"center"}}>{cur?"⏳ Esperando que un jurado gire...":"Todos los concursantes completaron esta etapa"}</p>
-          )}
-          {aw && (
-            <div key={wordKey} className="pop" style={{width:"100%",textAlign:"center"}}>
-              <div style={{display:"flex",gap:10,marginBottom:20,justifyContent:"center",flexWrap:"wrap"}}>
-                <div className={"check "+(j?.start?"on":"")} onClick={()=>isJudge&&doToggle("start")} style={{cursor:isJudge?"pointer":"default",minWidth:155}}>
-                  <span style={{fontSize:"1.1rem"}}>{j?.start?"✅":"☐"}</span>
-                  <span style={{fontSize:".8rem",color:j?.start?"#22c55e":"#6B7FA3"}}>Pronunció al inicio</span>
-                </div>
-                <div className={"check "+(j?.end?"on":"")} onClick={()=>isJudge&&doToggle("end")} style={{cursor:isJudge?"pointer":"default",minWidth:155}}>
-                  <span style={{fontSize:"1.1rem"}}>{j?.end?"✅":"☐"}</span>
-                  <span style={{fontSize:".8rem",color:j?.end?"#22c55e":"#6B7FA3"}}>Pronunció al final</span>
-                </div>
-              </div>
-              <div className="word-font" style={{fontSize:"clamp(2.2rem,7vw,4rem)",marginBottom:10,color:wColor}}>
-                {aw.word.split("").map((ltr,i)=>{
-                  const e=j?.err, isErr=e?.index===i;
-                  return (
-                    <span key={i} className={"ltr "+(isErr&&e.type==="skipped"?"skip":"")+" "+(isErr&&e.type==="misspelled"?"bad":"")}
-                      onClick={()=>isJudge&&doLetterClick(i,ltr)} title={isJudge?"Clic para marcar error en esta letra":""}>
-                      {ltr}
-                    </span>
-                  );
-                })}
-              </div>
-              {aw.phonetic
-                ? <div className="ph-font" style={{fontSize:"1.15rem",marginBottom:14}}>{aw.phonetic}</div>
-                : <div style={{fontSize:".78rem",color:"#3B4B6A",marginBottom:14,fontStyle:"italic"}}>Sin fonética registrada</div>}
-              <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap",marginBottom:16}}>
-                {j?.err && (
-                  <span style={{fontSize:".76rem",padding:"4px 10px",borderRadius:16,background:j.err.type==="skipped"?"rgba(251,191,36,.15)":"rgba(248,113,113,.15)",color:j.err.type==="skipped"?"#fbbf24":"#f87171",border:"1px solid "+(j.err.type==="skipped"?"rgba(251,191,36,.35)":"rgba(248,113,113,.35)")}}>
-                    {j.err.type==="skipped"?"⚡ Omitida":"❌ Mal deletreada"}: «{j.err.letter.toUpperCase()}»
-                  </span>
-                )}
-                {j?.override!=null && (
-                  <span style={{fontSize:".76rem",padding:"4px 10px",borderRadius:16,background:j.override==="correct"?"rgba(34,197,94,.15)":"rgba(248,113,113,.15)",color:j.override==="correct"?"#22c55e":"#f87171",border:"1px solid "+(j.override==="correct"?"rgba(34,197,94,.35)":"rgba(248,113,113,.35)")}}>
-                    ✏️ Consenso: {j.override==="correct"?"Correcto":"Incorrecto"}
-                  </span>
-                )}
-                {isJudge && (
-                  <button className="btn btn-ghost" style={{padding:"4px 10px",fontSize:".76rem"}} onClick={()=>setOvrModal(true)}>✏️ Corregir por consenso</button>
-                )}
-                {isJudge && (
-                  <button className="btn btn-ghost" style={{padding:"4px 10px",fontSize:".76rem",color:"#fbbf24",borderColor:"rgba(251,191,36,.35)"}} onClick={doFlagDispute}>⚠️ Marcar discrepancia</button>
-                )}
-              </div>
+
+          {/* CONTESTANT REVEAL — judges press ready */}
+          {gs.wordPhase==="contestant_reveal" && cur && (
+            <div style={{textAlign:"center",width:"100%"}} className="fade-up">
+              {isPresenter && (
+                <>
+                  <p style={{color:"#4B5A78",fontSize:".75rem",marginBottom:8}}>Próximo concursante:</p>
+                  <p className="word-font" style={{fontSize:"2rem",color:"#E8A200"}}>{cur.name}</p>
+                </>
+              )}
               {isJudge && (
-                <button className="btn" style={{background:stCol+"CC",color:"white",padding:"12px 32px",fontSize:".95rem"}} onClick={doNext}>
-                  {gs.slot>=wpr-1||gs.stage==="tiebreaker" ? "→ Siguiente Concursante" : "→ Palabra "+(gs.slot+2)+" de "+wpr}
+                <>
+                  <p style={{color:"#4B5A78",fontSize:".8rem",marginBottom:8}}>Concursante:</p>
+                  <p className="word-font" style={{fontSize:"2rem",color:"#E8EDF8",marginBottom:16}}>{cur.name}</p>
+                  <button className="btn btn-gold" style={{padding:"13px 36px"}}
+                    onClick={doJudgeReady} disabled={!!(gs.judgesReady||{})[role]}>
+                    {(gs.judgesReady||{})[role]?"✅ Listo":"✋ Listo — presiona cuando estés preparado"}
+                  </button>
+                  <p style={{color:"#4B5A78",fontSize:".72rem",marginTop:8}}>
+                    Listos: {Object.keys(gs.judgesReady||{}).length}/{numJudges}
+                  </p>
+                </>
+              )}
+              {(isMC||isCreator) && (
+                <>
+                  <p style={{color:"#4B5A78",fontSize:".8rem",marginBottom:6}}>En turno:</p>
+                  <p className="word-font" style={{fontSize:"2rem",color:"#E8EDF8"}}>{cur.name}</p>
+                  <p style={{color:"#2D3A55",fontSize:".8rem",marginTop:10}}>
+                    Esperando que los {numJudges} jurados confirmen listos... ({Object.keys(gs.judgesReady||{}).length}/{numJudges})
+                  </p>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* WORD SHOW */}
+          {gs.wordPhase==="word_show" && cur && (()=>{
+            const cw=(gs.currentWords||[])[gs.currentWordIdx||0];
+            const wi=gs.currentWordIdx||0;
+            const myVote=((gs.wordJudgments||{})[wi]||{})[role];
+            const totalVotes=Object.keys((gs.wordJudgments||{})[wi]||{}).length;
+            return (
+              <div style={{width:"100%",textAlign:"center"}} className="pop">
+                <p style={{color:"#4B5A78",fontSize:".72rem",marginBottom:4}}>{cur.name} — Palabra {wi+1} de 3</p>
+                <div className="word-font" style={{fontSize:"clamp(1.8rem,5vw,3rem)",marginBottom:8,color:"#22c55e"}}>{(cw?.word||"").toUpperCase()}</div>
+                <div className="ph-font" style={{fontSize:"1rem",marginBottom:14}}>{cw?.phonetic||""}</div>
+                {isJudge && !myVote && (
+                  <div style={{display:"flex",gap:10,justifyContent:"center"}}>
+                    <button className="btn btn-green" style={{padding:"11px 22px"}} onClick={()=>doJudgeWordVerdict("correct",null)}>✅ Correcta</button>
+                    <button className="btn btn-red" style={{padding:"11px 22px"}} onClick={()=>doJudgeWordVerdict("incorrect",null)}>❌ Incorrecta</button>
+                  </div>
+                )}
+                {isJudge && myVote && (
+                  <p style={{fontWeight:700,color:myVote.verdict==="correct"?"#22c55e":"#ef4444"}}>
+                    {myVote.verdict==="correct"?"✅ Marcaste: Correcta":"❌ Marcaste: Incorrecta"}
+                  </p>
+                )}
+                {!isJudge && <p style={{color:"#4B5A78"}}>{totalVotes}/{numJudges} jurados calificaron</p>}
+              </div>
+            );
+          })()}
+
+          {/* DELIBERATION */}
+          {gs.wordPhase==="deliberation" && (()=>{
+            const unresolved=(gs.discrepancies||[]).filter(d=>!d.resolved);
+            const disc=unresolved[0];
+            if(!disc) return null;
+            const discIdx=(gs.discrepancies||[]).findIndex(d=>!d.resolved);
+            return (
+              <div style={{width:"100%"}} className="fade-up">
+                <p style={{color:"#fbbf24",fontWeight:700,fontSize:".8rem",marginBottom:8}}>⚠ DISCREPANCIA — Palabra {(disc.wordIdx||0)+1}</p>
+                <div className="word-font" style={{fontSize:"1.8rem",textAlign:"center",marginBottom:4}}>{(disc.word||"").toUpperCase()}</div>
+                <div className="ph-font" style={{textAlign:"center",marginBottom:12,fontSize:".9rem"}}>{disc.phonetic||""}</div>
+                {isPresenter && <p style={{color:"#4B5A78",textAlign:"center"}}>Los jurados están deliberando. El siguiente concursante es: <strong style={{color:"#E8A200"}}>{(gs.contestants?.filter(c=>c.active)||[])[(gs.cIdx||0)+1]?.name||"—"}</strong></p>}
+                {!isPresenter && (
+                  <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap",marginBottom:10}}>
+                    {Object.entries(disc.votes||{}).map(([jid,v])=>{
+                      const judgeObj=(gs.judges||[]).find(j=>j.id===jid);
+                      const lastName=(judgeObj?.name||jid).split(" ")[1]||(judgeObj?.name||jid);
+                      return (
+                        <button key={jid} className="btn" onClick={()=>doResolveDiscrepancy(discIdx,v)} style={{
+                          flexDirection:"column",gap:2,padding:"9px 14px",
+                          background:v==="correct"?"rgba(34,197,94,.15)":"rgba(248,113,113,.15)",
+                          color:v==="correct"?"#22c55e":"#f87171",
+                          border:"1px solid "+(v==="correct"?"rgba(34,197,94,.4)":"rgba(248,113,113,.4)")}}>
+                          <span>{v==="correct"?"✅ Correcta":"❌ Incorrecta"}</span>
+                          <span style={{fontSize:".68rem",opacity:.75}}>{lastName}</span>
+                        </button>
+                      );
+                    })}
+                    <button className="btn btn-ghost" style={{flexDirection:"column",gap:2,padding:"9px 12px"}}
+                      onClick={()=>{
+                        const r=window.prompt("Resultado definitivo (correct / incorrect):");
+                        if(r==="correct"||r==="incorrect") doResolveDiscrepancy(discIdx,r);
+                      }}>
+                      <span>✏️</span><span style={{fontSize:".72rem"}}>Editar</span>
+                    </button>
+                  </div>
+                )}
+                <p style={{color:"#4B5A78",fontSize:".72rem",textAlign:"center"}}>{unresolved.length} discrepancia(s) pendiente(s)</p>
+              </div>
+            );
+          })()}
+
+          {/* STAGE END per contestant */}
+          {gs.wordPhase==="stage_end" && cur && (
+            <div style={{textAlign:"center"}} className="fade-up">
+              <p style={{color:"#22c55e",fontWeight:700,fontSize:"1rem",marginBottom:10}}>✅ {cur.name} completó sus palabras</p>
+              {(isMC||isCreator) && (
+                <button className="btn btn-gold" style={{padding:"12px 28px"}} onClick={doNextContestant}>
+                  {(gs.contestants?.filter(c=>c.active)||[]).length > (gs.cIdx||0)+1 ? "▶ Siguiente Concursante" : "📊 Ver Resultados de Etapa"}
                 </button>
               )}
-              {(isMC||isPresenter||isCreator) && <p style={{color:"#4B5A78",fontSize:".82rem"}}>Vista en tiempo real · Solo lectura</p>}
+              {!isMC&&!isCreator&&<p style={{color:"#4B5A78"}}>Esperando al Maestro de Ceremonia...</p>}
             </div>
           )}
+
         </div>
       )}
-
-      {/* Etapa completa */}
-      {gs.stageComplete && (
+{gs.stageComplete && (
         <div className="card fade-up" style={{marginBottom:14,borderColor:"rgba(232,162,0,.5)"}}>
           <h3 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.4rem",marginBottom:14}}>
             Etapa {cfg?.label} — {gs.stage==="tiebreaker"?"Ronda "+(gs.tbRound+1)+" completada":"Resultados"}
