@@ -135,8 +135,7 @@ async function getPhonetics(words, onProgress) {
 /* Parse plain text / paste for word bank */
 function parseTextBank(text) {
   const entries=[], seen=new Set();
-  for (const rawLine of text.split(/[
-]+/)) {
+  for (const rawLine of text.split(/[\r\n]+/)) {
     const line=rawLine.trim(); if(!line)continue;
     let matched=false;
     for (const sep of [" | "," - ","	"]) {
