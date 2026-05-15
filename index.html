@@ -44,9 +44,7 @@ window.FIREBASE_OK = false;
     if (!firebase.apps.length) {          /* Avoid "already initialized" on hot-reload */
       firebase.initializeApp(FIREBASE_CONFIG);
     }
-    window.rtdb   = firebase.database();
-    window.fbAuth = firebase.auth();
-    window.fbAuth.useDeviceLanguage();
+    window.rtdb = firebase.database();
     window.FIREBASE_OK = true;
     /* Notify React that Firebase is ready */
     ensureMasterExists().catch(console.error);
