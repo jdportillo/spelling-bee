@@ -47,7 +47,6 @@ window.FIREBASE_OK = false;
     window.rtdb = firebase.database();
     window.FIREBASE_OK = true;
     /* Notify React that Firebase is ready */
-    ensureMasterExists().catch(console.error);
     window.dispatchEvent(new Event('firebase-ready'));
   } catch(e) {
     console.error("Firebase init error:", e);
@@ -808,8 +807,8 @@ function App() {
 
   /* Force re-check FIREBASE_OK once Firebase finishes async init */
   useEffect(() => {
-    if (window.FIREBASE_OK) return;
-    const onReady = () => { setScreen(s => s); };
+    if (window.FIREBASE_OK) { ensureMasterExists().catch(console.error); return; }
+    const onReady = () => { ensureMasterExists().catch(console.error); setScreen(s => s); };
     window.addEventListener('firebase-ready', onReady);
     // After 12s, if still not ready, show error
     const timeout = setTimeout(() => {
@@ -1833,10 +1832,7 @@ function App() {
                     </div>
                   </label>
                 ) : (
-                  <textarea className="field" rows={5} placeholder={"above
-account
-actually | /ˈæktʃuəli/
-..."} value={pasteTexts[key]} onChange={e=>setPasteTexts(p=>({...p,[key]:e.target.value}))} style={{borderRadius:0,border:"none",borderTop:"1px solid rgba(255,255,255,.06)",width:"100%",resize:"vertical",fontSize:".84rem"}}/>
+                  <textarea className="field" rows={5} placeholder={"above\naccount\nactually | /ˈæktʃuəli/\n..."} value={pasteTexts[key]} onChange={e=>setPasteTexts(p=>({...p,[key]:e.target.value}))} style={{borderRadius:0,border:"none",borderTop:"1px solid rgba(255,255,255,.06)",width:"100%",resize:"vertical",fontSize:".84rem"}}/>
                 )}
               </div>
             ))}
