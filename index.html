@@ -195,6 +195,10 @@ function parseTextBank(text) {
       if(idx>0){
         const w=line.slice(0,idx).trim().toLowerCase();
         const ph=line.slice(idx+sep.length).trim();
+        // Skip document headers (e.g. "BASIC LIST - 2025") and invalid entries
+        if(/\b(list|basic|intermediate|advanced|extra|round|spelling|bee|macmillan)\b/.test(w)){matched=true;break;}
+        if(/^\d{4}/.test(ph)){matched=true;break;} // year at start = header artifact
+        if(ph.length>80||(ph.match(/\d/g)||[]).length>ph.length/3){matched=true;break;} // not real phonetic
         if(/^[a-z][a-z\s'-]*$/.test(w)&&!seen.has(w)){entries.push({word:w.replace(/\s+/g," "),phonetic:ph});seen.add(w);matched=true;break;}
       }
     }
@@ -216,7 +220,7 @@ function parseTextNames(text) {
   return text.split(/[\r\n]+/).map(l=>l.replace(/^\d+[\.\)\-]\s*/,"").trim()).filter(n=>n.length>1&&n.length<80);
 }
 
-/* Parse PDF word bank */
+/* Parse PDF word bank — handles Macmillan 3-column numbered lists */
 async function parsePDFWordBank(file) {
   return new Promise(resolve => {
     const fr=new FileReader();
@@ -224,22 +228,54 @@ async function parsePDFWordBank(file) {
       try {
         if(!window.pdfjsLib){resolve([]);return;}
         const pdf=await pdfjsLib.getDocument({data:e.target.result}).promise;
-        let fullText="";
+        // Collect ALL text items from ALL pages with their positions
+        let allItems=[];
         for(let p=1;p<=pdf.numPages;p++){
           const page=await pdf.getPage(p);
           const content=await page.getTextContent();
-          // Extract text items sorted by position (top-to-bottom, left-to-right)
-          const items=content.items.map(i=>({str:i.str,x:i.transform[4],y:i.transform[5]}));
-          fullText+=items.map(i=>i.str).join(" ")+"\n";
+          for(const item of content.items){
+            if(item.str&&item.str.trim()) allItems.push({str:item.str.trim(),y:item.transform[5],x:item.transform[4]});
+          }
         }
-        resolve(parseTextBank(fullText));
+        // Group items into lines by Y coordinate (tolerance = 4pt)
+        allItems.sort((a,b)=>b.y-a.y||a.x-b.x);
+        const lines=[];
+        let curY=null,curLine="";
+        for(const item of allItems){
+          if(curY===null||Math.abs(item.y-curY)>4){
+            if(curLine.trim()) lines.push(curLine.trim());
+            curLine=item.str; curY=item.y;
+          } else { curLine+=" "+item.str; }
+        }
+        if(curLine.trim()) lines.push(curLine.trim());
+
+        // PASS 1: try numbered-list format (Macmillan style: "1 after", "2 alive", etc.)
+        const entries1=[], seen1=new Set();
+        for(const line of lines){
+          // Match: optional number + word(s) — ignore headers, years, single chars
+          const m=line.match(/^(?:\d+\.?\s+)?([a-zA-Z][a-z\s\-']{1,38}[a-z])\s*$/);
+          if(m){
+            const w=m[1].trim().replace(/\s+/g," ").toLowerCase();
+            // Skip document headers and section labels
+            if(/\b(list|basic|intermediate|advanced|extra|round|spelling|bee|page|words|macmillan)\b/.test(w)) continue;
+            if(w.split(" ").length>5) continue;
+            if(!seen1.has(w)){entries1.push({word:w,phonetic:""});seen1.add(w);}
+          }
+        }
+
+        // PASS 2: try "word | phonetic" or "word - phonetic" format (custom banks)
+        const entries2=parseTextBank(lines.join("\n"));
+
+        // Use whichever pass yielded more results
+        const result=entries1.length>=entries2.length?entries1:entries2;
+        resolve(result.length>0?result:entries2);
       } catch(err){resolve([]);}
     };
     fr.readAsArrayBuffer(file);
   });
 }
 
-/* Parse PDF contestant list */
+/* Parse PDF contestant list — line-by-line extraction */
 async function parsePDFNames(file) {
   return new Promise(resolve => {
     const fr=new FileReader();
@@ -247,13 +283,26 @@ async function parsePDFNames(file) {
       try {
         if(!window.pdfjsLib){resolve([]);return;}
         const pdf=await pdfjsLib.getDocument({data:e.target.result}).promise;
-        let text="";
+        let allItems=[];
         for(let p=1;p<=pdf.numPages;p++){
           const page=await pdf.getPage(p);
           const content=await page.getTextContent();
-          text+=content.items.map(i=>i.str).join("\n")+"\n";
+          for(const item of content.items){
+            if(item.str&&item.str.trim()) allItems.push({str:item.str.trim(),y:item.transform[5],x:item.transform[4]});
+          }
         }
-        resolve(parseTextNames(text));
+        // Group by Y coordinate
+        allItems.sort((a,b)=>b.y-a.y||a.x-b.x);
+        const lines=[];
+        let curY=null,curLine="";
+        for(const item of allItems){
+          if(curY===null||Math.abs(item.y-curY)>4){
+            if(curLine.trim()) lines.push(curLine.trim());
+            curLine=item.str; curY=item.y;
+          } else { curLine+=" "+item.str; }
+        }
+        if(curLine.trim()) lines.push(curLine.trim());
+        resolve(parseTextNames(lines.join("\n")));
       } catch{resolve([]);}
     };
     fr.readAsArrayBuffer(file);
@@ -756,6 +805,24 @@ const CSS = `
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
   .fade-up{animation:fadeUp .3s ease;}.pop{animation:pop .4s ease;}.pulse{animation:pulse 2s infinite;}
 `;
+
+/* ════════════════════════════════════════════
+   ERROR BOUNDARY — prevents full blue-screen crash
+════════════════════════════════════════════ */
+class ErrorBoundary extends React.Component {
+  constructor(props){super(props);this.state={err:null};}
+  static getDerivedStateFromError(err){return{err};}
+  componentDidCatch(err,info){console.error("App error:",err,info);}
+  render(){
+    if(this.state.err) return React.createElement("div",{style:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",background:"#0C1628",color:"#E8EDF8",gap:16,padding:24}},
+      React.createElement("div",{style:{fontSize:"3rem"}},"🐝"),
+      React.createElement("h2",{style:{color:"#E8A200"}},"Ocurrió un error"),
+      React.createElement("p",{style:{color:"#4B5A78",fontSize:".9rem",maxWidth:400,textAlign:"center"}},String(this.state.err?.message||"Error desconocido")),
+      React.createElement("button",{style:{padding:"10px 24px",background:"#E8A200",color:"#0C1628",border:"none",borderRadius:10,fontWeight:700,cursor:"pointer",fontSize:"1rem"},onClick:()=>window.location.reload()},"🔄 Recargar página")
+    );
+    return this.props.children;
+  }
+}
 
 /* ════════════════════════════════════════════
    APP
@@ -2430,7 +2497,7 @@ function App() {
 }
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
-root.render(<App />);
+root.render(<ErrorBoundary><App /></ErrorBoundary>);
 </script>
 </body>
 </html>
