@@ -73,6 +73,59 @@ const STAGES = {
   advanced:     { label:"Avanzada",   color:"#ef4444", bank:"advanced",     next:"tiebreaker",   wpr:3 },
   tiebreaker:   { label:"Desempate",  color:"#a78bfa", bank:"advanced",     next:null,           wpr:1 },
 };
+/* ── FIREBASE ARRAY FIX ──
+   Firebase RTDB converts JS arrays to {0:{…},1:{…}} objects.
+   This function restores all arrays after every Firebase read. */
+function fixArrays(data) {
+  if (!data || typeof data !== 'object') return data;
+  function toArr(v) {
+    if (!v) return [];
+    if (Array.isArray(v)) return v;
+    return Object.values(v);
+  }
+  // banks
+  if (data.banks) {
+    ['basic','intermediate','advanced'].forEach(k => {
+      if (data.banks[k]) data.banks[k] = toArr(data.banks[k]);
+    });
+  }
+  // usedWords
+  if (data.usedWords) {
+    ['basic','intermediate','advanced'].forEach(k => {
+      if (data.usedWords[k]) data.usedWords[k] = toArr(data.usedWords[k]);
+    });
+  }
+  // contestants
+  if (data.contestants) data.contestants = toArr(data.contestants);
+  // judges
+  if (data.judges) data.judges = toArr(data.judges);
+  // history
+  if (data.history) data.history = toArr(data.history);
+  // currentWords
+  if (data.currentWords) data.currentWords = toArr(data.currentWords);
+  // discrepancies
+  if (data.discrepancies) data.discrepancies = toArr(data.discrepancies);
+  // advancing
+  if (data.advancing) data.advancing = toArr(data.advancing);
+  // scores — each stage has {cId: {v:[]}} — fix the inner v arrays
+  if (data.scores) {
+    ['basic','intermediate','advanced','tiebreaker'].forEach(stage => {
+      if (data.scores[stage]) {
+        Object.keys(data.scores[stage]).forEach(cId => {
+          if (data.scores[stage][cId]?.v) {
+            data.scores[stage][cId].v = toArr(data.scores[stage][cId].v);
+          }
+          if (data.scores[stage][cId]?.rounds) {
+            data.scores[stage][cId].rounds = toArr(data.scores[stage][cId].rounds);
+          }
+        });
+      }
+    });
+  }
+  return data;
+}
+
+
 
 /* ── INITIAL STATE ── */
 function initState() {
@@ -766,7 +819,7 @@ function App() {
     }
     setScreen("checking");
     window.rtdb.ref("spellingbee/rooms/"+room+"/state").once("value").then(snap => {
-      const s = snap.val();
+      const s = fixArrays(snap.val());
       if (!s) { setScreen("room-not-found"); return; }
       if (s.phase==="archived") { setScreen("room-closed"); return; }
       // Auto-expire after 72 hours of inactivity
@@ -788,7 +841,8 @@ function App() {
     if (!role||!roomId||!window.FIREBASE_OK) return;
     const ref = window.rtdb.ref("spellingbee/rooms/"+roomId+"/state");
     const h = snap => {
-      const data = snap.val(); if (!data) return;
+      const raw = snap.val(); if (!raw) return;
+      const data = fixArrays(raw);
       setGs(prev => JSON.stringify(prev)===JSON.stringify(data) ? prev : data);
       const sc = screenRef.current;
       if (data.phase==="competition" && (sc==="setup"||sc==="setup-wait")) setScreen("competition");
@@ -927,7 +981,7 @@ function App() {
   const doLogin = async () => {
     if (!role||!nameIn.trim()) return;
     const snap = await window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").once("value");
-    let s = snap.val() || gs || initState();
+    let s = fixArrays(snap.val()) || gs || initState();
     if (role==="mc") {
       s = {...s, mc:{name:nameIn.trim(),ts:Date.now()}};
     } else if (role==="presenter") {
