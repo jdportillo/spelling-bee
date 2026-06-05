@@ -67,65 +67,37 @@ function getShareUrl(roomId) {
 }
 
 /* ── STAGE CONFIG ── */
+/* FIREBASE ARRAY FIX: RTDB converts JS arrays to {0:{},1:{},...} objects.
+   Restore all arrays after every Firebase read. */
+function fixArrays(data) {
+  if(!data||typeof data!=='object') return data;
+  function toArr(v){ if(!v) return []; if(Array.isArray(v)) return v; return Object.values(v); }
+  if(data.banks){['basic','intermediate','advanced'].forEach(k=>{if(data.banks[k]) data.banks[k]=toArr(data.banks[k]);});}
+  if(data.usedWords){['basic','intermediate','advanced'].forEach(k=>{if(data.usedWords[k]) data.usedWords[k]=toArr(data.usedWords[k]);});}
+  if(data.contestants) data.contestants=toArr(data.contestants);
+  if(data.judges)      data.judges=toArr(data.judges);
+  if(data.history)     data.history=toArr(data.history);
+  if(data.currentWords) data.currentWords=toArr(data.currentWords);
+  if(data.discrepancies) data.discrepancies=toArr(data.discrepancies);
+  if(data.advancing)   data.advancing=toArr(data.advancing);
+  if(data.scores){
+    ['basic','intermediate','advanced','tiebreaker'].forEach(stage=>{
+      if(data.scores[stage]) Object.keys(data.scores[stage]).forEach(cId=>{
+        const sc=data.scores[stage][cId];
+        if(sc?.v) sc.v=toArr(sc.v);
+        if(sc?.rounds) sc.rounds=toArr(sc.rounds);
+      });
+    });
+  }
+  return data;
+}
+
 const STAGES = {
   basic:        { label:"Básica",     color:"#22c55e", bank:"basic",        next:"intermediate", wpr:3 },
   intermediate: { label:"Intermedia", color:"#f59e0b", bank:"intermediate", next:"advanced",     wpr:3 },
   advanced:     { label:"Avanzada",   color:"#ef4444", bank:"advanced",     next:"tiebreaker",   wpr:3 },
   tiebreaker:   { label:"Desempate",  color:"#a78bfa", bank:"advanced",     next:null,           wpr:1 },
 };
-/* ── FIREBASE ARRAY FIX ──
-   Firebase RTDB converts JS arrays to {0:{…},1:{…}} objects.
-   This function restores all arrays after every Firebase read. */
-function fixArrays(data) {
-  if (!data || typeof data !== 'object') return data;
-  function toArr(v) {
-    if (!v) return [];
-    if (Array.isArray(v)) return v;
-    return Object.values(v);
-  }
-  // banks
-  if (data.banks) {
-    ['basic','intermediate','advanced'].forEach(k => {
-      if (data.banks[k]) data.banks[k] = toArr(data.banks[k]);
-    });
-  }
-  // usedWords
-  if (data.usedWords) {
-    ['basic','intermediate','advanced'].forEach(k => {
-      if (data.usedWords[k]) data.usedWords[k] = toArr(data.usedWords[k]);
-    });
-  }
-  // contestants
-  if (data.contestants) data.contestants = toArr(data.contestants);
-  // judges
-  if (data.judges) data.judges = toArr(data.judges);
-  // history
-  if (data.history) data.history = toArr(data.history);
-  // currentWords
-  if (data.currentWords) data.currentWords = toArr(data.currentWords);
-  // discrepancies
-  if (data.discrepancies) data.discrepancies = toArr(data.discrepancies);
-  // advancing
-  if (data.advancing) data.advancing = toArr(data.advancing);
-  // scores — each stage has {cId: {v:[]}} — fix the inner v arrays
-  if (data.scores) {
-    ['basic','intermediate','advanced','tiebreaker'].forEach(stage => {
-      if (data.scores[stage]) {
-        Object.keys(data.scores[stage]).forEach(cId => {
-          if (data.scores[stage][cId]?.v) {
-            data.scores[stage][cId].v = toArr(data.scores[stage][cId].v);
-          }
-          if (data.scores[stage][cId]?.rounds) {
-            data.scores[stage][cId].rounds = toArr(data.scores[stage][cId].rounds);
-          }
-        });
-      }
-    });
-  }
-  return data;
-}
-
-
 
 /* ── INITIAL STATE ── */
 function initState() {
@@ -195,10 +167,10 @@ function parseTextBank(text) {
       if(idx>0){
         const w=line.slice(0,idx).trim().toLowerCase();
         const ph=line.slice(idx+sep.length).trim();
-        // Skip document headers (e.g. "BASIC LIST - 2025") and invalid entries
-        if(/\b(list|basic|intermediate|advanced|extra|round|spelling|bee|macmillan)\b/.test(w)){matched=true;break;}
-        if(/^\d{4}/.test(ph)){matched=true;break;} // year at start = header artifact
-        if(ph.length>80||(ph.match(/\d/g)||[]).length>ph.length/3){matched=true;break;} // not real phonetic
+        // Skip document headers (e.g. "BASIC LIST - 2025") and non-word entries
+        if(/\b(list|basic|intermediate|advanced|extra|round|macmillan)\b/.test(w)){matched=true;break;}
+        if(/^\d{4}/.test(ph)){matched=true;break;}
+        if(ph.length>80||(ph.match(/\d/g)||[]).length>ph.length/3){matched=true;break;}
         if(/^[a-z][a-z\s'-]*$/.test(w)&&!seen.has(w)){entries.push({word:w.replace(/\s+/g," "),phonetic:ph});seen.add(w);matched=true;break;}
       }
     }
@@ -223,90 +195,111 @@ function parseTextNames(text) {
 /* Parse PDF word bank — handles Macmillan 3-column numbered lists */
 async function parsePDFWordBank(file) {
   return new Promise(resolve => {
-    const fr=new FileReader();
-    fr.onload=async e=>{
+    const fr = new FileReader();
+    fr.onload = async e => {
       try {
-        if(!window.pdfjsLib){resolve([]);return;}
-        const pdf=await pdfjsLib.getDocument({data:e.target.result}).promise;
-        // Collect ALL text items from ALL pages with their positions
-        let allItems=[];
-        for(let p=1;p<=pdf.numPages;p++){
-          const page=await pdf.getPage(p);
-          const content=await page.getTextContent();
-          for(const item of content.items){
-            if(item.str&&item.str.trim()) allItems.push({str:item.str.trim(),y:item.transform[5],x:item.transform[4]});
+        if(!window.pdfjsLib){ resolve([]); return; }
+        const pdf = await pdfjsLib.getDocument({data:e.target.result}).promise;
+        let allItems = [];
+        for(let p=1; p<=pdf.numPages; p++){
+          const page = await pdf.getPage(p);
+          const tc   = await page.getTextContent();
+          for(const item of tc.items){
+            const s=item.str.trim();
+            if(s) allItems.push({s, x:item.transform[4], y:item.transform[5]});
           }
         }
-        // Group items into lines by Y coordinate (tolerance = 4pt)
-        allItems.sort((a,b)=>b.y-a.y||a.x-b.x);
-        const lines=[];
-        let curY=null,curLine="";
-        for(const item of allItems){
-          if(curY===null||Math.abs(item.y-curY)>4){
-            if(curLine.trim()) lines.push(curLine.trim());
-            curLine=item.str; curY=item.y;
-          } else { curLine+=" "+item.str; }
+        // Sort: top-to-bottom, left-to-right
+        allItems.sort((a,b)=>(b.y-a.y)||(a.x-b.x));
+        // Group items into rows by Y coordinate (tolerance ±4)
+        const rows=[]; let row=[], prevY=null;
+        for(const {s,y} of allItems){
+          if(prevY===null||Math.abs(y-prevY)<=4){ row.push(s); }
+          else { if(row.length) rows.push(row.join(' ').trim()); row=[s]; }
+          prevY=y;
         }
-        if(curLine.trim()) lines.push(curLine.trim());
-
-        // PASS 1: try numbered-list format (Macmillan style: "1 after", "2 alive", etc.)
-        const entries1=[], seen1=new Set();
-        for(const line of lines){
-          // Match: optional number + word(s) — ignore headers, years, single chars
-          const m=line.match(/^(?:\d+\.?\s+)?([a-zA-Z][a-z\s\-']{1,38}[a-z])\s*$/);
-          if(m){
-            const w=m[1].trim().replace(/\s+/g," ").toLowerCase();
-            // Skip document headers and section labels
-            if(/\b(list|basic|intermediate|advanced|extra|round|spelling|bee|page|words|macmillan)\b/.test(w)) continue;
-            if(w.split(" ").length>5) continue;
-            if(!seen1.has(w)){entries1.push({word:w,phonetic:""});seen1.add(w);}
+        if(row.length) rows.push(row.join(' ').trim());
+        // Skip junk rows (headers, footers, year-only)
+        const JUNK=/\b(macmillan|spelling bee)\b|^words on|representative of|english language|^\d{4}$|^(basic|intermediate|advanced)\s+list|^extra\s+round/i;
+        const cleanRows=rows.filter(r=>r.length>1&&!JUNK.test(r));
+        // PRIMARY: global regex finds ALL "number + word(s)" patterns per row
+        // Works for 3-col ("1 after 44 doctor 85 king") and 1-col ("1. advertisement")
+        const entries=[], seen=new Set();
+        const STOP=/^(the|and|of|on|in|at|to|a|is|it|be|as|by|or|an|their|high|sound|most)$/;
+        const RE=/\d+\.?\s+([a-zA-Z][a-zA-Z\s\u2011\-']{0,38}?[a-zA-Z])(?=\s+\d+\.?|\s*$)/g;
+        for(const row of cleanRows){
+          if(JUNK.test(row)) continue;
+          RE.lastIndex=0;
+          let m;
+          while((m=RE.exec(row))!==null){
+            const w=m[1].trim().replace(/\s+/g,' ').toLowerCase();
+            if(w.length<2||w.length>42||w.split(' ').length>5) continue;
+            if(STOP.test(w)||JUNK.test(w)) continue;
+            if(!seen.has(w)){ entries.push({word:w,phonetic:''}); seen.add(w); }
           }
         }
-
-        // PASS 2: try "word | phonetic" or "word - phonetic" format (custom banks)
-        const entries2=parseTextBank(lines.join("\n"));
-
-        // Use whichever pass yielded more results
-        const result=entries1.length>=entries2.length?entries1:entries2;
-        resolve(result.length>0?result:entries2);
-      } catch(err){resolve([]);}
+        // Fallback: "word | phonetic" custom format
+        if(entries.length<5){
+          const fb=parseTextBank(cleanRows.join('\n'));
+          if(fb.length>entries.length){ resolve(fb); return; }
+        }
+        // Fallback B: item-by-item (non-numbered PDFs)
+        if(entries.length<5){
+          const fb2=[],s2=new Set();
+          for(const {s} of allItems){
+            if(!s||s.length<2||s.length>42) continue;
+            if(/^\d+$/.test(s)||!/^[a-zA-Z]/.test(s)) continue;
+            if(!/^[a-zA-Z][a-zA-Z\s\-']*$/.test(s)||s.split(/\s+/).length>5) continue;
+            if(JUNK.test(s)) continue;
+            const w=s.replace(/\s+/g,' ').trim().toLowerCase();
+            if(w.length<2||s2.has(w)||STOP.test(w)) continue;
+            fb2.push({word:w,phonetic:''}); s2.add(w);
+          }
+          if(fb2.length>entries.length){ resolve(fb2); return; }
+        }
+        resolve(entries);
+      } catch(err){ resolve([]); }
     };
     fr.readAsArrayBuffer(file);
   });
 }
 
-/* Parse PDF contestant list — line-by-line extraction */
+);
+}
+
+/* Parse PDF contestant list — robust line extraction */
 async function parsePDFNames(file) {
   return new Promise(resolve => {
-    const fr=new FileReader();
-    fr.onload=async e=>{
+    const fr = new FileReader();
+    fr.onload = async e => {
       try {
-        if(!window.pdfjsLib){resolve([]);return;}
-        const pdf=await pdfjsLib.getDocument({data:e.target.result}).promise;
+        if(!window.pdfjsLib){ resolve([]); return; }
+        const pdf = await pdfjsLib.getDocument({data:e.target.result}).promise;
         let allItems=[];
-        for(let p=1;p<=pdf.numPages;p++){
+        for(let p=1; p<=pdf.numPages; p++){
           const page=await pdf.getPage(p);
-          const content=await page.getTextContent();
-          for(const item of content.items){
-            if(item.str&&item.str.trim()) allItems.push({str:item.str.trim(),y:item.transform[5],x:item.transform[4]});
+          const tc=await page.getTextContent();
+          for(const item of tc.items){
+            const s=item.str.trim();
+            if(s) allItems.push({s,x:item.transform[4],y:item.transform[5]});
           }
         }
-        // Group by Y coordinate
-        allItems.sort((a,b)=>b.y-a.y||a.x-b.x);
-        const lines=[];
-        let curY=null,curLine="";
-        for(const item of allItems){
-          if(curY===null||Math.abs(item.y-curY)>4){
-            if(curLine.trim()) lines.push(curLine.trim());
-            curLine=item.str; curY=item.y;
-          } else { curLine+=" "+item.str; }
+        allItems.sort((a,b)=>(b.y-a.y)||(a.x-b.x));
+        const lines=[]; let row=[],prevY=null;
+        for(const {s,y} of allItems){
+          if(prevY===null||Math.abs(y-prevY)<=4){ row.push(s); }
+          else { if(row.length) lines.push(row.join(' ').trim()); row=[s]; }
+          prevY=y;
         }
-        if(curLine.trim()) lines.push(curLine.trim());
-        resolve(parseTextNames(lines.join("\n")));
-      } catch{resolve([]);}
+        if(row.length) lines.push(row.join(' ').trim());
+        resolve(parseTextNames(lines.join('\n')));
+      } catch{ resolve([]); }
     };
     fr.readAsArrayBuffer(file);
   });
+}
+
+);
 }
 
 /* ── DOCUMENT PARSING ── */
@@ -806,19 +799,19 @@ const CSS = `
   .fade-up{animation:fadeUp .3s ease;}.pop{animation:pop .4s ease;}.pulse{animation:pulse 2s infinite;}
 `;
 
-/* ════════════════════════════════════════════
-   ERROR BOUNDARY — prevents full blue-screen crash
-════════════════════════════════════════════ */
+/* Error boundary — prevents full blue-screen crash */
 class ErrorBoundary extends React.Component {
-  constructor(props){super(props);this.state={err:null};}
+  constructor(p){super(p);this.state={err:null};}
   static getDerivedStateFromError(err){return{err};}
-  componentDidCatch(err,info){console.error("App error:",err,info);}
+  componentDidCatch(err,info){console.error("AppError:",err,info);}
   render(){
-    if(this.state.err) return React.createElement("div",{style:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",background:"#0C1628",color:"#E8EDF8",gap:16,padding:24}},
+    if(this.state.err) return React.createElement("div",
+      {style:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",background:"#0C1628",color:"#E8EDF8",gap:16,padding:24,fontFamily:"sans-serif"}},
       React.createElement("div",{style:{fontSize:"3rem"}},"🐝"),
-      React.createElement("h2",{style:{color:"#E8A200"}},"Ocurrió un error"),
-      React.createElement("p",{style:{color:"#4B5A78",fontSize:".9rem",maxWidth:400,textAlign:"center"}},String(this.state.err?.message||"Error desconocido")),
-      React.createElement("button",{style:{padding:"10px 24px",background:"#E8A200",color:"#0C1628",border:"none",borderRadius:10,fontWeight:700,cursor:"pointer",fontSize:"1rem"},onClick:()=>window.location.reload()},"🔄 Recargar página")
+      React.createElement("h2",{style:{color:"#E8A200",marginBottom:8}},"Ocurrió un error"),
+      React.createElement("p",{style:{color:"#4B5A78",fontSize:".9rem",maxWidth:400,textAlign:"center"}},String(this.state.err?.message||"Error inesperado")),
+      React.createElement("button",{style:{padding:"10px 24px",background:"#E8A200",color:"#0C1628",border:"none",borderRadius:10,fontWeight:700,cursor:"pointer",fontSize:"1rem"},
+        onClick:()=>window.location.reload()},"🔄 Recargar página")
     );
     return this.props.children;
   }
