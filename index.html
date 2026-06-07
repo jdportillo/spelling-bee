@@ -126,7 +126,7 @@ function initState() {
     history:[], stageComplete:false, advancing:[],
     tbLen:null, tbRound:0, results:null, setupComplete:false,
     institution:"", level:"", roomId:"", pdfConfirmed:{},
-    logoB64:"", disputedWords:{}, contestantsConfirmed:false,
+    logoB64:"", contestantsConfirmed:false,
     actasClosedAt:null,   // timestamp when all judges downloaded — room closes 36h later
   };
 }
@@ -344,43 +344,6 @@ async function parseNamesDoc(file) {
 }
 
 /* ── GAME UTILITIES ── */
-function pickWord(bank, used, len) {
-  let pool = bank.filter(w=>!used.includes(w.word));
-  if (len) pool = pool.filter(w=>w.word.length===len);
-  if (!pool.length&&len) pool = bank.filter(w=>!used.includes(w.word));
-  if (!pool.length) return null;
-  return pool[Math.floor(Math.random()*pool.length)];
-}
-function computeVerdict(j) {
-  if (!j) return null;
-  // If discrepancy was resolved, use the agreed final
-  if (j.phase==="agreed" && j.final) {
-    const f=j.final;
-    if (f.override!==null&&f.override!==undefined) return f.override;
-    if (f.err) return "incorrect";
-    if (f.start&&f.end) return "correct";
-    return "incorrect";
-  }
-  // Otherwise use the shared live evaluation
-  const s=j.shared||j;
-  if (s.override!==null&&s.override!==undefined) return s.override;
-  if (s.err) return "incorrect";
-  if (s.start&&s.end) return "correct";
-  return null;
-}
-function judgeVoteVerdict(v) {
-  if (!v) return null;
-  if (v.err) return "incorrect";
-  if (v.start&&v.end) return "correct";
-  return null;
-}
-function detectDiscrepancy(j) {
-  if (!j?.votes) return false;
-  const vArr = Object.values(j.votes);
-  if (vArr.length < 2) return false;
-  const verdicts = vArr.map(v => judgeVoteVerdict(v));
-  return verdicts.some(v => v !== verdicts[0]);
-}
 function getScore(scores, stage, cId) {
   if (stage==="tiebreaker") {
     const r=scores.tiebreaker?.[cId]?.rounds||[];
@@ -399,24 +362,14 @@ function canResolveTop3(r) {
   if (r.length<=2) return true;
   return r[0].correct!==r[1].correct && r[1].correct!==r[2].correct;
 }
-function reasonText(reasons, result) {
-  if (result==="correct") return "Correcta";
-  if (!reasons) return "Incorrecto";
-  if (reasons.override==="correct")   return "Correcto por consenso de jurados";
-  if (reasons.override==="incorrect") return "Incorrecto por consenso de jurados";
-  const issues=[];
-  if (!reasons.start) issues.push("No pronunció al inicio");
-  if (!reasons.end)   issues.push("No pronunció al final");
-  if (reasons.err) issues.push((reasons.err.type==="skipped"?"Omitió":"Deletreó mal")+" la letra «"+reasons.err.letter.toUpperCase()+"»");
-  return issues.length ? issues.join("; ") : "Incorrecto";
-}
-
 /* ── PDF REPORT v4 — Landscape oficio, 2-section layout ── */
 function printReport(gs, role, onDone) {
+  /* Escape user-provided text before inserting into the report HTML (XSS) */
+  const esc = s => String(s==null?"":s).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
   const judge = role==="mc" ? gs.mc
     : role==="presenter" ? gs.presenter
     : (gs.judges||[]).find(j=>j.id===role);
-  const name = judge?.name || role;
+  const name = esc(judge?.name || role);
   const roleLabel = role==="mc" ? "Maestro de Ceremonia"
     : role==="presenter" ? "Presentador"
     : "Judge "+role.replace("J","")+", Order "+judge?.order;
@@ -453,7 +406,7 @@ function printReport(gs, role, onDone) {
     if (!r.start) issues.push("Did not pronounce the word at the start");
     if (!r.end)   issues.push("Did not pronounce the word at the end");
     if (r.err) issues.push((r.err.type==="skipped"?"Skipped":"Misspelled")
-      +" letter &laquo;"+r.err.letter.toUpperCase()+"&raquo;");
+      +" letter &laquo;"+esc(r.err.letter).toUpperCase()+"&raquo;");
     return issues.length ? issues.join("; ") : "Incorrect";
   }
 
@@ -475,7 +428,7 @@ function printReport(gs, role, onDone) {
     const plcTxt=plc?plc.emoji+"&#8202;"+plc.label:"&mdash;";
     return '<tr style="'+(i%2?"background:#f9f9f9":"")+'">'
       +'<td class="rc" style="font-weight:700">'+(i+1)+'</td>'
-      +'<td class="nm">'+c.name+'</td>'
+      +'<td class="nm">'+esc(c.name)+'</td>'
       +resCell(c.id,"basic",0)+resCell(c.id,"basic",1)+resCell(c.id,"basic",2)
       +resCell(c.id,"intermediate",0)+resCell(c.id,"intermediate",1)+resCell(c.id,"intermediate",2)
       +resCell(c.id,"advanced",0)+resCell(c.id,"advanced",1)+resCell(c.id,"advanced",2)
@@ -505,15 +458,15 @@ function printReport(gs, role, onDone) {
       const ok=e.result==="correct";
       return '<tr class="'+(ok?"dr-ok":"dr-fail")+'">'
         +'<td class="dt-stage" style="color:'+stageColor[e.stage]+'">'+stageName[e.stage]+'</td>'
-        +'<td class="dt-word">'+e.word.toUpperCase()+'</td>'
-        +'<td class="dt-ph">'+(e.phonetic||"&mdash;")+'</td>'
+        +'<td class="dt-word">'+esc(e.word).toUpperCase()+'</td>'
+        +'<td class="dt-ph">'+(esc(e.phonetic)||"&mdash;")+'</td>'
         +'<td class="dt-res" style="color:'+(ok?"#16a34a":"#dc2626")+'">'+(ok?"&#10003;":"&#10007;")+'</td>'
         +'<td class="dt-obs" style="color:'+(ok?"#16a34a":"#dc2626")+'">'+(ok?"&#10003; ":"&#10007; ")+reasonEn(e.reasons,e.result)+'</td>'
         +'</tr>';
     }).join("");
     detailBlocks+='<div class="sblock">'
       +'<table class="dt"><thead><tr class="dt-hdr">'
-      +'<th colspan="3" style="text-align:left">'+c.name+'</th>'
+      +'<th colspan="3" style="text-align:left">'+esc(c.name)+'</th>'
       +'<th colspan="2" style="text-align:right;font-weight:400">'
         +(ents.length===0?'No words recorded':(cor+'/'+ents.length+' correct'))+(plc?" &nbsp;&bull;&nbsp; "+plc.emoji+" "+plc.label:"")
       +'</th></tr>'
@@ -582,7 +535,7 @@ function printReport(gs, role, onDone) {
     +'<div class="sum-wrap">'
     +'<div class="hdr" style="'+padL+'">'
     +'<h1>&#127829; Spelling Bee &mdash; Official Evaluation Record</h1>'
-    +(gs.institution?'<div class="inst">'+gs.institution+(gs.level?" &bull; "+gs.level:"")+'</div>':"")
+    +(gs.institution?'<div class="inst">'+esc(gs.institution)+(gs.level?" &bull; "+esc(gs.level):"")+'</div>':"")
     +'</div>'
 
     /* meta row */
@@ -628,7 +581,7 @@ function printReport(gs, role, onDone) {
     +'<div class="mini-hdr">'
     +(gs.logoB64?logoMiniHTML:"")
     +'<div class="mini-hdr-text">'
-    +'<h2>'+( gs.institution||"Spelling Bee")+(gs.level?" &bull; "+gs.level:"")+'</h2>'
+    +'<h2>'+esc(gs.institution||"Spelling Bee")+(gs.level?" &bull; "+esc(gs.level):"")+'</h2>'
     +'<p>Detailed Results by Contestant</p>'
     +'</div></div>'
     +detailBlocks
@@ -832,9 +785,6 @@ function App() {
   const [tab,      setTab]      = useState("banks");
   const [editBanks,setEditBanks]= useState({basic:[],intermediate:[],advanced:[]});
   const [progress, setProgress] = useState(null);
-  const [ltrModal, setLtrModal] = useState(null);
-  const [ovrModal, setOvrModal] = useState(false);
-  const [wordKey,  setWordKey]  = useState(0);
   const [logoB64,  setLogoB64]  = useState("");
   const [pasteTexts, setPasteTexts] = useState({basic:"",inter:"",adv:"",pax:""});
   const [pasteMode,  setPasteMode]  = useState({basic:false,inter:false,adv:false,pax:false});
@@ -848,7 +798,6 @@ function App() {
   const [adminForm,   setAdminForm]   = useState({username:"",password:"",limit:5});
   const [newUserForm, setNewUserForm] = useState({username:"",limit:5});
   const [operLogin,   setOperLogin]   = useState({username:"",password:""});
-  const [disputeModal, setDisputeModal] = useState(false);
   const [revealAdvancing, setRevealAdvancing] = useState(false);
 
   const gsRef     = useRef(gs);     gsRef.current     = gs;
@@ -927,13 +876,23 @@ function App() {
   }, []);
 
   const upd = useCallback(fn => {
+    /* Optimistic local update for an instant UI response. */
     setGs(prev => {
       const base = typeof fn==="function" ? fn(prev||initState()) : fn;
-      const next = {...base, lastActivity:Date.now()};
-      if (roomRef.current && window.FIREBASE_OK)
-        window.rtdb.ref("spellingbee/rooms/"+roomRef.current+"/state").set(next);
-      return next;
+      return {...base, lastActivity:Date.now()};
     });
+    /* Authoritative write via a transaction: the updater is re-applied on the
+       server's current value, so concurrent judges can't clobber each other's
+       votes (the lost-update / last-write-wins problem). The onValue listener
+       reconciles local state to the committed result. */
+    if (roomRef.current && window.FIREBASE_OK) {
+      window.rtdb.ref("spellingbee/rooms/"+roomRef.current+"/state").transaction(current => {
+        // Merge over initState so array fields RTDB drops when empty are restored.
+        const fixed = {...initState(), ...(fixArrays(current)||{})};
+        const base = typeof fn==="function" ? fn(fixed) : fn;
+        return {...base, lastActivity:Date.now()};
+      }, undefined, false);
+    }
   }, []);
 
   /* ── ADMIN HANDLERS ── */
@@ -1137,12 +1096,13 @@ function App() {
       const numJudges=(prev.judges||[]).length||prev.judgeCount||3;
       const allReady=Object.keys(newReady).length>=numJudges;
       if(!allReady) return {...prev,judgesReady:newReady};
-      // Draw 3 words for current contestant
+      // Draw `wpr` words for current contestant (3 normal stages, 1 in tiebreaker)
       const cfg=STAGES[prev.stage];
+      const wordsToDraw=cfg.wpr||3;
       const used=[...prev.usedWords[cfg.bank]];
       const drawn=[];
       const pool=prev.banks[cfg.bank].filter(w=>!used.includes(w.word));
-      for(let i=0;i<3&&pool.length>0;i++){
+      for(let i=0;i<wordsToDraw&&pool.length>0;i++){
         const idx=Math.floor(Math.random()*pool.length);
         drawn.push(pool[idx]);
         pool.splice(idx,1);
@@ -1181,9 +1141,15 @@ function App() {
           cId:cur?.id,cName:cur?.name,word:word?.word||"",phonetic:word?.phonetic||"",
           result:finalV,reasons:{override:null,err:errInfo,start:true,end:true}};
         const ns={...prev.scores};
-        const pv=ns[prev.stage]?.[cur?.id]?.v||[];
-        const nv=[...pv]; nv[wi]=finalV;
-        ns[prev.stage]={...ns[prev.stage],[cur?.id]:{v:nv}};
+        if(prev.stage==="tiebreaker"){
+          // Tiebreaker accumulates one verdict per round in `rounds`
+          const pr=ns.tiebreaker?.[cur?.id]?.rounds||[];
+          ns.tiebreaker={...ns.tiebreaker,[cur?.id]:{rounds:[...pr,finalV]}};
+        } else {
+          const pv=ns[prev.stage]?.[cur?.id]?.v||[];
+          const nv=[...pv]; nv[wi]=finalV;
+          ns[prev.stage]={...ns[prev.stage],[cur?.id]:{v:nv}};
+        }
         // Move to next word or stage_end
         const nextWi=wi+1;
         const isLast=nextWi>=prev.currentWords.length;
@@ -1203,32 +1169,38 @@ function App() {
     });
   },[role]);
 
-  /* Resolve discrepancy — pick one judge's verdict or custom */
+  /* Resolve the current discrepancy, record it, then continue with the
+     remaining words (or finish the contestant if it was the last word). */
   const doResolveDiscrepancy = useCallback((discIdx, finalVerdict) => {
     const s=gsRef.current; if(!s) return;
     upd(prev=>{
       const discs=[...prev.discrepancies];
-      discs[discIdx]={...discs[discIdx],resolved:true,final:finalVerdict};
-      const allResolved=discs.every(d=>d.resolved);
-      if(!allResolved) return {...prev,discrepancies:discs};
-      // All resolved — write to history and scores
+      const d={...discs[discIdx],resolved:true,final:finalVerdict};
+      discs[discIdx]=d;
       const active=prev.contestants.filter(c=>c.active);
       const cur=active[prev.cIdx];
-      let newHistory=[...prev.history];
+      // Record only THIS discrepancy to history + scores
+      const hEntry={stage:prev.stage,stageLabel:STAGES[prev.stage].label,
+        cId:cur?.id,cName:cur?.name,
+        word:d.word||"",phonetic:d.phonetic||"",
+        result:d.final,reasons:{override:d.final,err:null,start:true,end:true}};
       const ns={...prev.scores};
-      for(const d of discs){
-        const hEntry={stage:prev.stage,stageLabel:STAGES[prev.stage].label,
-          cId:cur?.id,cName:cur?.name,
-          word:d.word||"",phonetic:d.phonetic||"",
-          result:d.final,reasons:{override:d.final,err:null,start:true,end:true}};
-        newHistory=[...newHistory,hEntry];
+      if(prev.stage==="tiebreaker"){
+        const pr=ns.tiebreaker?.[cur?.id]?.rounds||[];
+        ns.tiebreaker={...ns.tiebreaker,[cur?.id]:{rounds:[...pr,d.final]}};
+      } else {
         const pv=ns[prev.stage]?.[cur?.id]?.v||[];
         const nv=[...pv]; nv[d.wordIdx]=d.final;
         ns[prev.stage]={...ns[prev.stage],[cur?.id]:{v:nv}};
       }
-      // Also add non-discrepancy words already in wordJudgments
-      return {...prev,discrepancies:discs,history:newHistory,scores:ns,
-        wordPhase:"stage_end",judgesReady:{}};
+      // Continue with the next word, or finish this contestant
+      const nextWi=(d.wordIdx||0)+1;
+      const isLast=nextWi>=(prev.currentWords||[]).length;
+      return {...prev,discrepancies:discs,
+        history:[...prev.history,hEntry],scores:ns,
+        wordPhase:isLast?"stage_end":"word_show",
+        currentWordIdx:isLast?(d.wordIdx||0):nextWi,
+        judgesReady:isLast?{}:prev.judgesReady};
     });
   },[]);
 
@@ -1273,115 +1245,12 @@ function App() {
     setScreen("competition");
   };
 
-  /* ── GAME ── */
-  const doSpin = () => {
-    const s=gsRef.current; if(!s) return;
-    const active=s.contestants.filter(c=>c.active);
-    const cur=active[s.cIdx]; if(!cur) return;
-    const cfg=STAGES[s.stage];
-    const word=pickWord(s.banks[cfg.bank], s.usedWords[cfg.bank], s.stage==="tiebreaker"?s.tbLen:null);
-    if (!word) { alert("No quedan palabras disponibles en este banco."); return; }
-    setWordKey(k=>k+1);
-    upd(prev=>({
-      ...prev,
-      activeWord:{...word,cId:cur.id},
-      judgment:{start:false,end:false,err:null,override:null},
-      usedWords:{...prev.usedWords,[cfg.bank]:[...prev.usedWords[cfg.bank],word.word]},
-      tbLen:s.stage==="tiebreaker"&&!prev.tbLen ? word.word.length : prev.tbLen,
-    }));
-  };
-
-  const doToggle = f => upd(prev => prev.judgment ? {...prev,judgment:{...prev.judgment,[f]:!prev.judgment[f]}} : prev);
-
-  const doLetterClick = (i,l) => {
-    const j=gsRef.current?.judgment; if(!j) return;
-    if (j.err?.index===i) upd(prev=>({...prev,judgment:{...prev.judgment,err:null}}));
-    else setLtrModal({index:i,letter:l});
-  };
-
-  const doMarkErr = type => {
-    upd(prev=>({...prev,judgment:{...prev.judgment,err:{index:ltrModal.index,letter:ltrModal.letter,type}}}));
-    setLtrModal(null);
-  };
-
-  const doOverride = v => { upd(prev=>({...prev,judgment:{...prev.judgment,override:v}})); setOvrModal(false); };
-
-  /* ── Discrepancy system ── */
-  const doFlagDispute = () => {
-    const s=gsRef.current; if(!s?.activeWord||!s?.judgment) return;
-    const key=s.stage+"-"+s.cIdx+"-"+s.slot;
-    const shared=s.judgment.shared||s.judgment;
-    upd(prev=>({...prev, disputedWords:{...prev.disputedWords,
-      [key]:{word:s.activeWord.word,phonetic:s.activeWord.phonetic,
-        cId:s.contestants.filter(c=>c.active)[s.cIdx]?.id,
-        cName:s.contestants.filter(c=>c.active)[s.cIdx]?.name,
-        stage:s.stage, slot:s.slot,
-        description: "Jurado "+role.replace("J","")+" marca discrepancia",
-        flaggedBy:role,
-        sharedState:{start:shared.start,end:shared.end,err:shared.err},
-        resolved:false, finalResult:null}}}));
-    setDisputeModal(true);
-  };
-  const doResolveDispute = (result, key) => {
-    upd(prev=>{
-      const dw={...prev.disputedWords};
-      if(dw[key]){dw[key]={...dw[key],resolved:true,finalResult:result};}
-      // Also update history if that word was already recorded
-      const h=[...prev.history];
-      const hIdx=h.findIndex(x=>x.stage===prev.stage&&x.cId===dw[key]?.cId&&x.word===dw[key]?.word);
-      if(hIdx>=0){h[hIdx]={...h[hIdx],result,reasons:{...(h[hIdx].reasons),override:result}};}
-      // Update scores too
-      const ns={...prev.scores};
-      if(prev.stage!=="tiebreaker"&&dw[key]){
-        const cId=dw[key].cId, slot=dw[key].slot;
-        const pv=ns[prev.stage]?.[cId]?.v||[];
-        const nv=[...pv]; nv[slot]=result;
-        ns[prev.stage]={...ns[prev.stage],[cId]:{v:nv}};
-      }
-      return {...prev, disputedWords:dw, history:h, scores:ns};
-    });
-  };
   const doLogoUpload = (file) => {
     if (!file) return;
     const fr=new FileReader();
     fr.onload=e=>{ setLogoB64(e.target.result); window._logoB64=e.target.result; };
     fr.readAsDataURL(file);
   };
-  const doNext = () => {
-    const s=gsRef.current; if(!s) return;
-    const active=s.contestants.filter(c=>c.active);
-    const cur=active[s.cIdx]; if(!cur) return;
-    const cfg=STAGES[s.stage];
-    const v=computeVerdict(s.judgment)||"incorrect";
-    let ns={...s.scores};
-    if (s.stage==="tiebreaker") {
-      const pr=s.scores.tiebreaker?.[cur.id]?.rounds||[];
-      ns.tiebreaker={...s.scores.tiebreaker,[cur.id]:{rounds:[...pr,v]}};
-    } else {
-      const pv=s.scores[s.stage]?.[cur.id]?.v||[];
-      const nv=[...pv]; nv[s.slot]=v;
-      ns[s.stage]={...s.scores[s.stage],[cur.id]:{v:nv}};
-    }
-    const hEntry={
-      stage:s.stage, stageLabel:cfg.label,
-      cId:cur.id, cName:cur.name,
-      word:s.activeWord?.word||"", phonetic:s.activeWord?.phonetic||"",
-      result:v,
-      reasons:{start:(s.judgment?.final||s.judgment?.shared||s.judgment)?.start,end:(s.judgment?.final||s.judgment?.shared||s.judgment)?.end,err:(s.judgment?.final||s.judgment?.shared||s.judgment)?.err,override:(s.judgment?.final||s.judgment?.shared||s.judgment)?.override},
-    };
-    const nextSlot=s.slot+1;
-    if (nextSlot<cfg.wpr) {
-      upd(prev=>({...prev,scores:ns,history:[...prev.history,hEntry],activeWord:null,judgment:null,slot:nextSlot}));
-    } else {
-      const nextIdx=s.cIdx+1;
-      if (nextIdx>=active.length) {
-        upd(prev=>({...prev,scores:ns,history:[...prev.history,hEntry],activeWord:null,judgment:null,cIdx:0,slot:0,stageComplete:true}));
-      } else {
-        upd(prev=>({...prev,scores:ns,history:[...prev.history,hEntry],activeWord:null,judgment:null,cIdx:nextIdx,slot:0}));
-      }
-    }
-  };
-
   const doSubmit = () => {
     const s=gsRef.current; if(!s) return;
     const ranked=rankActive(s.contestants.filter(c=>c.active),s.scores,s.stage);
@@ -1452,68 +1321,14 @@ function App() {
     (gs?.judges||[]).every(j=>(gs?.judgesReady||{})[j.id]);
   const active=gs?.contestants?.filter(c=>c.active)||[];
   const cur=active[gs?.cIdx??0];
-  const j=gs?.judgment, aw=gs?.activeWord;
   const cfg=gs?.stage&&STAGES[gs.stage]?STAGES[gs.stage]:null;
   const stCol=cfg?.color||"#E8A200", wpr=cfg?.wpr??3;
   const ranked=gs?rankActive(active,gs.scores,gs.stage):[];
-  const verdict=computeVerdict(j);
-  const wColor=verdict==="correct"?"#22c55e":verdict==="incorrect"||j?.err?"#ef4444":"#22c55e";
   const nextCfg=cfg?.next?STAGES[cfg.next]:null;
   const shareUrl=roomId?getShareUrl(roomId):"";
   const qrUrl=roomId?"https://api.qrserver.com/v1/create-qr-code/?size=180x180&data="+encodeURIComponent(shareUrl)+"&color=E8EDF8&bgcolor=162038":"";
   const confirmedCount=(gs?.judges||[]).filter(j=>gs?.pdfConfirmed?.[j.id]).length;
   const judgeCount=Math.max((gs?.judges||[]).length,1);
-
-  /* ── DISPUTE MODAL ── */
-  const pendingDisputes = Object.entries(gs?.disputedWords||{}).filter(([k,d])=>!d.resolved);
-  const DisputeModal = disputeModal && pendingDisputes.length>0 && (
-    <div className="overlay" onClick={()=>setDisputeModal(false)}>
-      <div className="card" style={{width:"100%",maxWidth:500,display:"flex",flexDirection:"column",gap:12,maxHeight:"80vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
-        <h3 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"1.4rem",color:"#fbbf24"}}>⚠️ Discrepancias Pendientes</h3>
-        <p style={{color:"#6B7FA3",fontSize:".8rem"}}>Los siguientes casos requieren deliberación. Seleccionen el resultado acordado:</p>
-        {pendingDisputes.map(([key,d])=>(
-          <div key={key} style={{background:"rgba(251,191,36,.08)",border:"1px solid rgba(251,191,36,.25)",borderRadius:10,padding:12}}>
-            <p style={{color:"#E8EDF8",fontWeight:700,fontSize:".9rem",marginBottom:2}}>{d.word?.toUpperCase()}</p>
-            <p style={{color:"#6B7FA3",fontSize:".78rem",marginBottom:4}}>{d.cName} · Etapa {STAGES[d.stage]?.label} · Palabra {(d.slot||0)+1}</p>
-            <p style={{color:"#fbbf24",fontSize:".74rem",marginBottom:10}}>⚠ {d.description}</p>
-            <div style={{display:"flex",gap:8}}>
-              <button className="btn btn-green" style={{flex:1,padding:10,fontSize:".84rem"}} onClick={()=>{doResolveDispute("correct",key);}}>✅ Correcto</button>
-              <button className="btn btn-red"   style={{flex:1,padding:10,fontSize:".84rem"}} onClick={()=>{doResolveDispute("incorrect",key);}}>❌ Incorrecto</button>
-            </div>
-          </div>
-        ))}
-        <button className="btn btn-ghost" onClick={()=>setDisputeModal(false)}>Cerrar</button>
-      </div>
-    </div>
-  );
-
-  /* ── MODALS ── */
-  const LtrModal = ltrModal && (
-    <div className="overlay" onClick={()=>setLtrModal(null)}>
-      <div className="card" style={{width:"100%",maxWidth:300,display:"flex",flexDirection:"column",gap:10}} onClick={e=>e.stopPropagation()}>
-        <h3 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"1.5rem"}}>
-          Error en «<span style={{color:"#E8A200"}}>{ltrModal.letter.toUpperCase()}</span>»
-        </h3>
-        <p style={{color:"#6B7FA3",fontSize:".82rem"}}>¿Qué error cometió el concursante?</p>
-        <button className="btn" style={{background:"rgba(251,191,36,.15)",color:"#fbbf24",border:"1px solid rgba(251,191,36,.3)",padding:13,width:"100%"}} onClick={()=>doMarkErr("skipped")}>⚡ La omitió / se la saltó</button>
-        <button className="btn" style={{background:"rgba(248,113,113,.15)",color:"#f87171",border:"1px solid rgba(248,113,113,.3)",padding:13,width:"100%"}} onClick={()=>doMarkErr("misspelled")}>❌ La deletreó incorrectamente</button>
-        <button className="btn btn-ghost" onClick={()=>setLtrModal(null)}>Cancelar</button>
-      </div>
-    </div>
-  );
-
-  const OvrModal = ovrModal && (
-    <div className="overlay" onClick={()=>setOvrModal(false)}>
-      <div className="card" style={{width:"100%",maxWidth:300,display:"flex",flexDirection:"column",gap:10}} onClick={e=>e.stopPropagation()}>
-        <h3 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"1.5rem"}}>✏️ Corrección por Consenso</h3>
-        <p style={{color:"#6B7FA3",fontSize:".82rem"}}>Resultado acordado por los jurados:</p>
-        <button className="btn btn-green" style={{padding:13,width:"100%"}} onClick={()=>doOverride("correct")}>✅ Correcto</button>
-        <button className="btn btn-red"   style={{padding:13,width:"100%"}} onClick={()=>doOverride("incorrect")}>❌ Incorrecto</button>
-        {j?.override!=null && <button className="btn btn-ghost" style={{width:"100%"}} onClick={()=>doOverride(null)}>🗑 Quitar corrección</button>}
-        <button className="btn btn-ghost" style={{width:"100%"}} onClick={()=>setOvrModal(false)}>Cancelar</button>
-      </div>
-    </div>
-  );
 
   /* ══════════════════════════════════════
      SCREENS
@@ -1553,7 +1368,7 @@ function App() {
         {adminView==="dashboard" && (adminUser?.type==="master") && (
           <div style={{display:"flex",flexDirection:"column",gap:14}}>
             <div style={{padding:"8px 12px",background:"rgba(232,162,0,.1)",border:"1px solid rgba(232,162,0,.25)",borderRadius:10}}>
-              <p style={{color:"#E8A200",fontSize:".78rem",fontWeight:700}}>👑 Maestro: {adminUser.email}</p>
+              <p style={{color:"#E8A200",fontSize:".78rem",fontWeight:700}}>👑 Maestro: {adminUser.username}</p>
             </div>
 
             {/* Create new user */}
@@ -1865,9 +1680,9 @@ function App() {
           <p style={{color:"#4B5A78",fontSize:".76rem",marginBottom:14}}>Los jurados se conectan solos al abrir el enlace y elegir "Jurado". Aquí ves el estado en tiempo real.</p>
           <div style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",background:"rgba(255,255,255,.04)",borderRadius:10,marginBottom:6}}>
             <span style={{fontSize:"1.1rem"}}>🎤</span>
-            <span style={{flex:1,fontSize:".88rem",color:"#E8EDF8",fontWeight:600}}>Monitor</span>
-            {gs?.host?.name
-              ? <span style={{fontSize:".76rem",background:"rgba(34,197,94,.15)",color:"#22c55e",padding:"2px 9px",borderRadius:10,border:"1px solid rgba(34,197,94,.3)"}}>✅ {gs.host.name}</span>
+            <span style={{flex:1,fontSize:".88rem",color:"#E8EDF8",fontWeight:600}}>Maestro de Ceremonia</span>
+            {gs?.mc?.name
+              ? <span style={{fontSize:".76rem",background:"rgba(34,197,94,.15)",color:"#22c55e",padding:"2px 9px",borderRadius:10,border:"1px solid rgba(34,197,94,.3)"}}>✅ {gs.mc.name}</span>
               : <span style={{fontSize:".76rem",color:"#3B4B6A"}}>Sin conectar</span>}
           </div>
           {[0,1,2].map(i=>{
@@ -2166,7 +1981,6 @@ function App() {
   return (
     <div className="sb" style={{maxWidth:680,margin:"0 auto",padding:"16px 14px 80px"}}>
       <style>{CSS}</style>
-      {LtrModal}{OvrModal}{DisputeModal}
 
       {/* Header */}
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18,paddingTop:6}}>
@@ -2181,12 +1995,6 @@ function App() {
         <div style={{color:"#4B5A78",fontSize:".76rem"}}>{isMC?(gs?.mc?.name||"Maestro de Ceremonia"):isPresenter?(gs?.presenter?.name||"Presentador"):myJudge?.name||"Jurado"}</div>
       </div>
 
-      {/* Dispute indicator */}
-      {pendingDisputes.length>0 && (
-        <button className="btn" style={{width:"100%",marginBottom:10,background:"rgba(251,191,36,.15)",color:"#fbbf24",border:"1px solid rgba(251,191,36,.35)",padding:10,fontSize:".84rem"}} onClick={()=>setDisputeModal(true)}>
-          ⚠️ Hay {pendingDisputes.length} discrepancia(s) pendiente(s) — Clic para deliberar
-        </button>
-      )}
       {/* Concursante actual */}
       {cur && !gs.stageComplete && (
         <div className="card fade-up" style={{marginBottom:14,borderColor:stCol+"35"}}>
@@ -2197,14 +2005,14 @@ function App() {
             </div>
             <div style={{textAlign:"right"}}>
               <p style={{color:"#4B5A78",fontSize:".68rem",fontWeight:700,letterSpacing:".07em",marginBottom:4}}>PALABRA</p>
-              <p style={{color:"#E8EDF8",fontWeight:700}}>{gs.stage==="tiebreaker"?"Desempate":(gs.slot+1)+" / "+wpr}</p>
+              <p style={{color:"#E8EDF8",fontWeight:700}}>{gs.stage==="tiebreaker"?"Desempate":((gs.currentWordIdx||0)+1)+" / "+wpr}</p>
             </div>
           </div>
           {gs.stage!=="tiebreaker" && (
             <div style={{display:"flex",gap:5,marginTop:10}}>
               {Array.from({length:wpr}).map((_,i)=>{
                 const sv=gs.scores[gs.stage]?.[cur.id]?.v?.[i];
-                return <div key={i} className="dot" style={{background:sv==="correct"?"#22c55e":sv==="incorrect"?"#ef4444":i===gs.slot&&!aw?stCol+"60":"rgba(255,255,255,.1)"}}/>;
+                return <div key={i} className="dot" style={{background:sv==="correct"?"#22c55e":sv==="incorrect"?"#ef4444":i===(gs.currentWordIdx||0)?stCol+"60":"rgba(255,255,255,.1)"}}/>;
               })}
             </div>
           )}
@@ -2266,7 +2074,7 @@ function App() {
             const totalVotes=Object.keys((gs.wordJudgments||{})[wi]||{}).length;
             return (
               <div style={{width:"100%",textAlign:"center"}} className="pop">
-                <p style={{color:"#4B5A78",fontSize:".72rem",marginBottom:4}}>{cur.name} — Palabra {wi+1} de 3</p>
+                <p style={{color:"#4B5A78",fontSize:".72rem",marginBottom:4}}>{cur.name} — Palabra {wi+1} de {(gs.currentWords||[]).length||wpr}</p>
                 <div className="word-font" style={{fontSize:"clamp(1.8rem,5vw,3rem)",marginBottom:8,color:"#22c55e"}}>{(cw?.word||"").toUpperCase()}</div>
                 <div className="ph-font" style={{fontSize:"1rem",marginBottom:14}}>{cw?.phonetic||""}</div>
                 {isJudge && !myVote && (
@@ -2313,13 +2121,15 @@ function App() {
                         </button>
                       );
                     })}
-                    <button className="btn btn-ghost" style={{flexDirection:"column",gap:2,padding:"9px 12px"}}
-                      onClick={()=>{
-                        const r=window.prompt("Resultado definitivo (correct / incorrect):");
-                        if(r==="correct"||r==="incorrect") doResolveDiscrepancy(discIdx,r);
-                      }}>
-                      <span>✏️</span><span style={{fontSize:".72rem"}}>Editar</span>
-                    </button>
+                  </div>
+                )}
+                {!isPresenter && (
+                  <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap",marginBottom:10}}>
+                    <span style={{color:"#4B5A78",fontSize:".72rem",alignSelf:"center"}}>Forzar por consenso:</span>
+                    <button className="btn btn-green" style={{padding:"7px 14px",fontSize:".8rem"}}
+                      onClick={()=>doResolveDiscrepancy(discIdx,"correct")}>✅ Correcta</button>
+                    <button className="btn btn-red" style={{padding:"7px 14px",fontSize:".8rem"}}
+                      onClick={()=>doResolveDiscrepancy(discIdx,"incorrect")}>❌ Incorrecta</button>
                   </div>
                 )}
                 <p style={{color:"#4B5A78",fontSize:".72rem",textAlign:"center"}}>{unresolved.length} discrepancia(s) pendiente(s)</p>
