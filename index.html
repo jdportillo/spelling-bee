@@ -99,6 +99,79 @@ const STAGES = {
   tiebreaker:   { label:"Desempate",  color:"#a78bfa", bank:"advanced",     next:null,           wpr:1 },
 };
 
+/* ── BANCO OFICIAL LCRJB 2025 (incrustado) ── */
+/* Palabras por nivel (deduplicadas: cada palabra vive en su nivel mas facil). */
+/* La fonetica IPA se autocompleta al cargar el banco (dictionaryapi.dev) y es editable. */
+const OFFICIAL_BANK_WORDS = {
+  basic: [
+    "after","alive","angry","atom","aunt","baby","bang","beans","beard","before","behind","bend",
+    "block","board","born","break","bring","brother","build","bully","burger","burn","camera","camp",
+    "cause","cheese","chicken","circus","clothes","coffee","cousin","coyote","crazy","culture","curtain","date",
+    "death","deep","deer","diet","disc","doctor","edge","fame","farm","favorite","feed","ferry",
+    "film","filter","first","flame","flash","float","foggy","fourteen","fresh","front","garlic","giant",
+    "giraffe","glasses","goat","good","grammar","grass","grow","guest","guys","hair","ham","happy",
+    "hard","health","hide","hippo","hotel","huge","image","inside","internet","jacket","jeans","king",
+    "knee","land","laptop","late","later","lazy","link","lion","major","marry","mean","meat",
+    "mirror","monkey","mouth","near","need","nephew","network","next","noise","noisy","noun","novel",
+    "nurse","office","olive","onion","online","open","outside","over","owl","pack","pain","panda",
+    "penguin","pepper","pixel","pizza","plan","plane","play","pocket","poem","pool","pot","prefer",
+    "press","pretty","print","public","queen","rain","rare","region","relax","roar","roof","room",
+    "rude","scan","scarf","shelf","shoot","show","sign","simple","skin","sled","sleep","slowly",
+    "smart","snake","sneaker","soap","soon","space","spider","splash","steak","steep","stick","still",
+    "stuff","suit","tape","task","teach","teacher","teen","teeth","third","thrill","throw","thumb",
+    "ticket","tiger","tiny","tissues","tomato","total","treat","tree","trust","t-shirt","twelve","under",
+    "usual","waiter","wallet","warm","website","well","wind","wool","world","zero"
+  ],
+  intermediate: [
+    "above","account","actually","adult","advice","affect","afford","afraid","airport","among","animation","animator",
+    "anyone","anything","anywhere","appear","art","artificial","asleep","attract","attractive","audience","basketball","beautiful",
+    "become","bestseller","border","bored","brakes","building","button","canadian","career","carnival","cartoon","cassette",
+    "celebrate","celebration","celebrity","cell","chance","channel","character","charity","checkout","clerk","collect","college",
+    "colorful","comment","common","community","complain","concert","contact","contain","contestant","continue","costume","cotton",
+    "countable","creature","crowd","cushion","customer","damage","dancer","danger","dangerous","daughter","delete","describe",
+    "desert","design","designer","destroy","develop","diamond","directions","director","display","downtown","drama","dramatic",
+    "drugstore","drummer","education","effect","electric","elevator","empty","enormous","episode","eruption","escape","everyone",
+    "everything","everywhere","exact","exactly","exotic","expensive","expert","explain","explorer","factory","fashion","festival",
+    "finally","flight","follow","forest","fortune","freedom","friendly","future","garbage","give","ground","haircut",
+    "harbor","illness","imagine","important","individual","industry","inspire","instant","interact","interest","interested","interview",
+    "introduce","invent","invention","journalist","jungle","karate","latest","library","limited","listen","luckily","magnet",
+    "magnetic","mainly","makeup","mammal","manage","manner","market","matches","material","medical","medicine","meeting",
+    "modern","monument","movie","multimedia","musical","musician","mustache","mystery","natural","nearly","nervous","nonsense",
+    "noodles","nothing","novelist","nowhere","ordinary","original","palace","passport","perfect","perform","police","popular",
+    "position","post","powerful","prison","produce","publish","puppet","reach","reality","reason","rebuild","recent",
+    "record","recover","replace","report","reporter","rescue","respond","return","rocket","route","ruins","sadly",
+    "safety","scared","scene","schoolboy","screen","sea","second","security","series","serious","setting","sight",
+    "silent","sit","somebody","someone","something","somewhere","spaceship","speed","speedboat","sports","spotify","spread",
+    "square","stadium","stage","stare","statue","strike","strong","studio","subway","success","suffer","suitcase",
+    "superior","supermarket","supplies","surface","survive","system","talent","talk","telephone","temple","theater","thought",
+    "thunder","tired","tiring","tourism","tradition","tragedy","triangle","trouble","tundra","unkind","unlike","unusual",
+    "upset","version","voice","waste","waterfall","whole","wildlife","wonder","worried","writer"
+  ],
+  advanced: [
+    "abbreviation","absolutely","accuracy","accurate","across","addictive","adventurous","advertising","afterward","aluminum","anagram","ancient",
+    "aquarium","arrangement","astronaut","atmosphere","atomic","attachment","autograph","auxiliary","available","average","awesome","background",
+    "backpack","backpacking","backstage","bicycle","brain","brightness","businessman","category","cathedral","caught","christmas","commercial",
+    "committee","communicate","communication","company","competitive","compulsory","computer","consultant","cosmopolitan","crocodile","crowded","definitely",
+    "definition","digital","dinosaur","disagree","documentary","earthquake","embarrassed","emergency","encourage","engineer","enough","entrance",
+    "envelope","environment","equipment","excited","exhausting","exhibition","experience","extraordinary","extremely","fantastically","fascinated","fascinating",
+    "fashionable","fast-moving","feather","figure","filmmaker","firefighter","fireworks","flower","fortunately","freezing","game","gesture",
+    "get","government","gymnastics","handwriting","happiness","heavy","height","helicopter","highlight","hostel","human","humorous",
+    "hunting","husky","imaginary","immediately","impossible","impressed","in","increased","independence","inhabitant","instrument","interactive",
+    "interesting","integrated","international","jewelry","juggler","keep","kindergarten","lead","liaison","life-size","loneliness","make",
+    "manager","mathematics","mechanic","merchandise","microphone","middle-class","murderer","museum","mushroom","music","neatly","nervously",
+    "networking","newsstand","normally","occasion","occasionally","old-fashioned","ourselves","overboard","overtake","paddleboat","paperback","part-owner",
+    "passenger","password","percentage","performance","playing","politely","politeness","politician","polyester","possession","postcard","primary",
+    "privilege","process","producer","promise","properly","punctuation","put","raincoat","raise","receptionist","rechargeable","rediscovered",
+    "referee","refuse","rehearsal","rehearse","reindeer","responsibility","rhythm","right-hand","romance","rowing","salt","satellite",
+    "scientist","sensitive","separate","seriously","shampoo","simulator","sitcom","skyscraper","species","spectacular","stereo","storyboard",
+    "streetcar","strength","stunning","succeed","successful","suddenly","suggestion","sunglasses","sunshine","superstition","surgeon","surprising",
+    "sweatshirt","switzerland","table","take","technology","terrifying","theme","through","thumbnail","thunderstorm","toilet","tournament",
+    "traditionally","translator","transmission","treatment","trillion","twig","umbrella","uncountable","underestimate","underground","underwater","underwear",
+    "unfriendly","username","vaccination","valuable","vandalism","vegetarian","venue","vietnamese","volcano","wagon","waterproof","weather",
+    "web","wedding","weigh","whereas","wizard","worldwide"
+  ]
+};
+
 /* ── INITIAL STATE ── */
 function initState() {
   return {
@@ -1060,6 +1133,28 @@ function App() {
     setBusy(false);
   };
 
+  /* Load the built-in official LCRJB 2025 bank (no upload needed) and
+     auto-generate phonetics. Words are editable afterwards. */
+  const doLoadOfficialBank = async () => {
+    setBusy(true); setStatus("🐝 Cargando banco oficial LCRJB 2025...");
+    try {
+      const toEntries = arr => arr.map(w => ({word:w, phonetic:""}));
+      const bW = toEntries(OFFICIAL_BANK_WORDS.basic);
+      const iW = toEntries(OFFICIAL_BANK_WORDS.intermediate);
+      const aW = toEntries(OFFICIAL_BANK_WORDS.advanced);
+      const need = [...new Set([...bW,...iW,...aW].map(w=>w.word))];
+      setStatus("🔤 Generando fonética para "+need.length+" palabras (API gratuita)...");
+      setProgress({done:0, total:need.length||1});
+      const pm = await getPhonetics(need, (done,total) => { setProgress({done,total}); setStatus("🔤 "+done+"/"+total+" palabras procesadas..."); });
+      const fill = arr => arr.map(w=>({...w, phonetic:w.phonetic||pm[w.word]||""}));
+      setEditBanks({basic:fill(bW), intermediate:fill(iW), advanced:fill(aW)});
+      setProgress(null);
+      setStatus("✅ Banco oficial cargado · Básico:"+bW.length+" · Intermedio:"+iW.length+" · Avanzado:"+aW.length+". Revisa/edita la fonética y guarda.");
+      setTab("banks");
+    } catch(e) { setStatus("❌ "+e.message); setProgress(null); }
+    setBusy(false);
+  };
+
   const doLoadContestants = async () => {
     if (!files.pax && !pasteTexts.pax?.trim()) { setStatus("⚠ Sube el archivo o pega la lista de concursantes."); return; }
     setBusy(true);
@@ -1100,12 +1195,20 @@ function App() {
       const cfg=STAGES[prev.stage];
       const wordsToDraw=cfg.wpr||3;
       const used=[...prev.usedWords[cfg.bank]];
-      const drawn=[];
       const pool=prev.banks[cfg.bank].filter(w=>!used.includes(w.word));
-      for(let i=0;i<wordsToDraw&&pool.length>0;i++){
-        const idx=Math.floor(Math.random()*pool.length);
-        drawn.push(pool[idx]);
-        pool.splice(idx,1);
+      const drawn=[];
+      if(wordsToDraw===3 && pool.length>=3){
+        // FAIRNESS: give every contestant a comparable mix — one short, one
+        // medium and one long word (length tertiles within their level) —
+        // instead of 3 fully-random words that could all be trivial or all brutal.
+        const sorted=[...pool].sort((a,b)=>a.word.length-b.word.length);
+        const t=Math.floor(sorted.length/3);
+        [sorted.slice(0,t), sorted.slice(t,2*t), sorted.slice(2*t)].forEach(bucket=>{
+          drawn.push(bucket[Math.floor(Math.random()*bucket.length)]);
+        });
+      } else {
+        const p=[...pool];
+        for(let i=0;i<wordsToDraw&&p.length>0;i++) drawn.push(p.splice(Math.floor(Math.random()*p.length),1)[0]);
       }
       const newUsed=[...used,...drawn.map(w=>w.word)];
       return {...prev,judgesReady:newReady,currentWords:drawn,currentWordIdx:0,
@@ -1732,10 +1835,19 @@ function App() {
 
       {tab==="banks" && (
         <div className="fade-up">
+          <div className="card" style={{marginBottom:12,borderColor:"rgba(232,162,0,.35)"}}>
+            <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:4}}>🐝 BANCO OFICIAL LCRJB 2025</p>
+            <p style={{color:"#4B5A78",fontSize:".75rem",marginBottom:10}}>
+              722 palabras ya incrustadas y categorizadas (Básico {OFFICIAL_BANK_WORDS.basic.length} · Intermedio {OFFICIAL_BANK_WORDS.intermediate.length} · Avanzado {OFFICIAL_BANK_WORDS.advanced.length}). Un clic — sin subir archivos. La fonética se autocompleta y queda editable.
+            </p>
+            <button className="btn btn-gold" style={{width:"100%"}} disabled={busy} onClick={doLoadOfficialBank}>
+              {busy ? "⏳ Procesando..." : "🐝 Usar banco oficial LCRJB 2025 (722 palabras)"}
+            </button>
+          </div>
           <div className="card" style={{marginBottom:12}}>
-            <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:4}}>📚 BANCOS DE PALABRAS</p>
+            <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:4}}>📚 BANCO PERSONALIZADO (opcional)</p>
             <p style={{color:"#4B5A78",fontSize:".75rem",marginBottom:14}}>
-              Word: una palabra por línea. Opcional con fonética: <span style={{fontFamily:"monospace",color:"#a78bfa"}}>apple | /ˈæpəl/</span><br/>
+              ¿Quieres tu propia lista? Word: una palabra por línea. Opcional con fonética: <span style={{fontFamily:"monospace",color:"#a78bfa"}}>apple | /ˈæpəl/</span><br/>
               La fonética se genera automáticamente desde dictionaryapi.dev (gratis, sin clave).
             </p>
             {[{key:"basic",l:"Level Basic",icon:"🟢",c:"#22c55e"},{key:"inter",l:"Level Intermediate",icon:"🟡",c:"#f59e0b"},{key:"adv",l:"Level Advanced",icon:"🔴",c:"#ef4444"}].map(({key,l,icon,c})=>(

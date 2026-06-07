@@ -1,0 +1,45 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+
+    "spellingbee": {
+      "rooms": {
+        "$room": {
+          ".read": true,
+          ".write": true,
+          "state": {
+            ".validate": "newData.hasChildren(['phase'])",
+            "phase":        { ".validate": "newData.isString() && newData.val().length < 40" },
+            "roomId":       { ".validate": "newData.isString() && newData.val().length < 60" },
+            "institution":  { ".validate": "newData.isString() && newData.val().length < 300" },
+            "level":        { ".validate": "newData.isString() && newData.val().length < 120" },
+            "lastActivity": { ".validate": "newData.isNumber()" },
+            "expiresAt":    { ".validate": "newData.isNumber()" },
+            "createdBy":    { ".validate": "newData.isString() && newData.val().length < 120" },
+            "logoB64":      { ".validate": "newData.isString() && newData.val().length < 600000" },
+            "$other":       { ".validate": true }
+          }
+        }
+      },
+
+      "admin": {
+        "master": {
+          ".read": true,
+          ".write": "!data.exists()"
+        },
+        "users": {
+          ".read": true,
+          ".write": true,
+          "$username": {
+            ".validate": "$username.length < 60",
+            "roomLimit":   { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 200" },
+            "active":      { ".validate": "newData.isBoolean()" },
+            "passwordHash":{ ".validate": "newData.isString() && newData.val().length == 64" },
+            "$other":      { ".validate": true }
+          }
+        }
+      }
+    }
+  }
+}
