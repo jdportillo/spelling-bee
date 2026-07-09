@@ -1,0 +1,2645 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>Spelling Bee — Sistema de Concurso</title>
+  <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js"></script>
+  <!-- PDF.js for reading PDF word banks -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script>if(window.pdfjsLib)pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";</script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-database-compat.js"></script>
+  <style>body{margin:0;padding:0;background:#0C1628;}</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- =========================================================
+     FIREBASE CONFIG — reemplaza con los datos de tu proyecto
+     console.firebase.google.com → ⚙ Configuración → App web
+========================================================= -->
+<script>
+const FIREBASE_CONFIG = {
+  apiKey:            "AIzaSyA3b2rKpcmqieaxxjITYe3-3B91YBPEamg",
+  authDomain:        "beespeller-6ebea.firebaseapp.com",
+  databaseURL:       "https://beespeller-6ebea-default-rtdb.firebaseio.com",
+  projectId:         "beespeller-6ebea",
+  storageBucket:     "beespeller-6ebea.firebasestorage.app",
+  messagingSenderId: "271671402001",
+  appId:             "1:271671402001:web:a5118c175af21dc80d1bb0",
+  measurementId:     "G-ZGXPCJBJ5C"
+};
+window.FIREBASE_OK = false;
+
+/* Safe init: retries every 50ms until the Firebase SDK is loaded */
+(function tryInitFirebase() {
+  if (typeof firebase === 'undefined') {
+    setTimeout(tryInitFirebase, 50);
+    return;
+  }
+  try {
+    if (!firebase.apps.length) {          /* Avoid "already initialized" on hot-reload */
+      firebase.initializeApp(FIREBASE_CONFIG);
+    }
+    window.rtdb = firebase.database();
+    window.FIREBASE_OK = true;
+    /* Notify React that Firebase is ready */
+    window.dispatchEvent(new Event('firebase-ready'));
+  } catch(e) {
+    console.error("Firebase init error:", e);
+  }
+})();
+</script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ── ROOM UTILS ── */
+function generateRoomId() {
+  const digits = String(Math.floor(100000 + Math.random() * 900000));
+  return "jd-" + digits;
+}
+function getShareUrl(roomId) {
+  return window.location.origin + window.location.pathname + "?room=" + roomId;
+}
+
+/* ── STAGE CONFIG ── */
+/* FIREBASE ARRAY FIX: RTDB converts JS arrays to {0:{},1:{},...} objects.
+   Restore all arrays after every Firebase read. */
+function fixArrays(data) {
+  if(!data||typeof data!=='object') return data;
+  function toArr(v){ if(!v) return []; if(Array.isArray(v)) return v; return Object.values(v); }
+  if(data.banks){['basic','intermediate','advanced'].forEach(k=>{if(data.banks[k]) data.banks[k]=toArr(data.banks[k]);});}
+  if(data.usedWords){['basic','intermediate','advanced'].forEach(k=>{if(data.usedWords[k]) data.usedWords[k]=toArr(data.usedWords[k]);});}
+  if(data.contestants) data.contestants=toArr(data.contestants);
+  if(data.judges)      data.judges=toArr(data.judges);
+  if(data.history)     data.history=toArr(data.history);
+  if(data.currentWords) data.currentWords=toArr(data.currentWords);
+  if(data.discrepancies) data.discrepancies=toArr(data.discrepancies);
+  if(data.advancing)   data.advancing=toArr(data.advancing);
+  if(!data.scores) data.scores={basic:{},intermediate:{},advanced:{},tiebreaker:{}};
+  if(data.scores){
+    ['basic','intermediate','advanced','tiebreaker'].forEach(stage=>{
+      if(!data.scores[stage]) data.scores[stage]={};
+      Object.keys(data.scores[stage]).forEach(cId=>{
+        const sc=data.scores[stage][cId];
+        if(sc?.v) sc.v=toArr(sc.v);
+        if(sc?.rounds) sc.rounds=toArr(sc.rounds);
+      });
+    });
+  }
+  return data;
+}
+
+const STAGES = {
+  basic:        { label:"Básica",     color:"#22c55e", bank:"basic",        next:"intermediate", wpr:3 },
+  intermediate: { label:"Intermedia", color:"#f59e0b", bank:"intermediate", next:"advanced",     wpr:3 },
+  advanced:     { label:"Avanzada",   color:"#ef4444", bank:"advanced",     next:"tiebreaker",   wpr:3 },
+  tiebreaker:   { label:"Desempate",  color:"#a78bfa", bank:"advanced",     next:null,           wpr:1 },
+};
+
+/* ── INITIAL STATE ── */
+function initState() {
+  return {
+    phase:"setup",
+    /* Roles */
+    mc:{name:"", ts:0},                 // Maestro de Ceremonia (ex-Monitor)
+    presenter:{name:"", ts:0},          // Presentador (lee las palabras)
+    judges:[],                          // Jurados (2-10, claimed at login)
+    judgeCount:3,                       // Configured by creator (2-10)
+    /* Data */
+    contestants:[], banks:{basic:[],intermediate:[],advanced:[]},
+    usedWords:{basic:[],intermediate:[],advanced:[]},
+    /* Game flow */
+    stage:"basic", cIdx:0,
+    /* New word-by-word flow */
+    wordPhase:"idle",  // "contestant_reveal"|"ready_wait"|"word_show"|"deliberation"|"stage_end"
+    currentWordIdx:0,  // 0,1,2 within the 3-word set
+    currentWords:[],   // [{word,phonetic}] — 3 words pre-drawn for current contestant
+    wordJudgments:{},  // { wordIdx: { J1:{verdict,err,start,end}, J2:…, J3:… } }
+    judgesReady:{},    // { J1:true, J2:true } — ready signal per word-reveal
+    discrepancies:[],  // [{wordIdx, word, phonetic, votes:{J1:v,J2:v}, resolved:false, final:null}]
+    /* Legacy compat */
+    slot:0, activeWord:null, judgment:null,
+    scores:{basic:{},intermediate:{},advanced:{},tiebreaker:{}},
+    history:[], stageComplete:false, advancing:[],
+    tbLen:null, tbRound:0, results:null, setupComplete:false,
+    institution:"", level:"", roomId:"", pdfConfirmed:{},
+    logoB64:"", disputedWords:{}, contestantsConfirmed:false,
+    actasClosedAt:null,   // timestamp when all judges downloaded — room closes 36h later
+  };
+}
+
+/* ── PHONETICS (dictionaryapi.dev — 100% gratis, sin clave) ── */
+async function getPhonetics(words, onProgress) {
+  const map = {};
+  // Only fetch single-word entries — multi-word phrases return 404 without CORS headers
+  const fetchable = words.filter(w => !w.includes(' ') && !w.includes('-') && w.length > 1);
+  const BATCH = 4;
+  const DELAY = 350; // ms between batches — avoids rate limiting
+  for (let i = 0; i < fetchable.length; i += BATCH) {
+    const batch = fetchable.slice(i, i+BATCH);
+    await Promise.allSettled(batch.map(async word => {
+      try {
+        const ctrl = new AbortController();
+        setTimeout(() => ctrl.abort(), 6000);
+        const res = await fetch("https://api.dictionaryapi.dev/api/v2/entries/en/" + encodeURIComponent(word), {signal:ctrl.signal});
+        if (res.ok) {
+          const d = await res.json();
+          const ph = d[0]?.phonetic || d[0]?.phonetics?.find(p=>p?.text)?.text || "";
+          if (ph) map[word] = ph;
+        }
+      } catch {}
+    }));
+    if (onProgress) onProgress(Math.min(i+BATCH, fetchable.length), fetchable.length);
+    if (i+BATCH < fetchable.length) await new Promise(r => setTimeout(r, DELAY));
+  }
+  return map;
+}
+
+/* ── DOCUMENT PARSING (Word .docx + PDF + plain text) ── */
+
+/* Parse plain text / paste for word bank */
+function parseTextBank(text) {
+  const entries=[], seen=new Set();
+  for (const rawLine of text.split(/[\r\n]+/)) {
+    const line=rawLine.trim(); if(!line)continue;
+    let matched=false;
+    for (const sep of [" | "," - ","	"]) {
+      const idx=line.indexOf(sep);
+      if(idx>0){
+        const w=line.slice(0,idx).trim().toLowerCase();
+        const ph=line.slice(idx+sep.length).trim();
+        // Skip document headers (e.g. "BASIC LIST - 2025") and non-word entries
+        if(/\b(list|basic|intermediate|advanced|extra|round|macmillan)\b/.test(w)){matched=true;break;}
+        if(/^\d{4}/.test(ph)){matched=true;break;}
+        if(ph.length>80||(ph.match(/\d/g)||[]).length>ph.length/3){matched=true;break;}
+        if(/^[a-z][a-z\s'-]*$/.test(w)&&!seen.has(w)){entries.push({word:w.replace(/\s+/g," "),phonetic:ph});seen.add(w);matched=true;break;}
+      }
+    }
+    if(!matched){
+      // Try "123 word" numbered list format or plain word
+      const numMatch=line.match(/^\d+\.?\s+(.+)$/);
+      const wordPart=numMatch?numMatch[1].trim():line;
+      for(const part of wordPart.split(/[,;]+/)){
+        const w=part.trim().toLowerCase().replace(/\s+/g," ");
+        if(w.length>0&&/^[a-z][a-z\s'-]*$/.test(w)&&!seen.has(w)){entries.push({word:w,phonetic:""});seen.add(w);}
+      }
+    }
+  }
+  return entries;
+}
+
+/* Parse plain text for contestant names */
+function parseTextNames(text) {
+  return text.split(/[\r\n]+/).map(l=>l.replace(/^\d+[\.\)\-]\s*/,"").trim()).filter(n=>n.length>1&&n.length<80);
+}
+
+/* Parse PDF word bank — handles Macmillan 3-column numbered lists */
+async function parsePDFWordBank(file) {
+  return new Promise(resolve => {
+    const fr = new FileReader();
+    fr.onload = async e => {
+      try {
+        if(!window.pdfjsLib){ resolve([]); return; }
+        const pdf = await pdfjsLib.getDocument({data:e.target.result}).promise;
+        let allItems = [];
+        for(let p=1; p<=pdf.numPages; p++){
+          const page = await pdf.getPage(p);
+          const tc   = await page.getTextContent();
+          for(const item of tc.items){
+            const s=item.str.trim();
+            if(s) allItems.push({s, x:item.transform[4], y:item.transform[5]});
+          }
+        }
+        // Sort: top-to-bottom, left-to-right
+        allItems.sort((a,b)=>(b.y-a.y)||(a.x-b.x));
+        // Group items into rows by Y coordinate (tolerance ±4)
+        const rows=[]; let row=[], prevY=null;
+        for(const {s,y} of allItems){
+          if(prevY===null||Math.abs(y-prevY)<=4){ row.push(s); }
+          else { if(row.length) rows.push(row.join(' ').trim()); row=[s]; }
+          prevY=y;
+        }
+        if(row.length) rows.push(row.join(' ').trim());
+        // Skip junk rows (headers, footers, year-only)
+        const JUNK=/\b(macmillan|spelling bee)\b|^words on|representative of|english language|^\d{4}$|^(basic|intermediate|advanced)\s+list|^extra\s+round/i;
+        const cleanRows=rows.filter(r=>r.length>1&&!JUNK.test(r));
+        // PRIMARY: global regex finds ALL "number + word(s)" patterns per row
+        // Works for 3-col ("1 after 44 doctor 85 king") and 1-col ("1. advertisement")
+        const entries=[], seen=new Set();
+        const STOP=/^(the|and|of|on|in|at|to|a|is|it|be|as|by|or|an|their|high|sound|most)$/;
+        const RE=/\d+\.?\s+([a-zA-Z][a-zA-Z\s\u2011\-']{0,38}?[a-zA-Z])(?=\s+\d+\.?|\s*$)/g;
+        for(const row of cleanRows){
+          if(JUNK.test(row)) continue;
+          RE.lastIndex=0;
+          let m;
+          while((m=RE.exec(row))!==null){
+            const w=m[1].trim().replace(/\s+/g,' ').toLowerCase();
+            if(w.length<2||w.length>42||w.split(' ').length>5) continue;
+            if(STOP.test(w)||JUNK.test(w)) continue;
+            if(!seen.has(w)){ entries.push({word:w,phonetic:''}); seen.add(w); }
+          }
+        }
+        // Fallback: "word | phonetic" custom format
+        if(entries.length<5){
+          const fb=parseTextBank(cleanRows.join('\n'));
+          if(fb.length>entries.length){ resolve(fb); return; }
+        }
+        // Fallback B: item-by-item (non-numbered PDFs)
+        if(entries.length<5){
+          const fb2=[],s2=new Set();
+          for(const {s} of allItems){
+            if(!s||s.length<2||s.length>42) continue;
+            if(/^\d+$/.test(s)||!/^[a-zA-Z]/.test(s)) continue;
+            if(!/^[a-zA-Z][a-zA-Z\s\-']*$/.test(s)||s.split(/\s+/).length>5) continue;
+            if(JUNK.test(s)) continue;
+            const w=s.replace(/\s+/g,' ').trim().toLowerCase();
+            if(w.length<2||s2.has(w)||STOP.test(w)) continue;
+            fb2.push({word:w,phonetic:''}); s2.add(w);
+          }
+          if(fb2.length>entries.length){ resolve(fb2); return; }
+        }
+        resolve(entries);
+      } catch(err){ resolve([]); }
+    };
+    fr.readAsArrayBuffer(file);
+  });
+}
+
+
+/* Parse PDF contestant list — robust line extraction */
+async function parsePDFNames(file) {
+  return new Promise(resolve => {
+    const fr = new FileReader();
+    fr.onload = async e => {
+      try {
+        if(!window.pdfjsLib){ resolve([]); return; }
+        const pdf = await pdfjsLib.getDocument({data:e.target.result}).promise;
+        let allItems=[];
+        for(let p=1; p<=pdf.numPages; p++){
+          const page=await pdf.getPage(p);
+          const tc=await page.getTextContent();
+          for(const item of tc.items){
+            const s=item.str.trim();
+            if(s) allItems.push({s,x:item.transform[4],y:item.transform[5]});
+          }
+        }
+        allItems.sort((a,b)=>(b.y-a.y)||(a.x-b.x));
+        const lines=[]; let row=[],prevY=null;
+        for(const {s,y} of allItems){
+          if(prevY===null||Math.abs(y-prevY)<=4){ row.push(s); }
+          else { if(row.length) lines.push(row.join(' ').trim()); row=[s]; }
+          prevY=y;
+        }
+        if(row.length) lines.push(row.join(' ').trim());
+        resolve(parseTextNames(lines.join('\n')));
+      } catch{ resolve([]); }
+    };
+    fr.readAsArrayBuffer(file);
+  });
+}
+
+/* ── DOCUMENT PARSING ── */
+async function parseWordDoc(file) {
+  return new Promise(resolve => {
+    const fr = new FileReader();
+    fr.onload = async e => {
+      try {
+        const {value} = await window.mammoth.extractRawText({arrayBuffer:e.target.result});
+        const entries=[], seen=new Set();
+        for (const rawLine of value.split(/[\r\n]+/)) {
+          const line = rawLine.trim(); if (!line) continue;
+          let matched = false;
+          for (const sep of [" | "," - ","\t"]) {
+            const idx = line.indexOf(sep);
+            if (idx>0) {
+              const w=line.slice(0,idx).trim().toLowerCase();
+              const ph=line.slice(idx+sep.length).trim();
+              if (/^[a-z][a-z'-]*$/.test(w)&&!seen.has(w)) { entries.push({word:w,phonetic:ph}); seen.add(w); matched=true; break; }
+            }
+          }
+          if (!matched) {
+            for (const part of line.split(",")) {
+              const w=part.trim().toLowerCase();
+              if (w.length>1&&/^[a-z][a-z'-]*$/.test(w)&&!seen.has(w)) { entries.push({word:w,phonetic:""}); seen.add(w); }
+            }
+          }
+        }
+        resolve(entries);
+      } catch { resolve([]); }
+    };
+    fr.readAsArrayBuffer(file);
+  });
+}
+
+async function parseNamesDoc(file) {
+  return new Promise(resolve => {
+    const fr = new FileReader();
+    fr.onload = async e => {
+      try {
+        const {value} = await window.mammoth.extractRawText({arrayBuffer:e.target.result});
+        resolve(value.split(/[\r\n]+/).map(l=>l.replace(/^\d+[\.\)\-]\s*/,"").trim()).filter(n=>n.length>1&&n.length<80));
+      } catch { resolve([]); }
+    };
+    fr.readAsArrayBuffer(file);
+  });
+}
+
+/* ── GAME UTILITIES ── */
+function pickWord(bank, used, len) {
+  let pool = bank.filter(w=>!used.includes(w.word));
+  if (len) pool = pool.filter(w=>w.word.length===len);
+  if (!pool.length&&len) pool = bank.filter(w=>!used.includes(w.word));
+  if (!pool.length) return null;
+  return pool[Math.floor(Math.random()*pool.length)];
+}
+function computeVerdict(j) {
+  if (!j) return null;
+  // If discrepancy was resolved, use the agreed final
+  if (j.phase==="agreed" && j.final) {
+    const f=j.final;
+    if (f.override!==null&&f.override!==undefined) return f.override;
+    if (f.err) return "incorrect";
+    if (f.start&&f.end) return "correct";
+    return "incorrect";
+  }
+  // Otherwise use the shared live evaluation
+  const s=j.shared||j;
+  if (s.override!==null&&s.override!==undefined) return s.override;
+  if (s.err) return "incorrect";
+  if (s.start&&s.end) return "correct";
+  return null;
+}
+function judgeVoteVerdict(v) {
+  if (!v) return null;
+  if (v.err) return "incorrect";
+  if (v.start&&v.end) return "correct";
+  return null;
+}
+function detectDiscrepancy(j) {
+  if (!j?.votes) return false;
+  const vArr = Object.values(j.votes);
+  if (vArr.length < 2) return false;
+  const verdicts = vArr.map(v => judgeVoteVerdict(v));
+  return verdicts.some(v => v !== verdicts[0]);
+}
+function getScore(scores, stage, cId) {
+  if (!scores) return {correct:0,total:0,words:[]};   // guard: scores undefined
+  if (stage==="tiebreaker") {
+    const r=scores.tiebreaker?.[cId]?.rounds||[];
+    return {correct:r.filter(x=>x==="correct").length,total:r.length,words:r};
+  }
+  const v=scores[stage]?.[cId]?.v||[];
+  return {correct:v.filter(x=>x==="correct").length,total:v.length,words:v};
+}
+function rankActive(contestants, scores, stage) {
+  if(!contestants||!Array.isArray(contestants)) return [];
+  return contestants.filter(c=>c.active)
+    .map(c=>({...c,...getScore(scores,stage,c.id)}))
+    .sort((a,b)=>b.correct-a.correct||a.name.localeCompare(b.name));
+}
+function canResolveTop3(r) {
+  if (!r.length) return false;
+  if (r.length<=2) return true;
+  return r[0].correct!==r[1].correct && r[1].correct!==r[2].correct;
+}
+function reasonText(reasons, result) {
+  if (result==="correct") return "Correcta";
+  if (!reasons) return "Incorrecto";
+  if (reasons.override==="correct")   return "Correcto por consenso de jurados";
+  if (reasons.override==="incorrect") return "Incorrecto por consenso de jurados";
+  const issues=[];
+  if (!reasons.start) issues.push("No pronunció al inicio");
+  if (!reasons.end)   issues.push("No pronunció al final");
+  if (reasons.err) issues.push((reasons.err.type==="skipped"?"Omitió":"Deletreó mal")+" la letra «"+reasons.err.letter.toUpperCase()+"»");
+  return issues.length ? issues.join("; ") : "Incorrecto";
+}
+
+/* ── PDF REPORT v4 — Landscape oficio, 2-section layout ── */
+function printReport(gs, role, onDone) {
+  const judge = role==="mc" ? gs.mc
+    : role==="presenter" ? gs.presenter
+    : (gs.judges||[]).find(j=>j.id===role);
+  const name = judge?.name || role;
+  const roleLabel = role==="mc" ? "Maestro de Ceremonia"
+    : role==="presenter" ? "Presentador"
+    : "Judge "+role.replace("J","")+", Order "+judge?.order;
+  const date = new Date().toLocaleDateString("en-US",{year:"numeric",month:"long",day:"numeric"});
+  const getC = id => gs.contestants.find(c=>c.id===id);
+
+  /* ── Placement map ── */
+  const placeMap = {};
+  if (gs.results) {
+    if (gs.results.first)  placeMap[gs.results.first]  = { label:"1st Place", emoji:"&#127945;" };
+    if (gs.results.second) placeMap[gs.results.second] = { label:"2nd Place", emoji:"&#129352;" };
+    if (gs.results.third)  placeMap[gs.results.third]  = { label:"3rd Place", emoji:"&#129353;" };
+  }
+
+  const hasTb = gs.history.some(h=>h.stage==="tiebreaker");
+  const allC  = gs.contestants||[];
+
+  /* ── Result cell for summary table ── */
+  function resCell(cId, stage, slot) {
+    const e = gs.history.filter(h=>h.cId===cId&&h.stage===stage)[slot];
+    if (!e) return '<td class="rc nd" style="font-size:5.5pt">&ndash;</td>';
+    return e.result==="correct"
+      ? '<td class="rc ok">&#10003;</td>'
+      : '<td class="rc fail">&#10007;</td>';
+  }
+
+  /* ── Reason text (English) ── */
+  function reasonEn(r, result) {
+    if (result==="correct") return "Correct";
+    if (!r) return "Incorrect";
+    if (r.override==="correct")   return "Correct — judges&rsquo; consensus";
+    if (r.override==="incorrect") return "Incorrect — judges&rsquo; consensus";
+    const issues=[];
+    if (!r.start) issues.push("Did not pronounce the word at the start");
+    if (!r.end)   issues.push("Did not pronounce the word at the end");
+    if (r.err) issues.push((r.err.type==="skipped"?"Skipped":"Misspelled")
+      +" letter &laquo;"+r.err.letter.toUpperCase()+"&raquo;");
+    return issues.length ? issues.join("; ") : "Incorrect";
+  }
+
+  /* ── Logo ── */
+  const logoHTML = gs.logoB64
+    ? '<img src="'+gs.logoB64+'" style="position:absolute;top:11mm;left:14mm;width:3cm;height:3cm;object-fit:contain" alt="Logo">'
+    : "";
+  const logoMiniHTML = gs.logoB64
+    ? '<img src="'+gs.logoB64+'" style="width:1.6cm;height:1.6cm;object-fit:contain;vertical-align:middle;margin-right:8px" alt="">'
+    : "";
+  const padL = gs.logoB64 ? "padding-left:3.6cm" : "";
+
+  /* ── SUMMARY ROWS ── */
+  const summaryRows = allC.map((c,i)=>{
+    const plc=placeMap[c.id];
+    const plcBg=plc
+      ?(c.id===gs.results?.first?"background:#fef9c3"
+        :c.id===gs.results?.second?"background:#f1f5f9":"background:#fef3e2"):"";
+    const plcTxt=plc?plc.emoji+"&#8202;"+plc.label:"&mdash;";
+    return '<tr style="'+(i%2?"background:#f9f9f9":"")+'">'
+      +'<td class="rc" style="font-weight:700">'+(i+1)+'</td>'
+      +'<td class="nm">'+c.name+'</td>'
+      +resCell(c.id,"basic",0)+resCell(c.id,"basic",1)+resCell(c.id,"basic",2)
+      +resCell(c.id,"intermediate",0)+resCell(c.id,"intermediate",1)+resCell(c.id,"intermediate",2)
+      +resCell(c.id,"advanced",0)+resCell(c.id,"advanced",1)+resCell(c.id,"advanced",2)
+      +(hasTb?resCell(c.id,"tiebreaker",0)+resCell(c.id,"tiebreaker",1):"")
+      +'<td class="place" style="'+plcBg+'">'+plcTxt+'</td>'
+      +'</tr>';
+  }).join("");
+
+  const tbHdr = hasTb
+    ? '<th colspan="2" style="background:#3a1680;border:.5px solid #555;padding:3px 4px;text-align:center">Break the Tie</th>'
+    : "";
+  const tbSub = hasTb
+    ? '<th class="sh">R1</th><th class="sh">R2</th>'
+    : "";
+
+  /* ── DETAIL BLOCKS (per student, vertical flow) ── */
+  let detailBlocks = "";
+  for (const c of allC) {
+    const ents = gs.history.filter(h=>h.cId===c.id);
+    // Always include ALL contestants, even those with no words recorded
+    const plc=placeMap[c.id];
+    const cor=ents.filter(e=>e.result==="correct").length;
+    const stageName={basic:"Basic",intermediate:"Intermediate",advanced:"Advanced",tiebreaker:"Tie-breaker"};
+    const stageColor={basic:"#16537e",intermediate:"#7a4f00",advanced:"#7a1616",tiebreaker:"#3a1680"};
+    const noHistMsg='<tr><td colspan="5" style="border:.5px solid #ccc;padding:3px 6px;color:#aaa;font-style:italic;text-align:center">No words recorded for this contestant</td></tr>';
+    const rows=ents.length===0?noHistMsg:ents.map(e=>{
+      const ok=e.result==="correct";
+      return '<tr class="'+(ok?"dr-ok":"dr-fail")+'">'
+        +'<td class="dt-stage" style="color:'+stageColor[e.stage]+'">'+stageName[e.stage]+'</td>'
+        +'<td class="dt-word">'+e.word.toUpperCase()+'</td>'
+        +'<td class="dt-ph">'+(e.phonetic||"&mdash;")+'</td>'
+        +'<td class="dt-res" style="color:'+(ok?"#16a34a":"#dc2626")+'">'+(ok?"&#10003;":"&#10007;")+'</td>'
+        +'<td class="dt-obs" style="color:'+(ok?"#16a34a":"#dc2626")+'">'+(ok?"&#10003; ":"&#10007; ")+reasonEn(e.reasons,e.result)+'</td>'
+        +'</tr>';
+    }).join("");
+    detailBlocks+='<div class="sblock">'
+      +'<table class="dt"><thead><tr class="dt-hdr">'
+      +'<th colspan="3" style="text-align:left">'+c.name+'</th>'
+      +'<th colspan="2" style="text-align:right;font-weight:400">'
+        +(ents.length===0?'No words recorded':(cor+'/'+ents.length+' correct'))+(plc?" &nbsp;&bull;&nbsp; "+plc.emoji+" "+plc.label:"")
+      +'</th></tr>'
+      +'<tr class="dt-sub"><th class="dt-stage">Stage</th><th class="dt-word">Word</th><th class="dt-ph">IPA Phonetics</th>'
+      +'<th class="dt-res" style="text-align:center">Result</th><th class="dt-obs">Observation / Reason for Error</th></tr></thead>'
+      +'<tbody>'+rows+'</tbody></table></div>';
+  }
+
+  const css=`
+    @page { size:355.6mm 215.9mm landscape; margin:11mm 14mm 12mm; }
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{font-family:Arial,Helvetica,sans-serif;font-size:7.5pt;color:#111;line-height:1.3;position:relative;}
+    /* ── Summary section ── */
+    .sum-wrap{page-break-after:always;}
+    .hdr{text-align:center;border-bottom:1.5px solid #111;padding-bottom:7px;margin-bottom:7px;}
+    .hdr h1{font-size:11.5pt;font-weight:700;letter-spacing:.02em;margin-bottom:1px;}
+    .hdr .inst{font-size:9.5pt;font-weight:700;color:#222;margin-bottom:1px;}
+    .hdr .sub{font-size:7pt;color:#555;}
+    .meta{display:flex;gap:10px;margin-bottom:7px;font-size:7pt;}
+    .meta-item{background:#f7f7f7;border:.5px solid #ddd;border-radius:2px;padding:3px 7px;}
+    .meta-lbl{color:#888;font-size:5.5pt;font-weight:700;letter-spacing:.05em;text-transform:uppercase;margin-bottom:1px;}
+    /* ── Summary table ── */
+    .stbl{width:100%;border-collapse:collapse;font-size:7pt;table-layout:fixed;}
+    .stbl th{background:#f0f0f0;border:.5px solid #bbb;padding:2.5px 3px;text-align:left;font-size:6.5pt;}
+    .stbl td{border:.5px solid #ccc;padding:2px 3px;vertical-align:middle;}
+    .nm{white-space:normal;word-break:break-word;font-weight:700;line-height:1.25;width:33%;}
+    .rc{text-align:center;width:9pt;padding:1.5px 0px;font-weight:700;font-size:6.5pt;}
+    .rc.ok{color:#16a34a;}.rc.fail{color:#dc2626;}.rc.nd{color:#ccc;font-size:6pt;}
+    .sh{text-align:center;font-size:5.5pt;width:9pt;padding:1px 0px;}
+    .place{text-align:center;font-size:7pt;font-weight:700;width:46pt;padding:2px 3px;}
+    /* ── Signature (summary page only) ── */
+    .sig-wrap{margin-top:18px;display:flex;justify-content:center;}
+    .sig{width:200pt;text-align:center;}
+    .sig-line{border-top:1px solid #222;margin-top:28px;margin-bottom:3px;}
+    .sig-name{font-size:8pt;font-weight:700;}
+    .sig-role{font-size:6.5pt;color:#555;}
+    /* ── Detail section ── */
+    .detail-wrap{}
+    .mini-hdr{display:flex;align-items:center;justify-content:center;border-bottom:1.5px solid #111;padding-bottom:6px;margin-bottom:8px;}
+    .mini-hdr-text{text-align:center;}
+    .mini-hdr-text h2{font-size:9.5pt;font-weight:700;margin-bottom:1px;}
+    .mini-hdr-text p{font-size:7pt;color:#555;}
+    .det-title{font-size:8pt;font-weight:700;color:#374151;border-left:2.5px solid #374151;padding-left:6px;margin-bottom:7px;}
+    .sblock{page-break-inside:avoid;margin-bottom:10px;}
+    .dt{width:100%;border-collapse:collapse;font-size:7pt;table-layout:fixed;}
+    .dt td,.dt th{border:.5px solid #ccc;padding:2px 4px;vertical-align:middle;}
+    .dt-hdr{background:#1a1a2e;color:#fff;}
+    .dt-hdr th{font-size:7.5pt;border-color:#444;}
+    .dt-sub{background:#eee;font-size:6.5pt;}
+    .dt-sub th{padding:2px 4px;}
+    .dt-stage{width:52pt;color:#555;font-size:6.5pt;}
+    .dt-word{width:70pt;font-weight:700;font-size:8pt;letter-spacing:.05em;}
+    .dt-ph{width:68pt;font-style:italic;color:#555;font-size:7pt;}
+    .dt-res{width:20pt;text-align:center;font-weight:700;}
+    .dt-obs{color:#555;}
+    .dr-ok .dt-obs,.dr-ok .dt-res{color:#16a34a;}
+    .dr-fail{background:#fff9f9;}.dr-fail .dt-obs,.dr-fail .dt-res{color:#dc2626;}
+    .footer{margin-top:8px;font-size:6pt;color:#bbb;text-align:center;border-top:.5px solid #eee;padding-top:3px;}
+  `;
+
+  const html='<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Spelling Bee Evaluation Record</title>'
+    +'<style>'+css+'</style></head><body>'
+    +logoHTML
+
+    /* ── SECTION 1: Summary ── */
+    +'<div class="sum-wrap">'
+    +'<div class="hdr" style="'+padL+'">'
+    +'<h1>&#127829; Spelling Bee &mdash; Official Evaluation Record</h1>'
+    +(gs.institution?'<div class="inst">'+gs.institution+(gs.level?" &bull; "+gs.level:"")+'</div>':"")
+    +'</div>'
+
+    /* meta row */
+    +'<div class="meta">'
+    +'<div class="meta-item"><div class="meta-lbl">Evaluator</div><strong>'+name+'</strong></div>'
+    +'<div class="meta-item"><div class="meta-lbl">Role</div>'+roleLabel+'</div>'
+    +'<div class="meta-item"><div class="meta-lbl">Room</div><strong>'+(gs.roomId||"")+'</strong></div>'
+    +'<div class="meta-item"><div class="meta-lbl">Date</div>'+date+'</div>'
+    +'<div class="meta-item"><div class="meta-lbl">Contestants</div><strong>'+allC.length+'</strong></div>'
+    +'</div>'
+
+    /* summary table */
+    +'<table class="stbl"><thead>'
+    +'<tr style="background:#1a1a2e;color:#fff;">'
+    +'<th style="border:.5px solid #555;padding:3px 3px;width:20pt;text-align:center">No.</th>'
+    +'<th style="border:.5px solid #555;padding:3px 4px;text-align:left;width:33%">Contestant</th>'
+    +'<th colspan="3" style="border:.5px solid #555;padding:3px 4px;text-align:center;background:#16537e">Round 1 &mdash; Basic</th>'
+    +'<th colspan="3" style="border:.5px solid #555;padding:3px 4px;text-align:center;background:#7a4f00">Round 2 &mdash; Intermediate</th>'
+    +'<th colspan="3" style="border:.5px solid #555;padding:3px 4px;text-align:center;background:#7a1616">Round 3 &mdash; Advanced</th>'
+    +tbHdr
+    +'<th style="border:.5px solid #555;padding:3px 3px;text-align:center;width:46pt">Place</th>'
+    +'</tr>'
+    +'<tr style="background:#eee;">'
+    +'<th class="sh"></th><th class="sh"></th>'
+    +'<th class="sh">W1</th><th class="sh">W2</th><th class="sh">W3</th>'
+    +'<th class="sh">W1</th><th class="sh">W2</th><th class="sh">W3</th>'
+    +'<th class="sh">W1</th><th class="sh">W2</th><th class="sh">W3</th>'
+    +tbSub
+    +'<th class="sh"></th>'
+    +'</tr></thead>'
+    +'<tbody>'+summaryRows+'</tbody></table>'
+
+    /* signature — only judge, no coordinator/director */
+    +'<div class="sig-wrap">'
+    +'<div class="sig"><div class="sig-line"></div>'
+    +'<div class="sig-name">'+name+'</div>'
+    +'<div class="sig-role">'+roleLabel+'</div>'
+    +'</div></div>'
+    +'</div>' /* end sum-wrap */
+
+    /* ── SECTION 2: Detail (new page) ── */
+    +'<div class="detail-wrap">'
+    +'<div class="mini-hdr">'
+    +(gs.logoB64?logoMiniHTML:"")
+    +'<div class="mini-hdr-text">'
+    +'<h2>'+( gs.institution||"Spelling Bee")+(gs.level?" &bull; "+gs.level:"")+'</h2>'
+    +'<p>Detailed Results by Contestant</p>'
+    +'</div></div>'
+    +detailBlocks
+    +'</div>' /* end detail-wrap */
+
+    +'</body></html>';
+
+  const win=window.open("","_blank","width=1300,height=820,menubar=yes");
+  if(!win){alert("Allow pop-ups and try again.");return;}
+  win.document.write(html); win.document.close();
+  win.onload=()=>{setTimeout(()=>{win.print();if(onDone)onDone();},500);};
+}
+
+
+/* ════════════════════════════════════════════════════
+   SISTEMA DE USUARIOS MAESTRO / OPERADORES
+════════════════════════════════════════════════════ */
+const ADMIN_PATH   = "spellingbee/admin";
+const ROOMS_PATH   = "spellingbee/rooms";
+const DEFAULT_PWD  = "jd-reset-2025";    // contraseña por defecto al crear/resetear
+
+/* Hashing SHA-256 con Web Crypto */
+async function hashPwd(pwd) {
+  const data = new TextEncoder().encode(pwd + ":jd-sb-salt");
+  const buf  = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+}
+
+/* Contar salas activas de un usuario */
+async function countActiveRooms(username) {
+  const snap = await window.rtdb.ref(ROOMS_PATH).once("value");
+  const rooms = snap.val()||{};
+  return Object.values(rooms).filter(r=>r.state?.createdBy===username&&r.state?.phase!=="archived").length;
+}
+
+/* Cargar todos los usuarios operadores */
+async function loadAdminUsers() {
+  const snap = await window.rtdb.ref(ADMIN_PATH+"/users").once("value");
+  const data = snap.val()||{};
+  // Enrich with active room count
+  const enriched = await Promise.all(Object.entries(data).map(async([username,u])=>{
+    const active = await countActiveRooms(username);
+    return {...u, username, activeRooms:active};
+  }));
+  return enriched;
+}
+
+/* Crear usuario operador */
+async function createAdminUser(username, roomLimit, createdBy) {
+  const pwdHash = await hashPwd(DEFAULT_PWD);
+  const user = { passwordHash:pwdHash, roomLimit:roomLimit||6, active:true,
+    createdAt:Date.now(), createdBy:createdBy||'master', totalCreated:0 };
+  await window.rtdb.ref(ADMIN_PATH+"/users/"+username).set(user);
+}
+
+/* Resetear contraseña a default */
+async function resetAdminUserPwd(username) {
+  const hash = await hashPwd(DEFAULT_PWD);
+  await window.rtdb.ref(ADMIN_PATH+"/users/"+username+"/passwordHash").set(hash);
+}
+
+/* Cambiar límite de salas */
+async function setRoomLimit(username, limit) {
+  await window.rtdb.ref(ADMIN_PATH+"/users/"+username+"/roomLimit").set(limit);
+}
+
+/* Desactivar usuario */
+async function toggleAdminUser(username, active) {
+  await window.rtdb.ref(ADMIN_PATH+"/users/"+username+"/active").set(active);
+}
+
+/* Login de operador */
+async function loginOperator(username, password) {
+  // Check if it's master
+  const masterLogin = await loginMaster(username, password);
+  if (masterLogin.ok) return {ok:true, user:{type:"master", username}};
+  // Check operator
+  const snap = await window.rtdb.ref(ADMIN_PATH+"/users/"+username).once("value");
+  const u = snap.val();
+  if (!u||!u.active) return {ok:false, err:"Usuario no encontrado o desactivado"};
+  const hash = await hashPwd(password);
+  if (hash !== u.passwordHash) return {ok:false, err:"Contraseña incorrecta"};
+  const active = await countActiveRooms(username);
+  return {ok:true, user:{type:"operator",username,roomLimit:u.roomLimit||6,activeRooms:active}};
+}
+
+/* Seed master user on first load */
+async function ensureMasterExists() {
+  const snap = await window.rtdb.ref(ADMIN_PATH+"/master").once("value");
+  if (!snap.val()) {
+    await window.rtdb.ref(ADMIN_PATH+"/master").set({
+      username:"dportillo",
+      passwordHash:"55f4662ff1f5fa7f28ea4c0edfa4a7c2d9663609bade88d5f951e2f8fe390344",
+      createdAt:Date.now()
+    });
+  }
+}
+
+/* Login master with username/password */
+async function loginMaster(username, password) {
+  const snap = await window.rtdb.ref(ADMIN_PATH+"/master").once("value");
+  const m = snap.val();
+  if (!m || m.username !== username) return {ok:false, err:"Usuario maestro no encontrado"};
+  const hash = await hashPwd(password);
+  if (hash !== m.passwordHash) return {ok:false, err:"Contraseña incorrecta"};
+  return {ok:true};
+}
+
+/* ── CSS ── */
+const CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,600;0,700;1,400;1,600&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap');
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+  body{background:#0C1628;}
+  .sb{min-height:100vh;background:#0C1628;color:#E8EDF8;font-family:'Plus Jakarta Sans',system-ui,sans-serif;font-size:15px;}
+  .word-font{font-family:'Cormorant Garamond',Georgia,serif;font-weight:700;letter-spacing:.14em;}
+  .ph-font{font-family:'Cormorant Garamond',Georgia,serif;font-style:italic;color:#6B7FA3;}
+  .ltr{display:inline-block;padding:2px 3px;border-radius:5px;cursor:pointer;transition:background .1s,color .1s;}
+  .ltr:hover{background:rgba(255,255,255,.13);}
+  .ltr.skip{color:#fbbf24;text-decoration:underline wavy 1.5px;}
+  .ltr.bad{color:#f87171;background:rgba(248,113,113,.2);}
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:10px 20px;border-radius:11px;border:none;cursor:pointer;font-family:inherit;font-size:.88rem;font-weight:600;transition:all .18s;white-space:nowrap;line-height:1;}
+  .btn:disabled{opacity:.35;cursor:not-allowed;pointer-events:none;}
+  .btn-gold{background:#E8A200;color:#0C1628;}.btn-gold:not(:disabled):hover{background:#F5AC00;box-shadow:0 4px 18px rgba(232,162,0,.42);transform:translateY(-1px);}
+  .btn-green{background:#16a34a;color:#fff;}.btn-green:not(:disabled):hover{background:#15803d;}
+  .btn-red{background:#dc2626;color:#fff;}.btn-red:not(:disabled):hover{background:#b91c1c;}
+  .btn-ghost{background:rgba(255,255,255,.07);color:#E8EDF8;border:1px solid rgba(255,255,255,.14);}.btn-ghost:not(:disabled):hover{background:rgba(255,255,255,.12);}
+  .btn-pdf{background:rgba(99,102,241,.18);color:#a5b4fc;border:1px solid rgba(99,102,241,.35);}.btn-pdf:not(:disabled):hover{background:rgba(99,102,241,.3);}
+  .spin-btn{background:linear-gradient(135deg,#E8A200,#FF7700);color:#0C1628;padding:18px 52px;font-size:1.28rem;letter-spacing:.12em;border-radius:16px;box-shadow:0 5px 28px rgba(232,162,0,.45);}
+  .spin-btn:not(:disabled):hover{transform:scale(1.05);}
+  .card{background:#162038;border-radius:16px;border:1px solid rgba(255,255,255,.07);padding:20px;}
+  .check{display:flex;align-items:center;gap:11px;padding:11px 15px;border-radius:10px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);cursor:pointer;user-select:none;transition:all .15s;}
+  .check.on{background:rgba(34,197,94,.14);border-color:rgba(34,197,94,.38);}
+  .check:not(.on):hover{background:rgba(255,255,255,.09);}
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.82);display:flex;align-items:center;justify-content:center;z-index:300;backdrop-filter:blur(6px);padding:16px;}
+  .upzone{border:2px dashed rgba(255,255,255,.18);border-radius:12px;padding:15px;cursor:pointer;transition:border-color .2s;position:relative;display:block;}
+  .upzone:hover{border-color:rgba(232,162,0,.5);}.upzone.ok{border-color:rgba(34,197,94,.6);}
+  .upzone input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;}
+  .field{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:10px 13px;color:#E8EDF8;font-size:.9rem;font-family:inherit;outline:none;width:100%;transition:border-color .15s;}
+  .field:focus{border-color:rgba(232,162,0,.5);}select.field{cursor:pointer;}
+  .word-table{width:100%;border-collapse:collapse;}
+  .word-table th{color:#4B5A78;font-size:.7rem;font-weight:700;letter-spacing:.05em;padding:5px 8px;border-bottom:1px solid rgba(255,255,255,.07);text-align:left;}
+  .word-table td{padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.04);font-size:.84rem;}
+  .word-table input{background:transparent;border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:3px 6px;color:#E8EDF8;font-family:'Cormorant Garamond',serif;font-size:.9rem;font-style:italic;outline:none;width:100%;}
+  .word-table input:focus{border-color:rgba(232,162,0,.5);background:rgba(232,162,0,.05);}
+  .dot{width:11px;height:11px;border-radius:3px;display:inline-block;}
+  @media(max-width:639px){
+    .sb{font-size:14px;}
+    .card{padding:15px;border-radius:13px;}
+    .btn{font-size:.84rem;padding:9px 16px;}
+    .spin-btn{padding:16px 36px;font-size:1.1rem;letter-spacing:.08em;}
+    .word-font{font-size:clamp(1.8rem,9vw,3.2rem);}
+    .ph-font{font-size:1rem;}
+    .check{padding:10px 12px;gap:9px;}
+    .field{font-size:.9rem;padding:9px 12px;}
+    .overlay{padding:10px;}
+  }
+  @media(max-width:380px){
+    .spin-btn{padding:14px 28px;font-size:1rem;}
+  }
+  @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  @keyframes pop{0%{transform:scale(.88)}55%{transform:scale(1.06)}100%{transform:none}}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  .fade-up{animation:fadeUp .3s ease;}.pop{animation:pop .4s ease;}.pulse{animation:pulse 2s infinite;}
+`;
+
+/* Error boundary — prevents full blue-screen crash */
+class ErrorBoundary extends React.Component {
+  constructor(p){super(p);this.state={err:null};}
+  static getDerivedStateFromError(err){return{err};}
+  componentDidCatch(err,info){console.error("AppError:",err,info);}
+  render(){
+    if(this.state.err) return React.createElement("div",
+      {style:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",background:"#0C1628",color:"#E8EDF8",gap:16,padding:24,fontFamily:"sans-serif"}},
+      React.createElement("div",{style:{fontSize:"3rem"}},"🐝"),
+      React.createElement("h2",{style:{color:"#E8A200",marginBottom:8}},"Ocurrió un error"),
+      React.createElement("p",{style:{color:"#4B5A78",fontSize:".9rem",maxWidth:400,textAlign:"center"}},String(this.state.err?.message||"Error inesperado")),
+      React.createElement("button",{style:{padding:"10px 24px",background:"#E8A200",color:"#0C1628",border:"none",borderRadius:10,fontWeight:700,cursor:"pointer",fontSize:"1rem"},
+        onClick:()=>window.location.reload()},"🔄 Recargar página")
+    );
+    return this.props.children;
+  }
+}
+
+/* ════════════════════════════════════════════
+   APP
+════════════════════════════════════════════ */
+function App() {
+  const [screen,   setScreen]   = useState("init");
+  const [roomId,   setRoomId]   = useState(null);
+  const [gs,       setGs]       = useState(null);
+  const [role,     setRole]     = useState(null);
+  const [nameIn,   setNameIn]   = useState("");
+  const [inst,     setInst]     = useState("");
+  const [lvl,      setLvl]      = useState("");
+  const [joinCode, setJoinCode] = useState("");
+  const [jNames,   setJNames]   = useState({J1:"",J2:"",J3:""});
+  const [jOrders,  setJOrders]  = useState({J1:1,J2:2,J3:3});
+  const [files,    setFiles]    = useState({basic:null,inter:null,adv:null,pax:null});
+  const [status,   setStatus]   = useState("");
+  const [busy,     setBusy]     = useState(false);
+  const [tab,      setTab]      = useState("banks");
+  const [editBanks,setEditBanks]= useState({basic:[],intermediate:[],advanced:[]});
+  const [progress, setProgress] = useState(null);
+  const [ltrModal, setLtrModal] = useState(null);
+  const [ovrModal, setOvrModal] = useState(false);
+  const [wordKey,  setWordKey]  = useState(0);
+  const [logoB64,  setLogoB64]  = useState("");
+  const [pasteTexts, setPasteTexts] = useState({basic:"",inter:"",adv:"",pax:""});
+  const [pasteMode,  setPasteMode]  = useState({basic:false,inter:false,adv:false,pax:false});
+  const [isMobile, setIsMobile] = useState(typeof window!=="undefined"&&window.innerWidth<640);
+  const [adminUser,   setAdminUser]   = useState(null);   // {type,username,roomLimit,activeRooms} or {type:"master",uid,email}
+  const [showAdmin,   setShowAdmin]   = useState(false);  // show admin overlay
+  const [adminView,   setAdminView]   = useState("login"); // "login"|"dashboard"|"setup-master"
+  const [adminUsers,  setAdminUsers]  = useState([]);
+  const [adminBusy,   setAdminBusy]   = useState(false);
+  const [adminStatus, setAdminStatus] = useState("");
+  const [adminForm,   setAdminForm]   = useState({username:"",password:"",limit:5});
+  const [newUserForm, setNewUserForm] = useState({username:"",limit:5});
+  const [operLogin,   setOperLogin]   = useState({username:"",password:""});
+  const [disputeModal, setDisputeModal] = useState(false);
+  const [markedLetterIdx,setMarkedLetterIdx]=useState(null);
+  const [markedReason,setMarkedReason]=useState(null);
+  const [revealAdvancing, setRevealAdvancing] = useState(false);
+
+  const gsRef     = useRef(gs);     gsRef.current     = gs;
+  const screenRef = useRef(screen); screenRef.current = screen;
+  const roomRef   = useRef(roomId); roomRef.current   = roomId;
+
+  /* Init — read ?room= from URL */
+  useEffect(() => {
+    const room = new URLSearchParams(window.location.search).get("room");
+    if (!room) { setScreen("landing"); return; }
+    setRoomId(room); roomRef.current = room;
+    if (!window.FIREBASE_OK) {
+      /* Firebase still initializing — wait for it */
+      const waitAndCheck = () => {
+        if (window.FIREBASE_OK) {
+          checkRoom(room);
+        } else {
+          setTimeout(waitAndCheck, 80);
+        }
+      };
+      waitAndCheck();
+      return;
+    }
+    setScreen("checking");
+    window.rtdb.ref("spellingbee/rooms/"+room+"/state").once("value").then(snap => {
+      const s = fixArrays(snap.val());
+      if (!s) { setScreen("room-not-found"); return; }
+      if (s.phase==="archived") { setScreen("room-closed"); return; }
+      // Auto-expire after 72 hours of inactivity
+      const last = s.lastActivity || s.expiresAt - 72*3600*1000 || 0;
+      // 36h after all actas downloaded
+      const actaExpired = s.actasClosedAt && (Date.now()-s.actasClosedAt > 36*3600*1000);
+      // 72h inactivity
+      const expired = actaExpired || (s.expiresAt ? Date.now()>s.expiresAt : (Date.now()-last>72*3600*1000));
+      if (expired) {
+        window.rtdb.ref("spellingbee/rooms/"+room+"/state/phase").set("archived");
+        setScreen("room-closed"); return;
+      }
+      setGs(s); setScreen("login");
+    }).catch(() => setScreen("room-not-found"));
+  }, []);
+
+  /* Firebase real-time subscription */
+  useEffect(() => {
+    if (!role||!roomId||!window.FIREBASE_OK) return;
+    const ref = window.rtdb.ref("spellingbee/rooms/"+roomId+"/state");
+    const h = snap => {
+      const raw = snap.val(); if (!raw) return;
+      const data = fixArrays(raw);
+      setGs(prev => JSON.stringify(prev)===JSON.stringify(data) ? prev : data);
+      const sc = screenRef.current;
+      if (data.phase==="competition" && (sc==="setup"||sc==="setup-wait")) setScreen("competition");
+      if (data.phase==="results" && sc!=="results") setScreen("results");
+    };
+    ref.on("value", h);
+    return () => ref.off("value", h);
+  }, [role, roomId]);
+
+  useEffect(() => { if(gs?.stage||gs?.stageComplete===false) setRevealAdvancing(false); }, [gs?.stage]);
+  useEffect(() => {
+    const h=()=>setIsMobile(window.innerWidth<640);
+    window.addEventListener("resize",h);
+    return()=>window.removeEventListener("resize",h);
+  },[]);
+
+  /* Force re-check FIREBASE_OK once Firebase finishes async init */
+  useEffect(() => {
+    if (window.FIREBASE_OK) { ensureMasterExists().catch(console.error); return; }
+    const onReady = () => { ensureMasterExists().catch(console.error); setScreen(s => s); };
+    window.addEventListener('firebase-ready', onReady);
+    // After 12s, if still not ready, show error
+    const timeout = setTimeout(() => {
+      if (!window.FIREBASE_OK) setScreen("firebase-error");
+    }, 12000);
+    return () => { window.removeEventListener('firebase-ready', onReady); clearTimeout(timeout); };
+  }, []);
+
+  const upd = useCallback(fn => {
+    setGs(prev => {
+      const base = typeof fn==="function" ? fn(prev||initState()) : fn;
+      const next = {...base, lastActivity:Date.now()};
+      if (roomRef.current && window.FIREBASE_OK)
+        window.rtdb.ref("spellingbee/rooms/"+roomRef.current+"/state").set(next);
+      return next;
+    });
+  }, []);
+
+  /* ── ADMIN HANDLERS ── */
+  // Google login removed;
+
+  const doOperatorLogin = async () => {
+    if (!operLogin.username||!operLogin.password) return;
+    setAdminBusy(true); setAdminStatus("");
+    const res = await loginOperator(operLogin.username, operLogin.password);
+    if (res.ok) {
+      setAdminUser(res.user);
+      if (res.user.type==="master") {
+        const users = await loadAdminUsers();
+        setAdminUsers(users);
+        setAdminView("dashboard");
+      } else {
+        setShowAdmin(false);
+      }
+    } else {
+      setAdminStatus("❌ "+res.err);
+    }
+    setAdminBusy(false);
+  };
+
+  const doAdminLogout = async () => {
+    setAdminUser(null); setShowAdmin(false); setAdminView("login"); setOperLogin({username:"",password:""});
+  };
+
+  const doCreateAdminUser = async () => {
+    if (!newUserForm.username.trim()||!adminUser) return;
+    setAdminBusy(true); setAdminStatus("");
+    try {
+      await createAdminUser(newUserForm.username.trim(), +newUserForm.limit||6, adminUser.username||'master');
+      const users = await loadAdminUsers();
+      setAdminUsers(users);
+      setNewUserForm({username:"",limit:5});
+      setAdminStatus("✅ Usuario «"+newUserForm.username.trim()+"» creado. Contraseña: "+DEFAULT_PWD);
+    } catch(e) { setAdminStatus("❌ "+e.message); }
+    setAdminBusy(false);
+  };
+
+  const doResetPwd = async (username) => {
+    setAdminBusy(true);
+    await resetAdminUserPwd(username);
+    setAdminStatus("✅ Contraseña de «"+username+"» restablecida a: "+DEFAULT_PWD);
+    setAdminBusy(false);
+  };
+
+  const doSetLimit = async (username, limit) => {
+    setAdminBusy(true);
+    await setRoomLimit(username, +limit);
+    const users = await loadAdminUsers();
+    setAdminUsers(users);
+    setAdminBusy(false);
+  };
+
+  const doToggleUser = async (username, active) => {
+    await toggleAdminUser(username, active);
+    const users = await loadAdminUsers();
+    setAdminUsers(users);
+  };
+
+  const doRefreshUsers = async () => {
+    setAdminBusy(true);
+    const users = await loadAdminUsers();
+    setAdminUsers(users);
+    setAdminBusy(false);
+  };
+
+  /* ── CREATE ROOM ── */
+  const doCreateRoom = async () => {
+    if (!inst.trim()) return;
+    if (!window.FIREBASE_OK) {
+      setAdminStatus("⏳ Firebase aún inicializando. Espera un momento e intenta de nuevo.");
+      return;
+    }
+    if (!adminUser) { setShowAdmin(true); setAdminView("login"); return; }
+    // Check room limit for operators
+    if (adminUser.type==="operator") {
+      const active = await countActiveRooms(adminUser.username);
+      if (active >= adminUser.roomLimit) {
+        alert("Has alcanzado el límite de "+adminUser.roomLimit+" sala(s) simultánea(s) para tu cuenta.\nCierra salas activas o contacta al administrador para ampliar tu límite.");
+        return;
+      }
+    }
+    const newId = generateRoomId();
+    const ns = {...initState(), roomId:newId, institution:inst.trim(), level:lvl.trim(), createdBy:adminUser?.username||adminUser?.email||"master", expiresAt:Date.now()+72*3600*1000, lastActivity:Date.now()};
+    await window.rtdb.ref("spellingbee/rooms/"+newId+"/state").set(ns);
+    sessionStorage.setItem("creator-"+newId, "1");
+    window.history.pushState({}, "", window.location.pathname+"?room="+newId);
+    setRoomId(newId); roomRef.current = newId; setGs(ns); setScreen("share-link");
+  };
+
+  const doJoinByCode = () => {
+    const code = joinCode.trim().toUpperCase(); if (!code) return;
+    window.location.href = window.location.pathname+"?room="+code;
+  };
+
+  /* ── LOGIN ── */
+  const doLogin = async () => {
+    if (!role||!nameIn.trim()) return;
+    const snap = await window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").once("value");
+    let s = fixArrays(snap.val()) || gs || initState();
+    if (role==="mc") {
+      s = {...s, mc:{name:nameIn.trim(),ts:Date.now()}};
+    } else if (role==="presenter") {
+      s = {...s, presenter:{name:nameIn.trim(),ts:Date.now()}};
+    } else if (role==="judge") {
+      const taken=(s.judges||[]).map(j=>j.id);
+      const maxSlots=["J1","J2","J3","J4","J5","J6","J7","J8","J9","J10"].slice(0,s.judgeCount||3);
+      const available=maxSlots.find(id=>!taken.includes(id));
+      if(!available){alert("No hay más lugares de jurado disponibles.");return;}
+      const newJudge={id:available,name:nameIn.trim(),order:taken.length+1,ts:Date.now()};
+      s={...s,judges:[...(s.judges||[]),newJudge]};
+      setRole(available);
+    }
+    window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").set(s); setGs(s);
+    const isCreator = sessionStorage.getItem("creator-"+roomId)==="1";
+    if (isCreator && s.phase==="setup") setScreen("setup");
+    else if (s.phase==="setup") setScreen("setup-wait");
+    else if (s.phase==="competition") setScreen("competition");
+    else setScreen("results");
+  };
+
+  const doLoginCreator = async () => {
+    if (!role||!nameIn.trim()) return;
+    let s = gs || initState();
+    if (role==="mc") {
+      s={...s,mc:{name:nameIn.trim(),ts:Date.now()}};
+    } else if (role==="presenter") {
+      s={...s,presenter:{name:nameIn.trim(),ts:Date.now()}};
+    } else if(role==="judge"){
+      const taken=(s.judges||[]).map(j=>j.id);
+      const maxSlots=["J1","J2","J3","J4","J5","J6","J7","J8","J9","J10"].slice(0,s.judgeCount||3);
+      const available=maxSlots.find(id=>!taken.includes(id));
+      if(!available){alert("No hay más lugares disponibles.");return;}
+      const newJudge={id:available,name:nameIn.trim(),order:taken.length+1,ts:Date.now()};
+      s={...s,judges:[...(s.judges||[]),newJudge]};
+      setRole(available);
+    }
+    window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").set(s); setGs(s);
+    setScreen("setup");
+  };
+
+  /* ── SETUP ── */
+  const doLoadBanks = async () => {
+    if (!files.basic&&!files.inter&&!files.adv&&!pasteTexts.basic.trim()&&!pasteTexts.inter.trim()&&!pasteTexts.adv.trim()) { setStatus("⚠ Sube al menos un banco de palabras o pega el texto."); return; }
+    setBusy(true); setStatus("📄 Leyendo documentos Word...");
+    try {
+      const [bW,iW,aW] = await Promise.all([
+        files.basic ? (files.basic.name?.endsWith('.pdf')?parsePDFWordBank(files.basic):parseWordDoc(files.basic)) : pasteTexts.basic?Promise.resolve(parseTextBank(pasteTexts.basic)):Promise.resolve([]),
+        files.inter ? (files.inter.name?.endsWith('.pdf')?parsePDFWordBank(files.inter):parseWordDoc(files.inter)) : pasteTexts.inter?Promise.resolve(parseTextBank(pasteTexts.inter)):Promise.resolve([]),
+        files.adv   ? (files.adv.name?.endsWith('.pdf')  ?parsePDFWordBank(files.adv)  :parseWordDoc(files.adv))   : pasteTexts.adv?Promise.resolve(parseTextBank(pasteTexts.adv)):Promise.resolve([]),
+      ]);
+      const need = [...new Set([...bW,...iW,...aW].filter(w=>!w.phonetic).map(w=>w.word))];
+      setStatus("🔤 Generando fonética para "+need.length+" palabras (API gratuita)...");
+      setProgress({done:0, total:need.length||1});
+      const pm = await getPhonetics(need, (done,total) => { setProgress({done,total}); setStatus("🔤 "+done+"/"+total+" palabras procesadas..."); });
+      const fill = arr => arr.map(w=>({...w, phonetic:w.phonetic||pm[w.word]||""}));
+      setEditBanks({basic:fill(bW), intermediate:fill(iW), advanced:fill(aW)});
+      setProgress(null);
+      setStatus("✅ Básico:"+bW.length+" · Intermedio:"+iW.length+" · Avanzado:"+aW.length+" palabras cargadas.");
+      setTab("banks");
+    } catch(e) { setStatus("❌ "+e.message); setProgress(null); }
+    setBusy(false);
+  };
+
+  const doLoadContestants = async () => {
+    if (!files.pax && !pasteTexts.pax?.trim()) { setStatus("⚠ Sube el archivo o pega la lista de concursantes."); return; }
+    setBusy(true);
+    try {
+      const names = files.pax
+        ? (files.pax.name?.endsWith('.pdf') ? await parsePDFNames(files.pax) : await parseNamesDoc(files.pax))
+        : parseTextNames(pasteTexts.pax||"");
+      upd(prev => ({...prev, contestants:names.map((n,i)=>({id:"C"+(i+1),name:n,active:true}))}));
+      setStatus("✅ "+names.length+" concursantes cargados."); setTab("contestants");
+    } catch { setStatus("❌ Error al leer la lista."); }
+    setBusy(false);
+  };
+
+  const doSaveBanks = () => {
+    upd(prev => ({
+      ...prev,
+      banks:{basic:editBanks.basic, intermediate:editBanks.intermediate, advanced:editBanks.advanced},
+      // judges names are set at login; preserve existing
+    }));
+    setStatus("✅ Bancos y jurados guardados.");
+    setTab("contestants");
+  };
+
+
+  /* ══════════════════════════════════════════
+     NEW WORD-BY-WORD FLOW HANDLERS
+  ══════════════════════════════════════════ */
+
+  /* All judges pressed "Listo" — pre-draw 3 words */
+  useEffect(()=>{setMarkedLetterIdx(null);setMarkedReason(null);},[gs?.currentWordIdx]);
+
+  const doJudgeReady = useCallback(() => {
+    const s=gsRef.current; if(!s) return;
+    upd(prev=>{
+      const newReady={...prev.judgesReady,[role]:true};
+      const numJudges=(prev.judges||[]).length||prev.judgeCount||3;
+      const allReady=Object.keys(newReady).length>=numJudges;
+      if(!allReady) return {...prev,judgesReady:newReady};
+      // Draw 3 words for current contestant
+      const cfg=STAGES[prev.stage];
+      const used=[...prev.usedWords[cfg.bank]];
+      const drawn=[];
+      const pool=prev.banks[cfg.bank].filter(w=>!used.includes(w.word));
+      for(let i=0;i<3&&pool.length>0;i++){
+        const idx=Math.floor(Math.random()*pool.length);
+        drawn.push(pool[idx]);
+        pool.splice(idx,1);
+      }
+      const newUsed=[...used,...drawn.map(w=>w.word)];
+      return {...prev,judgesReady:newReady,currentWords:drawn,currentWordIdx:0,
+        wordJudgments:{},wordPhase:"word_show",
+        usedWords:{...prev.usedWords,[cfg.bank]:newUsed}};
+    });
+  },[role]);
+
+  /* Judge submits verdict for current word */
+  const doJudgeWordVerdict = useCallback((verdict, errInfo) => {
+    const s=gsRef.current; if(!s) return;
+    const wi=s.currentWordIdx;
+    upd(prev=>{
+      const prevWJ=prev.wordJudgments||{};
+      const prevWord=prevWJ[wi]||{};
+      const myVote={verdict, err:errInfo||null, ts:Date.now()};
+      const updWord={...prevWord,[role]:myVote};
+      const newWJ={...prevWJ,[wi]:updWord};
+      const numJudges=(prev.judges||[]).length||prev.judgeCount||3;
+      const allVoted=Object.keys(updWord).length>=numJudges;
+      if(!allVoted) return {...prev,wordJudgments:newWJ};
+      // All judges voted — check discrepancies
+      const votes=Object.values(updWord);
+      const verdicts=votes.map(v=>v.verdict);
+      const hasDisc=verdicts.some(v=>v!==verdicts[0]);
+      const word=prev.currentWords[wi];
+      // Record to history if all agree
+      if(!hasDisc){
+        const finalV=verdicts[0];
+        const active=prev.contestants.filter(c=>c.active);
+        const cur=active[prev.cIdx];
+        const hEntry={stage:prev.stage,stageLabel:STAGES[prev.stage].label,
+          cId:cur?.id,cName:cur?.name,word:word?.word||"",phonetic:word?.phonetic||"",
+          result:finalV,reasons:{override:null,err:errInfo,start:true,end:true}};
+        const ns={...prev.scores};
+        const pv=ns[prev.stage]?.[cur?.id]?.v||[];
+        const nv=[...pv]; nv[wi]=finalV;
+        ns[prev.stage]={...ns[prev.stage],[cur?.id]:{v:nv}};
+        // Move to next word or stage_end
+        const nextWi=wi+1;
+        const isLast=nextWi>=prev.currentWords.length;
+        return {...prev,wordJudgments:newWJ,
+          history:[...prev.history,hEntry],scores:ns,
+          wordPhase:isLast?"stage_end":"word_show",
+          currentWordIdx:isLast?wi:nextWi,
+          judgesReady:isLast?{}:prev.judgesReady};
+      }
+      // Has discrepancy — add to list
+      const disc={wordIdx:wi,word:word?.word,phonetic:word?.phonetic,
+        votes:Object.fromEntries(Object.entries(updWord).map(([jid,v])=>[jid,v.verdict])),
+        resolved:false,final:null};
+      return {...prev,wordJudgments:newWJ,
+        discrepancies:[...prev.discrepancies,disc],
+        wordPhase:"deliberation"};
+    });
+  },[role]);
+
+  /* Resolve discrepancy — pick one judge's verdict or custom */
+  const doResolveDiscrepancy = useCallback((discIdx, finalVerdict) => {
+    const s=gsRef.current; if(!s) return;
+    upd(prev=>{
+      const discs=[...prev.discrepancies];
+      discs[discIdx]={...discs[discIdx],resolved:true,final:finalVerdict};
+      const allResolved=discs.every(d=>d.resolved);
+      if(!allResolved) return {...prev,discrepancies:discs};
+      // All resolved — write to history and scores
+      const active=prev.contestants.filter(c=>c.active);
+      const cur=active[prev.cIdx];
+      let newHistory=[...prev.history];
+      const ns={...prev.scores};
+      for(const d of discs){
+        const hEntry={stage:prev.stage,stageLabel:STAGES[prev.stage].label,
+          cId:cur?.id,cName:cur?.name,
+          word:d.word||"",phonetic:d.phonetic||"",
+          result:d.final,reasons:{override:d.final,err:null,start:true,end:true}};
+        newHistory=[...newHistory,hEntry];
+        const pv=ns[prev.stage]?.[cur?.id]?.v||[];
+        const nv=[...pv]; nv[d.wordIdx]=d.final;
+        ns[prev.stage]={...ns[prev.stage],[cur?.id]:{v:nv}};
+      }
+      // Also add non-discrepancy words already in wordJudgments
+      return {...prev,discrepancies:discs,history:newHistory,scores:ns,
+        wordPhase:"stage_end",judgesReady:{}};
+    });
+  },[]);
+
+  /* Advance to next contestant (after stage_end) */
+  const doNextContestant = useCallback(() => {
+    const s=gsRef.current; if(!s) return;
+    const active=s.contestants.filter(c=>c.active);
+    const nextIdx=s.cIdx+1;
+    if(nextIdx>=active.length){
+      upd(prev=>({...prev,cIdx:0,wordPhase:"idle",stageComplete:true,
+        currentWords:[],wordJudgments:{},discrepancies:[],judgesReady:{}}));
+    } else {
+      upd(prev=>({...prev,cIdx:nextIdx,wordPhase:"contestant_reveal",
+        currentWords:[],wordJudgments:{},discrepancies:[],judgesReady:{},currentWordIdx:0}));
+    }
+  },[]);
+
+  /* MC/Presenter starts the first contestant */
+  const doStartContestants = useCallback(() => {
+    upd(prev=>({...prev,wordPhase:"contestant_reveal",cIdx:0,
+      currentWords:[],wordJudgments:{},discrepancies:[],judgesReady:{}}));
+  },[]);
+
+  const doConfirmContestants = () => {
+    upd(prev=>({...prev, contestantsConfirmed:true}));
+  };
+  const doEditContestant = (id, newName) => {
+    upd(prev=>({...prev, contestants:prev.contestants.map(c=>c.id===id?{...c,name:newName}:c)}));
+  };
+  const doRemoveContestant = id => {
+    upd(prev=>({...prev, contestants:prev.contestants.filter(c=>c.id!==id), contestantsConfirmed:false}));
+  };
+  const doAddContestant = name => {
+    upd(prev=>{
+      const next=[...prev.contestants,{id:"C"+(prev.contestants.length+1),name:name.trim(),active:true}];
+      return {...prev,contestants:next,contestantsConfirmed:false};
+    });
+  };
+
+  const doStart = () => {
+    upd(prev => ({...prev, phase:"competition", logoB64:logoB64||window._logoB64||"", setupComplete:true, stage:"basic", cIdx:0, slot:0, activeWord:null, judgment:null, stageComplete:false}));
+    setScreen("competition");
+  };
+
+  /* ── GAME ── */
+  const doSpin = () => {
+    const s=gsRef.current; if(!s) return;
+    const active=s.contestants.filter(c=>c.active);
+    const cur=active[s.cIdx]; if(!cur) return;
+    const cfg=STAGES[s.stage];
+    const word=pickWord(s.banks[cfg.bank], s.usedWords[cfg.bank], s.stage==="tiebreaker"?s.tbLen:null);
+    if (!word) { alert("No quedan palabras disponibles en este banco."); return; }
+    setWordKey(k=>k+1);
+    upd(prev=>({
+      ...prev,
+      activeWord:{...word,cId:cur.id},
+      judgment:{start:false,end:false,err:null,override:null},
+      usedWords:{...prev.usedWords,[cfg.bank]:[...prev.usedWords[cfg.bank],word.word]},
+      tbLen:s.stage==="tiebreaker"&&!prev.tbLen ? word.word.length : prev.tbLen,
+    }));
+  };
+
+  const doToggle = f => upd(prev => prev.judgment ? {...prev,judgment:{...prev.judgment,[f]:!prev.judgment[f]}} : prev);
+
+  const doLetterClick = (i,l) => {
+    const j=gsRef.current?.judgment; if(!j) return;
+    if (j.err?.index===i) upd(prev=>({...prev,judgment:{...prev.judgment,err:null}}));
+    else setLtrModal({index:i,letter:l});
+  };
+
+  const doMarkErr = type => {
+    upd(prev=>({...prev,judgment:{...prev.judgment,err:{index:ltrModal.index,letter:ltrModal.letter,type}}}));
+    setLtrModal(null);
+  };
+
+  const doOverride = v => { upd(prev=>({...prev,judgment:{...prev.judgment,override:v}})); setOvrModal(false); };
+
+  /* ── Discrepancy system ── */
+  const doFlagDispute = () => {
+    const s=gsRef.current; if(!s?.activeWord||!s?.judgment) return;
+    const key=s.stage+"-"+s.cIdx+"-"+s.slot;
+    const shared=s.judgment.shared||s.judgment;
+    upd(prev=>({...prev, disputedWords:{...prev.disputedWords,
+      [key]:{word:s.activeWord.word,phonetic:s.activeWord.phonetic,
+        cId:s.contestants.filter(c=>c.active)[s.cIdx]?.id,
+        cName:s.contestants.filter(c=>c.active)[s.cIdx]?.name,
+        stage:s.stage, slot:s.slot,
+        description: "Jurado "+role.replace("J","")+" marca discrepancia",
+        flaggedBy:role,
+        sharedState:{start:shared.start,end:shared.end,err:shared.err},
+        resolved:false, finalResult:null}}}));
+    setDisputeModal(true);
+  };
+  const doResolveDispute = (result, key) => {
+    upd(prev=>{
+      const dw={...prev.disputedWords};
+      if(dw[key]){dw[key]={...dw[key],resolved:true,finalResult:result};}
+      // Also update history if that word was already recorded
+      const h=[...prev.history];
+      const hIdx=h.findIndex(x=>x.stage===prev.stage&&x.cId===dw[key]?.cId&&x.word===dw[key]?.word);
+      if(hIdx>=0){h[hIdx]={...h[hIdx],result,reasons:{...(h[hIdx].reasons),override:result}};}
+      // Update scores too
+      const ns={...prev.scores};
+      if(prev.stage!=="tiebreaker"&&dw[key]){
+        const cId=dw[key].cId, slot=dw[key].slot;
+        const pv=ns[prev.stage]?.[cId]?.v||[];
+        const nv=[...pv]; nv[slot]=result;
+        ns[prev.stage]={...ns[prev.stage],[cId]:{v:nv}};
+      }
+      return {...prev, disputedWords:dw, history:h, scores:ns};
+    });
+  };
+  const doLogoUpload = (file) => {
+    if (!file) return;
+    const fr=new FileReader();
+    fr.onload=e=>{ setLogoB64(e.target.result); window._logoB64=e.target.result; };
+    fr.readAsDataURL(file);
+  };
+  const doNext = () => {
+    const s=gsRef.current; if(!s) return;
+    const active=s.contestants.filter(c=>c.active);
+    const cur=active[s.cIdx]; if(!cur) return;
+    const cfg=STAGES[s.stage];
+    const v=computeVerdict(s.judgment)||"incorrect";
+    let ns={...s.scores};
+    if (s.stage==="tiebreaker") {
+      const pr=s.scores.tiebreaker?.[cur.id]?.rounds||[];
+      ns.tiebreaker={...s.scores.tiebreaker,[cur.id]:{rounds:[...pr,v]}};
+    } else {
+      const pv=s.scores[s.stage]?.[cur.id]?.v||[];
+      const nv=[...pv]; nv[s.slot]=v;
+      ns[s.stage]={...s.scores[s.stage],[cur.id]:{v:nv}};
+    }
+    const hEntry={
+      stage:s.stage, stageLabel:cfg.label,
+      cId:cur.id, cName:cur.name,
+      word:s.activeWord?.word||"", phonetic:s.activeWord?.phonetic||"",
+      result:v,
+      reasons:{start:(s.judgment?.final||s.judgment?.shared||s.judgment)?.start,end:(s.judgment?.final||s.judgment?.shared||s.judgment)?.end,err:(s.judgment?.final||s.judgment?.shared||s.judgment)?.err,override:(s.judgment?.final||s.judgment?.shared||s.judgment)?.override},
+    };
+    const nextSlot=s.slot+1;
+    if (nextSlot<cfg.wpr) {
+      upd(prev=>({...prev,scores:ns,history:[...prev.history,hEntry],activeWord:null,judgment:null,slot:nextSlot}));
+    } else {
+      const nextIdx=s.cIdx+1;
+      if (nextIdx>=active.length) {
+        upd(prev=>({...prev,scores:ns,history:[...prev.history,hEntry],activeWord:null,judgment:null,cIdx:0,slot:0,stageComplete:true}));
+      } else {
+        upd(prev=>({...prev,scores:ns,history:[...prev.history,hEntry],activeWord:null,judgment:null,cIdx:nextIdx,slot:0}));
+      }
+    }
+  };
+
+  const doSubmit = () => {
+    const s=gsRef.current; if(!s) return;
+    const ranked=rankActive(s.contestants.filter(c=>c.active),s.scores,s.stage);
+    let advIds = s.stage==="tiebreaker" ? ranked.map(c=>c.id) : ranked.filter(c=>c.correct>=2).map(c=>c.id);
+    if (advIds.length<2 && ranked.length>=2) advIds=ranked.slice(0,2).map(c=>c.id);
+    if (!advIds.length) advIds=ranked.slice(0,1).map(c=>c.id);
+    upd(prev=>({...prev,advancing:advIds}));
+  };
+
+  const doAdvance = () => {
+    const s=gsRef.current; if(!s) return;
+    const ranked=rankActive(s.contestants.filter(c=>s.advancing.includes(c.id)),s.scores,s.stage);
+    const r3=canResolveTop3(ranked);
+    if (s.stage==="tiebreaker") {
+      if (r3) {
+        upd(prev=>({...prev,phase:"results",results:{first:ranked[0]?.id||null,second:ranked[1]?.id||null,third:ranked[2]?.id||null}}));
+        setScreen("results");
+      } else {
+        upd(prev=>({...prev,cIdx:0,slot:0,activeWord:null,judgment:null,stageComplete:false,advancing:[],tbRound:prev.tbRound+1}));
+      }
+      return;
+    }
+    if (s.stage==="advanced" && (r3||ranked.length<=2)) {
+      upd(prev=>({...prev,phase:"results",results:{first:ranked[0]?.id||null,second:ranked[1]?.id||null,third:ranked[2]?.id||null}}));
+      setScreen("results"); return;
+    }
+    const next=STAGES[s.stage]?.next; if(!next) return;
+    upd(prev=>({
+      ...prev, stage:next,
+      contestants:prev.contestants.map(c=>({...c,active:s.advancing.includes(c.id)})),
+      cIdx:0,slot:0,activeWord:null,judgment:null,stageComplete:false,advancing:[],tbLen:null,tbRound:0,
+    }));
+  };
+
+  const doPrintAndConfirm = () => {
+    printReport(gsRef.current, role, () => {
+      upd(prev=>{
+        const confirmed={...prev.pdfConfirmed,[role]:true};
+        const totalJudges=Math.max((prev.judges||[]).length,1);
+        const judgesConfirmed=(prev.judges||[]).filter(j=>confirmed[j.id]).length;
+        const allDone=judgesConfirmed>0&&judgesConfirmed>=totalJudges;
+        // Set actasClosedAt timestamp — room archives 36h later
+        const actasClosedAt=allDone&&!prev.actasClosedAt?Date.now():prev.actasClosedAt;
+        return {...prev,pdfConfirmed:confirmed,actasClosedAt};
+      });
+    });
+  };
+
+  /* Configurator can print ANY judge's acta */
+  const doPrintJudgeActa = (judgeId) => {
+    const s=gsRef.current; if(!s) return;
+    printReport(s, judgeId, null);
+  };
+
+  const doArchive = () => {
+    if (!confirm("¿Cerrar definitivamente esta sala? Los nuevos visitantes ya no podrán unirse.")) return;
+    upd(prev=>({...prev,phase:"archived"}));
+  };
+
+  /* ── DERIVED ── */
+  const isMC        = role==="mc";
+  const isPresenter = role==="presenter";
+  const isJudge     = role && ["J1","J2","J3","J4","J5","J6","J7","J8","J9","J10"].includes(role);
+  const isCreator   = !!sessionStorage.getItem("creator-"+roomId);
+  const myJudge     = (gs?.judges||[]).find(j=>j.id===role);
+  const numJudges   = gs?.judgeCount||3;
+  const allJudgesReady = (gs?.judges||[]).length>=numJudges && 
+    (gs?.judges||[]).every(j=>(gs?.judgesReady||{})[j.id]);
+  const active=gs?.contestants?.filter(c=>c.active)||[];
+  const cur=active[gs?.cIdx??0];
+  const j=gs?.judgment, aw=gs?.activeWord;
+  const cfg=gs?.stage&&STAGES[gs.stage]?STAGES[gs.stage]:null;
+  const stCol=cfg?.color||"#E8A200", wpr=cfg?.wpr??3;
+  const ranked=gs?rankActive(active,gs.scores,gs.stage):[];
+  const verdict=computeVerdict(j);
+  const wColor=verdict==="correct"?"#22c55e":verdict==="incorrect"||j?.err?"#ef4444":"#22c55e";
+  const nextCfg=cfg?.next?STAGES[cfg.next]:null;
+  const shareUrl=roomId?getShareUrl(roomId):"";
+  const qrUrl=roomId?"https://api.qrserver.com/v1/create-qr-code/?size=180x180&data="+encodeURIComponent(shareUrl)+"&color=E8EDF8&bgcolor=162038":"";
+  const confirmedCount=(gs?.judges||[]).filter(j=>gs?.pdfConfirmed?.[j.id]).length;
+  const judgeCount=Math.max((gs?.judges||[]).length,1);
+
+  /* ── DISPUTE MODAL ── */
+  const pendingDisputes = Object.entries(gs?.disputedWords||{}).filter(([k,d])=>!d.resolved);
+  const DisputeModal = disputeModal && pendingDisputes.length>0 && (
+    <div className="overlay" onClick={()=>setDisputeModal(false)}>
+      <div className="card" style={{width:"100%",maxWidth:500,display:"flex",flexDirection:"column",gap:12,maxHeight:"80vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+        <h3 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"1.4rem",color:"#fbbf24"}}>⚠️ Discrepancias Pendientes</h3>
+        <p style={{color:"#6B7FA3",fontSize:".8rem"}}>Los siguientes casos requieren deliberación. Seleccionen el resultado acordado:</p>
+        {pendingDisputes.map(([key,d])=>(
+          <div key={key} style={{background:"rgba(251,191,36,.08)",border:"1px solid rgba(251,191,36,.25)",borderRadius:10,padding:12}}>
+            <p style={{color:"#E8EDF8",fontWeight:700,fontSize:".9rem",marginBottom:2}}>{d.word?.toUpperCase()}</p>
+            <p style={{color:"#6B7FA3",fontSize:".78rem",marginBottom:4}}>{d.cName} · Etapa {STAGES[d.stage]?.label} · Palabra {(d.slot||0)+1}</p>
+            <p style={{color:"#fbbf24",fontSize:".74rem",marginBottom:10}}>⚠ {d.description}</p>
+            <div style={{display:"flex",gap:8}}>
+              <button className="btn btn-green" style={{flex:1,padding:10,fontSize:".84rem"}} onClick={()=>{doResolveDispute("correct",key);}}>✅ Correcto</button>
+              <button className="btn btn-red"   style={{flex:1,padding:10,fontSize:".84rem"}} onClick={()=>{doResolveDispute("incorrect",key);}}>❌ Incorrecto</button>
+            </div>
+          </div>
+        ))}
+        <button className="btn btn-ghost" onClick={()=>setDisputeModal(false)}>Cerrar</button>
+      </div>
+    </div>
+  );
+
+  /* ── MODALS ── */
+  const LtrModal = ltrModal && (
+    <div className="overlay" onClick={()=>setLtrModal(null)}>
+      <div className="card" style={{width:"100%",maxWidth:300,display:"flex",flexDirection:"column",gap:10}} onClick={e=>e.stopPropagation()}>
+        <h3 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"1.5rem"}}>
+          Error en «<span style={{color:"#E8A200"}}>{ltrModal.letter.toUpperCase()}</span>»
+        </h3>
+        <p style={{color:"#6B7FA3",fontSize:".82rem"}}>¿Qué error cometió el concursante?</p>
+        <button className="btn" style={{background:"rgba(251,191,36,.15)",color:"#fbbf24",border:"1px solid rgba(251,191,36,.3)",padding:13,width:"100%"}} onClick={()=>doMarkErr("skipped")}>⚡ La omitió / se la saltó</button>
+        <button className="btn" style={{background:"rgba(248,113,113,.15)",color:"#f87171",border:"1px solid rgba(248,113,113,.3)",padding:13,width:"100%"}} onClick={()=>doMarkErr("misspelled")}>❌ La deletreó incorrectamente</button>
+        <button className="btn btn-ghost" onClick={()=>setLtrModal(null)}>Cancelar</button>
+      </div>
+    </div>
+  );
+
+  const OvrModal = ovrModal && (
+    <div className="overlay" onClick={()=>setOvrModal(false)}>
+      <div className="card" style={{width:"100%",maxWidth:300,display:"flex",flexDirection:"column",gap:10}} onClick={e=>e.stopPropagation()}>
+        <h3 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"1.5rem"}}>✏️ Corrección por Consenso</h3>
+        <p style={{color:"#6B7FA3",fontSize:".82rem"}}>Resultado acordado por los jurados:</p>
+        <button className="btn btn-green" style={{padding:13,width:"100%"}} onClick={()=>doOverride("correct")}>✅ Correcto</button>
+        <button className="btn btn-red"   style={{padding:13,width:"100%"}} onClick={()=>doOverride("incorrect")}>❌ Incorrecto</button>
+        {j?.override!=null && <button className="btn btn-ghost" style={{width:"100%"}} onClick={()=>doOverride(null)}>🗑 Quitar corrección</button>}
+        <button className="btn btn-ghost" style={{width:"100%"}} onClick={()=>setOvrModal(false)}>Cancelar</button>
+      </div>
+    </div>
+  );
+
+  /* ══════════════════════════════════════
+     SCREENS
+  ══════════════════════════════════════ */
+
+  /* INIT spinner */
+  /* ── ADMIN MODAL OVERLAY ── */
+  const AdminModal = showAdmin && (
+    <div className="overlay" style={{zIndex:500,alignItems:"flex-start",paddingTop:40}} onClick={()=>setShowAdmin(false)}>
+      <div className="card" style={{width:"100%",maxWidth:520,maxHeight:"88vh",overflowY:"auto",display:"flex",flexDirection:"column",gap:14}} onClick={e=>e.stopPropagation()}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+          <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.5rem",fontWeight:700}}>
+            {adminView==="login"?"🔐 Acceso":"👑 Panel de Administración"}
+          </h2>
+          <button className="btn btn-ghost" style={{padding:"4px 10px",fontSize:".76rem"}} onClick={()=>setShowAdmin(false)}>✕</button>
+        </div>
+
+        {/* ── LOGIN VIEW ── */}
+        {adminView==="login" && (
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            <p style={{color:"#4B5A78",fontSize:".80rem",lineHeight:1.6}}>Ingresa con tu nombre de usuario y contraseña para acceder al sistema.</p>
+            <input className="field" placeholder="Nombre de usuario" value={operLogin.username}
+              onChange={e=>setOperLogin(p=>({...p,username:e.target.value}))} style={{fontSize:".90rem"}}
+              autoComplete="username"/>
+            <input className="field" placeholder="Contraseña" type="password" value={operLogin.password}
+              onChange={e=>setOperLogin(p=>({...p,password:e.target.value}))}
+              onKeyDown={e=>e.key==="Enter"&&doOperatorLogin()} style={{fontSize:".90rem"}}
+              autoComplete="current-password"/>
+            <button className="btn btn-gold" style={{width:"100%",padding:13}} disabled={adminBusy||!operLogin.username||!operLogin.password} onClick={doOperatorLogin}>
+              {adminBusy?"Verificando...":"Iniciar Sesión"}
+            </button>
+            {adminStatus && <p style={{color:adminStatus.startsWith("✅")?"#22c55e":"#f87171",fontSize:".82rem"}}>{adminStatus}</p>}
+          </div>
+        )}
+
+        {/* ── DASHBOARD VIEW (master only) ── */}
+        {adminView==="dashboard" && (adminUser?.type==="master") && (
+          <div style={{display:"flex",flexDirection:"column",gap:14}}>
+            <div style={{padding:"8px 12px",background:"rgba(232,162,0,.1)",border:"1px solid rgba(232,162,0,.25)",borderRadius:10}}>
+              <p style={{color:"#E8A200",fontSize:".78rem",fontWeight:700}}>👑 Maestro: {adminUser.email}</p>
+            </div>
+
+            {/* Create new user */}
+            <div style={{borderBottom:"1px solid rgba(255,255,255,.08)",paddingBottom:14}}>
+              <p style={{color:"#6B7FA3",fontSize:".72rem",fontWeight:700,letterSpacing:".05em",marginBottom:10}}>➕ CREAR USUARIO OPERADOR</p>
+              <div style={{display:"flex",gap:8,marginBottom:8}}>
+                <input className="field" placeholder="Nombre de usuario (sin espacios)" value={newUserForm.username}
+                  onChange={e=>setNewUserForm(p=>({...p,username:e.target.value.replace(/\s/g,"")}))} style={{flex:2,fontSize:".85rem"}}/>
+                <div style={{flex:1,display:"flex",flexDirection:"column",gap:3}}>
+                  <label style={{color:"#4B5A78",fontSize:".65rem"}}>Límite de salas</label>
+                  <input className="field" type="number" min={1} max={50} value={newUserForm.limit}
+                    onChange={e=>setNewUserForm(p=>({...p,limit:+e.target.value}))} style={{textAlign:"center"}}/>
+                </div>
+              </div>
+              <p style={{color:"#2D3A55",fontSize:".72rem",marginBottom:8}}>Contraseña inicial: <code style={{color:"#a78bfa",background:"rgba(167,139,250,.1)",padding:"1px 6px",borderRadius:4}}>{DEFAULT_PWD}</code></p>
+              <button className="btn btn-gold" style={{width:"100%"}} disabled={adminBusy||!newUserForm.username.trim()} onClick={doCreateAdminUser}>
+                {adminBusy?"Creando...":"Crear Usuario"}
+              </button>
+              {adminStatus && <p style={{color:adminStatus.startsWith("✅")?"#22c55e":"#f87171",fontSize:".8rem",marginTop:6}}>{adminStatus}</p>}
+            </div>
+
+            {/* User list */}
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+              <p style={{color:"#6B7FA3",fontSize:".72rem",fontWeight:700,letterSpacing:".05em"}}>👥 USUARIOS REGISTRADOS ({adminUsers.length})</p>
+              <button className="btn btn-ghost" style={{padding:"3px 10px",fontSize:".68rem"}} onClick={doRefreshUsers}>{adminBusy?"⏳":"🔄 Actualizar"}</button>
+            </div>
+            {adminUsers.length===0&&<p style={{color:"#2D3A55",fontSize:".8rem",textAlign:"center"}}>No hay usuarios creados aún</p>}
+            {adminUsers.map(u=>(
+              <div key={u.username} style={{background:"rgba(255,255,255,.04)",borderRadius:10,padding:"10px 13px",border:"1px solid rgba(255,255,255,.07)"}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6,flexWrap:"wrap"}}>
+                  <span style={{fontWeight:700,color:u.active?"#E8EDF8":"#3B4B6A",flex:1}}>{u.username}</span>
+                  <span style={{fontSize:".72rem",padding:"2px 8px",borderRadius:10,background:u.active?"rgba(34,197,94,.15)":"rgba(239,68,68,.1)",color:u.active?"#22c55e":"#f87171",border:"1px solid "+(u.active?"rgba(34,197,94,.3)":"rgba(239,68,68,.25)")}}>
+                    {u.active?"Activo":"Desactivado"}
+                  </span>
+                  <span style={{fontSize:".72rem",color:"#4B5A78"}}>
+                    {u.activeRooms}/{u.roomLimit} salas
+                  </span>
+                </div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  <button className="btn btn-ghost" style={{padding:"4px 10px",fontSize:".72rem",color:"#f59e0b",borderColor:"rgba(245,158,11,.3)"}}
+                    onClick={()=>doResetPwd(u.username)}>🔑 Resetear contraseña</button>
+                  <div style={{display:"flex",alignItems:"center",gap:4}}>
+                    <span style={{color:"#4B5A78",fontSize:".72rem"}}>Límite:</span>
+                    <input type="number" min={1} max={50} defaultValue={u.roomLimit}
+                      onBlur={e=>doSetLimit(u.username,e.target.value)}
+                      style={{width:46,background:"rgba(255,255,255,.06)",border:"1px solid rgba(255,255,255,.1)",borderRadius:6,padding:"3px 5px",color:"#E8EDF8",fontSize:".78rem",textAlign:"center"}}/>
+                  </div>
+                  <button className="btn btn-ghost" style={{padding:"4px 10px",fontSize:".72rem",color:u.active?"#ef4444":"#22c55e",borderColor:u.active?"rgba(239,68,68,.3)":"rgba(34,197,94,.3)"}}
+                    onClick={()=>doToggleUser(u.username,!u.active)}>
+                    {u.active?"⛔ Desactivar":"✅ Activar"}
+                  </button>
+                </div>
+                <p style={{color:"#2D3A55",fontSize:".68rem",marginTop:5}}>
+                  Creado: {new Date(u.createdAt).toLocaleDateString("es-SV")}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  if (screen==="init") return (
+    <div className="sb" style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh"}}>
+      <style>{CSS}</style>
+      <p className="pulse" style={{color:"#4B5A78"}}>Iniciando...</p>
+    </div>
+  );
+
+  /* FIREBASE ERROR */
+  if (screen==="firebase-error") return (
+    <div className="sb" style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:20}}>
+      <style>{CSS}</style>
+      <div className="card" style={{maxWidth:500,width:"100%",textAlign:"center",gap:14,display:"flex",flexDirection:"column"}}>
+        <div className="pulse" style={{fontSize:"3rem"}}>🐝</div>
+        <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.6rem"}}>Conectando con Firebase...</h2>
+        <p style={{color:"#6B7FA3",fontSize:".88rem",lineHeight:1.7}}>
+          Si este mensaje no desaparece en 10 segundos, verifica tu conexión a internet o que Firebase esté habilitado en el archivo <code style={{background:"rgba(255,255,255,.1)",padding:"2px 6px",borderRadius:4}}>index.html</code>.
+        </p>
+        <button className="btn btn-ghost" style={{alignSelf:"center"}} onClick={()=>window.location.reload()}>🔄 Recargar página</button>
+      </div>
+    </div>
+  );
+
+  /* CHECKING */
+  if (screen==="checking") return (
+    <div className="sb" style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",gap:16}}>
+      <style>{CSS}</style>
+      <div className="pulse" style={{fontSize:"3rem"}}>🐝</div>
+      <p style={{color:"#4B5A78"}}>Verificando sala {roomId}...</p>
+    </div>
+  );
+
+  /* ROOM NOT FOUND */
+  if (screen==="room-not-found") return (
+    <div className="sb" style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:20}}>
+      <style>{CSS}</style>
+      <div className="card" style={{maxWidth:420,width:"100%",textAlign:"center"}}>
+        <div style={{fontSize:"3rem",marginBottom:12}}>🔍</div>
+        <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#ef4444",fontSize:"1.8rem",marginBottom:10}}>Sala no encontrada</h2>
+        <p style={{color:"#6B7FA3",marginBottom:20}}>El código <code style={{background:"rgba(255,255,255,.08)",padding:"2px 8px",borderRadius:6,color:"#E8EDF8"}}>{roomId}</code> no existe o el enlace expiró.</p>
+        <button className="btn btn-ghost" onClick={()=>{window.history.pushState({},"",window.location.pathname);setScreen("landing");}}>← Volver</button>
+      </div>
+    </div>
+  );
+
+  /* ROOM CLOSED */
+  if (screen==="room-closed") return (
+    <div className="sb" style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:20}}>
+      <style>{CSS}</style>
+      <div className="card" style={{maxWidth:420,width:"100%",textAlign:"center"}}>
+        <div style={{fontSize:"3rem",marginBottom:12}}>🔒</div>
+        <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#a78bfa",fontSize:"1.8rem",marginBottom:10}}>Concurso finalizado</h2>
+        <p style={{color:"#6B7FA3",marginBottom:16}}>La sala <strong style={{color:"#E8EDF8"}}>{roomId}</strong> ya cerró. Las actas fueron generadas o la sala expiró después de 72 horas de inactividad.</p>
+        <button className="btn btn-ghost" onClick={()=>{window.history.pushState({},"",window.location.pathname);setScreen("landing");}}>← Crear un nuevo concurso</button>
+      </div>
+    </div>
+  );
+
+  /* LANDING */
+  if (screen==="landing") return (
+    <div className="sb" style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:24,gap:28}}>
+      <style>{CSS}</style>
+      {AdminModal}
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:"3.5rem",lineHeight:1.1,marginBottom:6}}>🐝</div>
+        <h1 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"3rem",fontWeight:700,color:"#E8A200",lineHeight:1}}>Spelling Bee</h1>
+        <p style={{color:"#4B5A78",marginTop:5,fontSize:".85rem"}}>Sistema Multi-sala · Tiempo real · Actas PDF</p>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,width:"100%",maxWidth:560}}>
+        <div className="card" style={{display:"flex",flexDirection:"column",gap:12,borderColor:"rgba(232,162,0,.35)"}}>
+          <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em"}}>🆕 CREAR CONCURSO</p>
+          <p style={{color:"#4B5A78",fontSize:".78rem",lineHeight:1.5}}>Genera una sala única con enlace y QR para compartir con los jurados</p>
+          <input className="field" placeholder="Nombre de la institución *" value={inst} onChange={e=>setInst(e.target.value)} style={{fontSize:".84rem"}}/>
+          <input className="field" placeholder="Grado / Nivel (opcional)" value={lvl} onChange={e=>setLvl(e.target.value)} style={{fontSize:".84rem"}}/>
+          <button className="btn btn-gold" disabled={!inst.trim()||!window.FIREBASE_OK} onClick={doCreateRoom} style={{width:"100%"}}>Generar Sala →</button>
+        </div>
+        <div className="card" style={{display:"flex",flexDirection:"column",gap:12}}>
+          <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em"}}>🔗 UNIRSE A SALA</p>
+          <p style={{color:"#4B5A78",fontSize:".78rem",lineHeight:1.5}}>Escribe el código de sala que te compartió el configurador del concurso</p>
+          <input className="field" placeholder="Código (ej: UNAB-K7X2)" value={joinCode} onChange={e=>setJoinCode(e.target.value.toUpperCase())} onKeyDown={e=>e.key==="Enter"&&doJoinByCode()} style={{fontSize:".84rem",letterSpacing:".06em"}}/>
+          <button className="btn btn-ghost" disabled={!joinCode.trim()} onClick={doJoinByCode} style={{width:"100%"}}>Entrar →</button>
+          <p style={{color:"#2D3A55",fontSize:".72rem",textAlign:"center"}}>o abre el enlace / escanea el QR que recibiste</p>
+        </div>
+      </div>
+      {!window.FIREBASE_OK && (
+        <div style={{maxWidth:560,width:"100%",padding:"10px 14px",background:"rgba(239,68,68,.1)",border:"1px solid rgba(239,68,68,.3)",borderRadius:10,color:"#f87171",fontSize:".82rem"}}>
+          ⚠️ Firebase no configurado — edita index.html con tus credenciales (ver SETUP.md)
+        </div>
+      )}
+
+      {/* Admin status + button */}
+      <div style={{display:"flex",alignItems:"center",gap:10,marginTop:4}}>
+        {adminUser ? (
+          <div style={{display:"flex",alignItems:"center",gap:8,padding:"5px 12px",background:"rgba(34,197,94,.1)",border:"1px solid rgba(34,197,94,.25)",borderRadius:16}}>
+            <span style={{fontSize:".72rem",color:"#22c55e"}}>
+              {adminUser.type==="master"?"👑 Maestro: "+adminUser.username:"⚙️ "+adminUser.username+" · "+adminUser.activeRooms+"/"+adminUser.roomLimit+" salas"}
+            </span>
+            <button className="btn btn-ghost" style={{padding:"2px 8px",fontSize:".68rem"}} onClick={doAdminLogout}>Salir</button>
+            {adminUser.type==="master" && <button className="btn btn-ghost" style={{padding:"2px 8px",fontSize:".68rem"}} onClick={()=>{setAdminView("dashboard");setShowAdmin(true);}}>Panel</button>}
+          </div>
+        ) : (
+          <button className="btn btn-ghost" style={{padding:"5px 12px",fontSize:".72rem",color:"#4B5A78",borderColor:"rgba(255,255,255,.08)"}} onClick={()=>{setAdminView("login");setShowAdmin(true);}}>
+            🔐 Acceso de operador
+          </button>
+        )}
+      </div>
+    </div>
+  );
+
+  /* SHARE LINK */
+  if (screen==="share-link") return (
+    <div className="sb" style={{maxWidth:580,margin:"0 auto",padding:"24px 16px",display:"flex",flexDirection:"column",gap:16}}>
+      <style>{CSS}</style>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:"2.5rem"}}>🐝</div>
+        <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#22c55e",fontSize:"1.8rem",fontWeight:700,margin:"4px 0"}}>¡Sala creada!</h2>
+        <p style={{color:"#4B5A78",fontSize:".85rem"}}>{gs?.institution}{gs?.level?" · "+gs.level:""}</p>
+      </div>
+      <div className="card" style={{display:"flex",gap:18,alignItems:"center",flexWrap:"wrap",justifyContent:"center",borderColor:"rgba(34,197,94,.3)"}}>
+        <img src={qrUrl} alt="QR" style={{width:150,height:150,borderRadius:10}} onError={e=>e.target.style.display="none"}/>
+        <div style={{flex:1,minWidth:200}}>
+          <p style={{color:"#4B5A78",fontSize:".72rem",fontWeight:700,letterSpacing:".06em",marginBottom:5}}>CÓDIGO DE SALA</p>
+          <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"2rem",fontWeight:700,color:"#E8A200",letterSpacing:".12em",marginBottom:10}}>{roomId}</div>
+          <p style={{color:"#4B5A78",fontSize:".72rem",fontWeight:700,letterSpacing:".06em",marginBottom:5}}>ENLACE DE ACCESO</p>
+          <div style={{background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.1)",borderRadius:8,padding:"7px 11px",fontSize:".74rem",color:"#a78bfa",wordBreak:"break-all",marginBottom:8}}>{shareUrl}</div>
+          <button className="btn btn-ghost" style={{fontSize:".76rem",padding:"6px 14px"}} onClick={()=>navigator.clipboard.writeText(shareUrl).then(()=>alert("¡Enlace copiado!"))}>📋 Copiar enlace</button>
+        </div>
+      </div>
+      <div className="card">
+        <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:4}}>👤 TU ACCESO — Configurador</p>
+        <p style={{color:"#4B5A78",fontSize:".78rem",marginBottom:12}}>Selecciona el rol que deseas tener. Puedes ser Monitor, o también cualquiera de los jurados.</p>
+        <input className="field" placeholder="Tu nombre completo" value={nameIn} onChange={e=>setNameIn(e.target.value)} style={{marginBottom:10}}/>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+          {[{id:"mc",icon:"🎙",l:"M. de Ceremonia"},{id:"presenter",icon:"🎤",l:"Presentador"},{id:"judge",icon:"⚖️",l:"Jurado"}].map(r=>(
+            <button key={r.id} className="btn" onClick={()=>setRole(r.id)} style={{padding:"10px 8px",fontSize:".82rem",flexDirection:"column",gap:3,background:role===r.id?"#E8A200":"rgba(255,255,255,.05)",color:role===r.id?"#0C1628":"#E8EDF8",border:role===r.id?"none":"1px solid rgba(255,255,255,.1)"}}>
+              <span style={{fontSize:"1.1rem"}}>{r.icon}</span><span style={{fontWeight:700}}>{r.l}</span>
+            </button>
+          ))}
+        </div>
+        <button className="btn btn-gold" style={{width:"100%"}} disabled={!role||!nameIn.trim()} onClick={doLoginCreator}>Iniciar Configuración →</button>
+      </div>
+    </div>
+  );
+
+  /* LOGIN */
+  if (screen==="login") return (
+    <div className="sb" style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:20,gap:22}}>
+      <style>{CSS}</style>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:"3rem",marginBottom:4}}>🐝</div>
+        <h1 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"2.2rem",fontWeight:700,color:"#E8A200"}}>Spelling Bee</h1>
+        {gs?.institution && <p style={{color:"#4B5A78",fontSize:".85rem",marginTop:4}}>{gs.institution}{gs?.level?" · "+gs.level:""}</p>}
+        <div style={{marginTop:6,display:"inline-flex",alignItems:"center",gap:6,padding:"3px 12px",borderRadius:16,background:"rgba(167,139,250,.15)",border:"1px solid rgba(167,139,250,.35)",fontSize:".74rem",color:"#a78bfa"}}>
+          Sala: {roomId}
+        </div>
+      </div>
+      <div className="card" style={{width:"100%",maxWidth:400,display:"flex",flexDirection:"column",gap:14}}>
+        <div>
+          <p style={{color:"#6B7FA3",fontSize:".72rem",fontWeight:700,letterSpacing:".06em",marginBottom:7}}>TU NOMBRE COMPLETO</p>
+          <input className="field" placeholder="Escribe tu nombre..." value={nameIn} onChange={e=>setNameIn(e.target.value)} onKeyDown={e=>e.key==="Enter"&&role&&nameIn.trim()&&doLogin()}/>
+        </div>
+        <div>
+          <p style={{color:"#6B7FA3",fontSize:".72rem",fontWeight:700,letterSpacing:".06em",marginBottom:7}}>SELECCIONA TU ROL</p>
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {[
+              {id:"mc",       icon:"🎙", label:"Maestro de Ceremonia", field:"mc"},
+              {id:"presenter",icon:"🎤", label:"Presentador",          field:"presenter"},
+            ].map(({id,icon,label,field})=>{
+              const occupied=!!(gs?.[field]?.name);
+              const takenName=gs?.[field]?.name;
+              return(
+                <button key={id} className="btn" onClick={()=>!occupied&&setRole(id)} style={{
+                  flexDirection:"row",gap:10,padding:"11px 14px",fontSize:".86rem",textAlign:"left",
+                  background:role===id?"#E8A200":occupied?"rgba(255,255,255,.02)":"rgba(255,255,255,.05)",
+                  color:role===id?"#0C1628":occupied?"#3B4B6A":"#E8EDF8",
+                  border:role===id?"none":"1px solid rgba(255,255,255,.1)",
+                  cursor:occupied?"not-allowed":"pointer",opacity:occupied?0.65:1,justifyContent:"flex-start"}}>
+                  <span style={{fontSize:"1.2rem"}}>{icon}</span>
+                  <div style={{flex:1}}>
+                    <div style={{fontWeight:700,fontSize:".84rem"}}>{label}</div>
+                    <div style={{fontSize:".70rem",opacity:.75}}>{occupied?"Ocupado: "+takenName:"Deseo ser "+label}</div>
+                  </div>
+                  {occupied&&<span style={{fontSize:".66rem",color:"#ef4444",fontWeight:700}}>OCUPADO</span>}
+                </button>
+              );
+            })}
+            {/* Judge slots */}
+            {(()=>{
+              const taken=(gs?.judges||[]);
+              const maxSlots=gs?.judgeCount||3;
+              const avail=maxSlots-taken.length;
+              return(
+                <button className="btn" onClick={()=>avail>0&&setRole("judge")} style={{
+                  flexDirection:"column",gap:4,padding:"11px 14px",fontSize:".86rem",
+                  background:role==="judge"?"#E8A200":avail===0?"rgba(255,255,255,.02)":"rgba(255,255,255,.05)",
+                  color:role==="judge"?"#0C1628":avail===0?"#3B4B6A":"#E8EDF8",
+                  border:role==="judge"?"none":"1px solid rgba(255,255,255,.1)",
+                  cursor:avail===0?"not-allowed":"pointer",alignItems:"flex-start"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,width:"100%"}}>
+                    <span style={{fontSize:"1.2rem"}}>⚖️</span>
+                    <div style={{flex:1,textAlign:"left"}}>
+                      <div style={{fontWeight:700,fontSize:".84rem"}}>Jurado</div>
+                      <div style={{fontSize:".70rem",opacity:.75}}>{avail===0?"No hay lugares":""+avail+" lugar"+(avail!==1?"es":"")+" disponible"+(avail!==1?"s":"")+" de "+maxSlots}</div>
+                    </div>
+                    {avail===0&&<span style={{fontSize:".66rem",color:"#ef4444",fontWeight:700}}>LLENO</span>}
+                  </div>
+                  {taken.length>0&&<div style={{display:"flex",gap:4,flexWrap:"wrap",paddingLeft:28}}>
+                    {taken.map(j=><span key={j.id} style={{fontSize:".64rem",background:"rgba(34,197,94,.15)",color:"#22c55e",padding:"1px 6px",borderRadius:8}}>✅ {j.name}</span>)}
+                  </div>}
+                </button>
+              );
+            })()}
+          </div>
+        </div>
+        <button className="btn btn-gold" style={{width:"100%",padding:13}} disabled={!role||!nameIn.trim()} onClick={doLogin}>Entrar al Concurso →</button>
+      </div>
+    </div>
+  );
+
+  /* SETUP */
+  if (screen==="setup") return (
+    <div className="sb" style={{maxWidth:720,margin:"0 auto",padding:"20px 16px 80px"}}>
+      <style>{CSS}</style>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:10}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <span style={{fontSize:"2rem"}}>🐝</span>
+          <div>
+            <h1 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.8rem",fontWeight:700}}>Configuración</h1>
+            <p style={{color:"#4B5A78",fontSize:".78rem"}}>{gs?.institution}{gs?.level?" · "+gs.level:""}</p>
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 12px",background:"rgba(167,139,250,.1)",border:"1px solid rgba(167,139,250,.3)",borderRadius:20}}>
+          <span style={{color:"#a78bfa",fontSize:".74rem",fontWeight:700,letterSpacing:".06em"}}>{roomId}</span>
+          <button className="btn btn-ghost" style={{padding:"3px 8px",fontSize:".7rem"}} onClick={()=>navigator.clipboard.writeText(shareUrl).then(()=>alert("¡Enlace copiado!"))}>📋</button>
+        </div>
+      </div>
+
+      <div style={{display:"flex",gap:6,marginBottom:18,borderBottom:"1px solid rgba(255,255,255,.08)"}}>
+        {[{id:"judges",l:"1. Jurados"},{id:"banks",l:"2. Palabras"},{id:"contestants",l:"3. Concursantes"}].map(t=>(
+          <button key={t.id} className="btn" onClick={()=>setTab(t.id)} style={{borderRadius:"8px 8px 0 0",padding:"8px 16px",fontSize:".82rem",background:tab===t.id?"#162038":"transparent",color:tab===t.id?"#E8A200":"#4B5A78",border:tab===t.id?"1px solid rgba(255,255,255,.1)":"none",borderBottom:tab===t.id?"1px solid #162038":"none"}}>{t.l}</button>
+        ))}
+      </div>
+
+      {tab==="judges" && (
+        <div className="card fade-up" style={{marginBottom:14}}>
+          <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:4}}>👥 JURADOS CONECTADOS</p>
+          <p style={{color:"#4B5A78",fontSize:".76rem",marginBottom:14}}>Los jurados se conectan solos al abrir el enlace y elegir "Jurado". Aquí ves el estado en tiempo real.</p>
+          <div style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",background:"rgba(255,255,255,.04)",borderRadius:10,marginBottom:6}}>
+            <span style={{fontSize:"1.1rem"}}>🎤</span>
+            <span style={{flex:1,fontSize:".88rem",color:"#E8EDF8",fontWeight:600}}>Monitor</span>
+            {gs?.host?.name
+              ? <span style={{fontSize:".76rem",background:"rgba(34,197,94,.15)",color:"#22c55e",padding:"2px 9px",borderRadius:10,border:"1px solid rgba(34,197,94,.3)"}}>✅ {gs.host.name}</span>
+              : <span style={{fontSize:".76rem",color:"#3B4B6A"}}>Sin conectar</span>}
+          </div>
+          {[0,1,2].map(i=>{
+            const jj=(gs?.judges||[])[i];
+            return(<div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",background:"rgba(255,255,255,.04)",borderRadius:10,marginBottom:6}}>
+              <span style={{fontSize:"1.1rem"}}>⚖️</span>
+              <span style={{flex:1,fontSize:".88rem",color:"#4B5A78"}}>Jurado {i+1}</span>
+              {jj?<span style={{fontSize:".76rem",background:"rgba(34,197,94,.15)",color:"#22c55e",padding:"2px 9px",borderRadius:10,border:"1px solid rgba(34,197,94,.3)"}}>✅ {jj.name}</span>
+                 :<span style={{fontSize:".76rem",color:"#3B4B6A"}}>Sin conectar</span>}
+            </div>);
+          })}
+          <div style={{marginTop:10,padding:"8px 12px",background:"rgba(167,139,250,.08)",border:"1px solid rgba(167,139,250,.2)",borderRadius:8}}>
+            <p style={{color:"#a78bfa",fontSize:".74rem"}}>💡 Comparte el código <strong style={{letterSpacing:".06em"}}>{gs?.roomId}</strong> para que los jurados entren.</p>
+          </div>
+          <div style={{marginTop:14,paddingTop:12,borderTop:"1px solid rgba(255,255,255,.07)"}}>
+            <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:8}}>🏫 LOGO DE LA INSTITUCIÓN</p>
+            <p style={{color:"#4B5A78",fontSize:".74rem",marginBottom:8}}>Aparece en la esquina superior izquierda del acta PDF (3×3 cm).</p>
+            <label className={"upzone "+(logoB64?"ok":"")} style={{display:"block",marginBottom:8}}>
+              <input type="file" accept="image/*" onChange={e=>doLogoUpload(e.target.files[0])}/>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                {logoB64?<img src={logoB64} style={{width:48,height:48,objectFit:"contain",borderRadius:6,border:"1px solid rgba(255,255,255,.1)"}} alt="Logo"/>:<span style={{fontSize:"1.3rem"}}>🏫</span>}
+                <div>
+                  <div style={{color:logoB64?"#22c55e":"#E8EDF8",fontWeight:600,fontSize:".88rem"}}>{logoB64?"✓ Logo cargado":"Subir logo (opcional)"}</div>
+                  <div style={{color:"#4B5A78",fontSize:".74rem"}}>PNG, JPG, SVG — Click para seleccionar</div>
+                </div>
+              </div>
+            </label>
+          </div>
+          <div style={{marginTop:14,padding:"10px 14px",background:"rgba(255,255,255,.04)",borderRadius:10,border:"1px solid rgba(255,255,255,.07)"}}>
+            <p style={{color:"#E8A200",fontWeight:700,fontSize:".74rem",letterSpacing:".05em",marginBottom:8}}>NÚMERO DE JURADOS</p>
+            <div style={{display:"flex",gap:8}}>
+              {[2,3,4,5,6,7,8,9,10].map(n=>(
+                <button key={n} className="btn" onClick={()=>upd(prev=>({...prev,judgeCount:n}))} style={{
+                  flex:1,padding:"9px 0",fontWeight:700,fontSize:".9rem",
+                  background:((gs?.judgeCount||3)===n)?"#E8A200":"rgba(255,255,255,.06)",
+                  color:((gs?.judgeCount||3)===n)?"#0C1628":"#E8EDF8",
+                  border:((gs?.judgeCount||3)===n)?"none":"1px solid rgba(255,255,255,.1)"}}>
+                  {n}
+                </button>
+              ))}
+            </div>
+            <p style={{color:"#4B5A78",fontSize:".72rem",marginTop:5}}>Mínimo 2, máximo 10 jurados</p>
+          </div>
+          <button className="btn btn-gold" style={{width:"100%",marginTop:12}} onClick={()=>setTab("banks")}>Continuar → Palabras</button>
+        </div>
+      )}
+
+      {tab==="banks" && (
+        <div className="fade-up">
+          <div className="card" style={{marginBottom:12}}>
+            <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:4}}>📚 BANCOS DE PALABRAS</p>
+            <p style={{color:"#4B5A78",fontSize:".75rem",marginBottom:14}}>
+              Word: una palabra por línea. Opcional con fonética: <span style={{fontFamily:"monospace",color:"#a78bfa"}}>apple | /ˈæpəl/</span><br/>
+              La fonética se genera automáticamente desde dictionaryapi.dev (gratis, sin clave).
+            </p>
+            {[{key:"basic",l:"Level Basic",icon:"🟢",c:"#22c55e"},{key:"inter",l:"Level Intermediate",icon:"🟡",c:"#f59e0b"},{key:"adv",l:"Level Advanced",icon:"🔴",c:"#ef4444"}].map(({key,l,icon,c})=>(
+              <div key={key} style={{marginBottom:10,border:"1px solid rgba(255,255,255,.08)",borderRadius:10,overflow:"hidden"}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,padding:"7px 12px",background:"rgba(255,255,255,.03)"}}>
+                  <span style={{fontSize:"1.2rem"}}>{icon}</span>
+                  <span style={{fontWeight:700,fontSize:".85rem",color:"#E8EDF8",flex:1}}>{l}</span>
+                  <div style={{display:"flex",gap:4}}>
+                    <button className="btn btn-ghost" style={{padding:"3px 9px",fontSize:".68rem",background:!pasteMode[key]?"rgba(232,162,0,.15)":"rgba(255,255,255,.05)",color:!pasteMode[key]?"#E8A200":"#4B5A78",borderColor:!pasteMode[key]?"rgba(232,162,0,.35)":"rgba(255,255,255,.1)"}} onClick={()=>setPasteMode(p=>({...p,[key]:false}))}>📂 Archivo</button>
+                    <button className="btn btn-ghost" style={{padding:"3px 9px",fontSize:".68rem",background:pasteMode[key]?"rgba(232,162,0,.15)":"rgba(255,255,255,.05)",color:pasteMode[key]?"#E8A200":"#4B5A78",borderColor:pasteMode[key]?"rgba(232,162,0,.35)":"rgba(255,255,255,.1)"}} onClick={()=>setPasteMode(p=>({...p,[key]:true}))}>📋 Pegar</button>
+                  </div>
+                </div>
+                {!pasteMode[key] ? (
+                  <label className={"upzone "+(files[key]?"ok":"")} style={{borderRadius:0,border:"none",borderTop:"1px solid rgba(255,255,255,.06)",margin:0,borderColor:files[key]?c:undefined}}>
+                    <input type="file" accept=".docx,.doc,.pdf" onChange={e=>setFiles(p=>({...p,[key]:e.target.files[0]||null}))}/>
+                    <div style={{display:"flex",alignItems:"center",gap:10,padding:"6px 0"}}>
+                      <div style={{color:files[key]?"#22c55e":"#4B5A78",fontSize:".78rem"}}>{files[key]?"✓ "+files[key].name:"Word (.docx) o PDF — una palabra por línea, o pégalo"}</div>
+                    </div>
+                  </label>
+                ) : (
+                  <textarea className="field" rows={5} placeholder={"above\naccount\nactually | /ˈæktʃuəli/\n..."} value={pasteTexts[key]} onChange={e=>setPasteTexts(p=>({...p,[key]:e.target.value}))} style={{borderRadius:0,border:"none",borderTop:"1px solid rgba(255,255,255,.06)",width:"100%",resize:"vertical",fontSize:".84rem"}}/>
+                )}
+              </div>
+            ))}
+            {progress && (
+              <div style={{margin:"10px 0",padding:"10px 14px",background:"rgba(167,139,250,.1)",border:"1px solid rgba(167,139,250,.3)",borderRadius:10}}>
+                <div style={{color:"#a78bfa",fontSize:".82rem",marginBottom:6}}>🔤 Fonética: {progress.done}/{progress.total} palabras</div>
+                <div style={{height:4,background:"rgba(255,255,255,.1)",borderRadius:2}}>
+                  <div style={{height:4,background:"#a78bfa",borderRadius:2,width:Math.round(progress.done/progress.total*100)+"%",transition:"width .3s"}}/>
+                </div>
+              </div>
+            )}
+            <button className="btn btn-ghost" style={{width:"100%",marginTop:8}} disabled={busy} onClick={doLoadBanks}>
+              {busy ? "⏳ Procesando..." : "📥 Cargar + Generar Fonética Automática"}
+            </button>
+          </div>
+          {["basic","intermediate","advanced"].some(k=>editBanks[k]?.length>0) && (
+            <div className="card" style={{marginBottom:12}}>
+              <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:12}}>✏️ REVISAR / EDITAR FONÉTICA</p>
+              {[{key:"basic",label:"Básico",color:"#22c55e"},{key:"intermediate",label:"Intermedio",color:"#f59e0b"},{key:"advanced",label:"Avanzado",color:"#ef4444"}].map(({key,label,color})=>editBanks[key]?.length>0&&(
+                <div key={key} style={{marginBottom:14}}>
+                  <p style={{color,fontSize:".78rem",fontWeight:700,marginBottom:6}}>{label} — {editBanks[key].length} palabras</p>
+                  <div style={{maxHeight:200,overflowY:"auto",border:"1px solid rgba(255,255,255,.08)",borderRadius:10}}>
+                    <table className="word-table">
+                      <thead><tr><th>#</th><th>Palabra</th><th>Fonética IPA (editable)</th></tr></thead>
+                      <tbody>{editBanks[key].map((w,i)=>(
+                        <tr key={w.word}>
+                          <td style={{color:"#4B5A78",fontSize:".75rem",width:32}}>{i+1}</td>
+                          <td style={{fontWeight:600,letterSpacing:".06em"}}>{w.word.toUpperCase()}</td>
+                          <td><input placeholder="/fonética/" value={w.phonetic} onChange={e=>{const v=e.target.value;setEditBanks(p=>({...p,[key]:p[key].map((x,xi)=>xi===i?{...x,phonetic:v}:x)}))}}/></td>
+                        </tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                </div>
+              ))}
+              <button className="btn btn-gold" style={{width:"100%"}} onClick={doSaveBanks}>💾 Guardar y Continuar</button>
+            </div>
+          )}
+          {status && <div style={{padding:"9px 13px",background:"rgba(255,255,255,.05)",borderRadius:10,color:"#E8EDF8",fontSize:".83rem",marginTop:8}}>{status}</div>}
+        </div>
+      )}
+
+      {tab==="contestants" && (
+        <div className="fade-up">
+          <div className="card" style={{marginBottom:12}}>
+            <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:10}}>🏆 LISTA DE CONCURSANTES</p>
+            <div style={{display:"flex",gap:6,marginBottom:10}}>
+              <button className="btn btn-ghost" style={{flex:1,padding:"7px 10px",fontSize:".76rem",background:!pasteMode.pax?"rgba(232,162,0,.15)":"rgba(255,255,255,.05)",color:!pasteMode.pax?"#E8A200":"#4B5A78",borderColor:!pasteMode.pax?"rgba(232,162,0,.35)":"rgba(255,255,255,.1)"}} onClick={()=>setPasteMode(p=>({...p,pax:false}))}>📂 Subir archivo</button>
+              <button className="btn btn-ghost" style={{flex:1,padding:"7px 10px",fontSize:".76rem",background:pasteMode.pax?"rgba(232,162,0,.15)":"rgba(255,255,255,.05)",color:pasteMode.pax?"#E8A200":"#4B5A78",borderColor:pasteMode.pax?"rgba(232,162,0,.35)":"rgba(255,255,255,.1)"}} onClick={()=>setPasteMode(p=>({...p,pax:true}))}>📋 Pegar texto</button>
+            </div>
+            {!pasteMode.pax ? (
+              <>
+                <label className={"upzone "+(files.pax?"ok":"")} style={{display:"block",marginBottom:8}}>
+                  <input type="file" accept=".docx,.doc,.pdf" onChange={e=>setFiles(p=>({...p,pax:e.target.files[0]||null}))}/>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    <span style={{fontSize:"1.3rem"}}>📋</span>
+                    <div>
+                      <div style={{color:files.pax?"#22c55e":"#E8EDF8",fontWeight:600,fontSize:".88rem"}}>Lista de Concursantes</div>
+                      <div style={{color:"#4B5A78",fontSize:".74rem"}}>{files.pax?"✓ "+files.pax.name:"Word (.docx) o PDF — un nombre por línea"}</div>
+                    </div>
+                  </div>
+                </label>
+                <button className="btn btn-ghost" style={{width:"100%"}} disabled={busy||!files.pax} onClick={doLoadContestants}>{busy?"⏳ Cargando...":"📥 Cargar Lista"}</button>
+              </>
+            ) : (
+              <>
+                <textarea className="field" rows={8} placeholder={"1. Carlos Ernesto Martínez\n2. Ana Sofía Rivas\n3. José Daniel Portillo\n..."} value={pasteTexts.pax} onChange={e=>setPasteTexts(p=>({...p,pax:e.target.value}))} style={{resize:"vertical",fontFamily:"inherit",marginBottom:8}}/>
+                <button className="btn btn-ghost" style={{width:"100%"}} disabled={busy||!pasteTexts.pax.trim()} onClick={doLoadContestants}>{busy?"⏳ Procesando...":"📥 Cargar desde texto"}</button>
+              </>
+            )}
+
+            {/* Participant list with edit/delete/add */}
+            {gs?.contestants?.length>0 && (
+              <div style={{marginTop:14}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                  <p style={{color:"#4B5A78",fontSize:".72rem",fontWeight:700,letterSpacing:".05em"}}>{gs.contestants.length} CONCURSANTES {gs.contestantsConfirmed?"✅ CONFIRMADOS":"— SIN CONFIRMAR"}</p>
+                  {gs.contestantsConfirmed && <button className="btn btn-ghost" style={{padding:"3px 10px",fontSize:".72rem"}} onClick={()=>upd(prev=>({...prev,contestantsConfirmed:false}))}>✏️ Editar</button>}
+                </div>
+                <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:240,overflowY:"auto"}}>
+                  {gs.contestants.map((c,i)=>(
+                    <div key={c.id} style={{display:"flex",alignItems:"center",gap:7,padding:"6px 10px",background:"rgba(255,255,255,.04)",borderRadius:8}}>
+                      <span style={{color:"#4B5A78",fontSize:".72rem",width:20,textAlign:"right",flexShrink:0}}>{i+1}</span>
+                      {!gs.contestantsConfirmed ? (
+                        <>
+                          <input className="field" value={c.name} onChange={e=>doEditContestant(c.id,e.target.value)} style={{flex:1,padding:"4px 8px",fontSize:".84rem"}}/>
+                          <button style={{background:"none",border:"none",cursor:"pointer",color:"#ef4444",fontSize:"1rem",padding:"2px 4px"}} onClick={()=>doRemoveContestant(c.id)} title="Eliminar">✕</button>
+                        </>
+                      ) : (
+                        <span style={{flex:1,fontSize:".88rem",color:"#E8EDF8"}}>{c.name}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                {!gs.contestantsConfirmed && (
+                  <div style={{marginTop:8,display:"flex",gap:8}}>
+                    <input className="field" id="newNameInput" placeholder="Agregar concursante..." style={{flex:1,fontSize:".84rem"}}
+                      onKeyDown={e=>{if(e.key==="Enter"&&e.target.value.trim()){doAddContestant(e.target.value);e.target.value="";}}}/>
+                    <button className="btn btn-ghost" style={{padding:"8px 12px",fontSize:".82rem"}}
+                      onClick={()=>{const el=document.getElementById("newNameInput");if(el&&el.value.trim()){doAddContestant(el.value);el.value="";}}}
+                    >+ Agregar</button>
+                  </div>
+                )}
+                {!gs.contestantsConfirmed && (
+                  <button className="btn btn-green" style={{width:"100%",marginTop:10}} onClick={doConfirmContestants}>
+                    ✅ Confirmar Lista de Participantes
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+          {status && <div style={{padding:"9px 13px",background:"rgba(255,255,255,.05)",borderRadius:10,color:"#E8EDF8",fontSize:".83rem",marginBottom:12}}>{status}</div>}
+          <button className="btn btn-gold" style={{width:"100%",padding:14,fontSize:"1rem"}}
+            disabled={!gs?.contestants?.length||!gs?.banks?.basic?.length||!gs?.contestantsConfirmed}
+            onClick={doStart}>
+            {!gs?.contestantsConfirmed?"⚠️ Confirma la lista antes de iniciar":"🚀 Iniciar Concurso"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+
+  /* SETUP WAIT */
+  if (screen==="setup-wait") return (
+    <div className="sb" style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",gap:20,padding:24}}>
+      <style>{CSS}</style>
+      <div className="pulse" style={{fontSize:"3.5rem"}}>🐝</div>
+      <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"2.2rem",fontWeight:700}}>Esperando configuración...</h2>
+      {gs?.institution && <p style={{color:"#4B5A78"}}>{gs.institution}{gs?.level?" · "+gs.level:""}</p>}
+      <div className="card" style={{textAlign:"center"}}>
+        <p style={{color:"#4B5A78",fontSize:".76rem",fontWeight:700,letterSpacing:".05em",marginBottom:4}}>CONECTADO COMO</p>
+        <p style={{color:"#E8A200",fontSize:"1.15rem",fontWeight:700}}>{gs?.judges?.find(jj=>jj.id===role)?.name||(role==="mc"?gs?.mc?.name:null)||(role==="presenter"?gs?.presenter?.name:null)||nameIn||role}</p>
+        <p style={{color:"#2D3A55",fontSize:".72rem",marginTop:4}}>🟢 Firebase · Sala {roomId}</p>
+      </div>
+    </div>
+  );
+
+  /* RESULTS */
+  if (screen==="results") {
+    const getC = id => gs?.contestants?.find(c=>c.id===id);
+    const allDone = judgeCount>0 && confirmedCount>=judgeCount;
+    return (
+      <div className="sb" style={{maxWidth:600,margin:"0 auto",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:24,gap:20}}>
+        <style>{CSS}</style>
+        <div style={{textAlign:"center"}}>
+          <div style={{fontSize:"3rem"}}>🏆</div>
+          <h1 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"2.8rem",fontWeight:700}}>Resultados Finales</h1>
+          {gs?.institution && <p style={{color:"#4B5A78",fontSize:".85rem",marginTop:4}}>{gs.institution}{gs?.level?" · "+gs.level:""}</p>}
+        </div>
+        <div style={{display:"flex",flexDirection:"column",gap:12,width:"100%",maxWidth:420}}>
+          {[{key:"first",emoji:"🥇",label:"Primer Lugar",color:"#F2A900",bg:"rgba(242,169,0,.13)"},{key:"second",emoji:"🥈",label:"Segundo Lugar",color:"#B8B8B8",bg:"rgba(184,184,184,.09)"},{key:"third",emoji:"🥉",label:"Tercer Lugar",color:"#CD7F32",bg:"rgba(205,127,50,.09)"}].map(({key,emoji,label,color,bg})=>(
+            <div key={key} className="card fade-up" style={{background:bg,borderColor:color+"35",display:"flex",alignItems:"center",gap:14}}>
+              <span style={{fontSize:"2.5rem"}}>{emoji}</span>
+              <div>
+                <div style={{color:"#4B5A78",fontSize:".72rem",fontWeight:700,letterSpacing:".05em"}}>{label}</div>
+                <div style={{color,fontFamily:"'Cormorant Garamond',serif",fontSize:"1.55rem",fontWeight:700}}>{getC(gs?.results?.[key])?.name||"—"}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="card" style={{width:"100%",maxWidth:420,borderColor:"rgba(99,102,241,.35)"}}>
+          <p style={{color:"#a5b4fc",fontSize:".8rem",fontWeight:700,letterSpacing:".04em",marginBottom:6}}>🖨️ ACTAS PDF — TAMAÑO OFICIO HORIZONTAL</p>
+          {isJudge && (
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              <p style={{color:"#4B5A78",fontSize:".76rem",lineHeight:1.6}}>
+                Descarga tu acta, guárdala o imprímela. La sala se cerrará 36 horas después de que todos confirmen.
+              </p>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:4}}>
+                {(gs?.judges||[]).map(j=>({id:j.id,name:j.name})).map(({id,name})=>(
+                  <span key={id} style={{fontSize:".74rem",padding:"3px 10px",borderRadius:12,
+                    background:gs?.pdfConfirmed?.[id]?"rgba(34,197,94,.15)":"rgba(255,255,255,.06)",
+                    color:gs?.pdfConfirmed?.[id]?"#22c55e":"#4B5A78",
+                    border:"1px solid "+(gs?.pdfConfirmed?.[id]?"rgba(34,197,94,.35)":"rgba(255,255,255,.1)")}}>
+                    {gs?.pdfConfirmed?.[id]?"✓ ":"○ "}{name}
+                  </span>
+                ))}
+              </div>
+              {!gs?.pdfConfirmed?.[role] ? (
+                <button className="btn btn-pdf" style={{width:"100%",padding:13,fontSize:".95rem"}} onClick={doPrintAndConfirm}>
+                  📄 Descargar / Imprimir mi Acta y Confirmar
+                </button>
+              ) : (
+                <div style={{textAlign:"center",padding:"8px 0"}}>
+                  <p style={{color:"#22c55e",fontSize:".84rem",marginBottom:6}}>✅ Tu acta fue confirmada.</p>
+                  {!allDone && <p style={{color:"#4B5A78",fontSize:".76rem"}}>Esperando a los demás jurados ({confirmedCount}/{judgeCount})...</p>}
+                  {allDone && <p style={{color:"#22c55e",fontSize:".84rem",fontWeight:700}}>✅ Todos confirmaron — sala cierra en 36h.</p>}
+                </div>
+              )}
+            </div>
+
+          )}
+          {(isMC||isPresenter||isCreator) && !isJudge && (
+            <div style={{display:"flex",flexDirection:"column",gap:10,padding:"8px 0"}}>
+              <p style={{color:"#4B5A78",fontSize:".82rem",lineHeight:1.6}}>
+                {isCreator?"Como configurador puedes descargar el acta de cada jurado:":""}
+              </p>
+              {isCreator && (gs?.judges||[]).map(j=>(
+                <button key={j.id} className="btn btn-pdf" style={{width:"100%",padding:10,justifyContent:"flex-start",gap:10,fontSize:".84rem"}}
+                  onClick={()=>doPrintJudgeActa(j.id)}>
+                  📄 Acta de {j.name}
+                </button>
+              ))}
+              <p style={{color:"#4B5A78",fontSize:".74rem",marginTop:6}}>
+                Confirmaciones de jurados: {confirmedCount}/{judgeCount} {allDone?"✅":"⏳"}
+              </p>
+              {allDone && <p style={{color:"#22c55e",fontSize:".78rem"}}>La sala se cerrará 36 horas después de la última confirmación.</p>}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  /* COMPETITION */
+  if (!gs || screen!=="competition") return (
+    <div className="sb" style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh"}}>
+      <style>{CSS}</style>
+      <p className="pulse" style={{color:"#4B5A78"}}>Cargando...</p>
+    </div>
+  );
+
+  return (
+    <div className="sb" style={{maxWidth:680,margin:"0 auto",padding:"16px 14px 80px"}}>
+      <style>{CSS}</style>
+      {LtrModal}{OvrModal}{DisputeModal}
+
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18,paddingTop:6}}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <span>🐝</span>
+          <span style={{display:"inline-flex",alignItems:"center",gap:6,padding:"4px 13px",borderRadius:18,fontSize:".74rem",fontWeight:700,background:stCol+"1A",border:"1px solid "+stCol+"45",color:stCol}}>
+            Etapa {cfg?.label}
+            {gs.stage==="tiebreaker"&&gs.tbRound>0&&<span style={{opacity:.7}}> · Ronda {gs.tbRound+1}</span>}
+          </span>
+          {(isMC||isCreator)&&<span style={{fontSize:".68rem",color:"#2D3A55",marginLeft:8}}>{active.length} activos</span>}
+        </div>
+        <div style={{color:"#4B5A78",fontSize:".76rem"}}>{isMC?(gs?.mc?.name||"Maestro de Ceremonia"):isPresenter?(gs?.presenter?.name||"Presentador"):myJudge?.name||"Jurado"}</div>
+      </div>
+
+      {/* Dispute indicator */}
+      {pendingDisputes.length>0 && (
+        <button className="btn" style={{width:"100%",marginBottom:10,background:"rgba(251,191,36,.15)",color:"#fbbf24",border:"1px solid rgba(251,191,36,.35)",padding:10,fontSize:".84rem"}} onClick={()=>setDisputeModal(true)}>
+          ⚠️ Hay {pendingDisputes.length} discrepancia(s) pendiente(s) — Clic para deliberar
+        </button>
+      )}
+      {/* Concursante actual */}
+      {cur && !gs.stageComplete && (
+        <div className="card fade-up" style={{marginBottom:14,borderColor:stCol+"35"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+            <div>
+              <p style={{color:"#4B5A78",fontSize:".68rem",fontWeight:700,letterSpacing:".07em",marginBottom:4}}>CONCURSANTE ACTUAL</p>
+              <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8EDF8",fontSize:"1.65rem",fontWeight:700}}>{cur.name}</h2>
+            </div>
+            <div style={{textAlign:"right"}}>
+              <p style={{color:"#4B5A78",fontSize:".68rem",fontWeight:700,letterSpacing:".07em",marginBottom:4}}>PALABRA</p>
+              <p style={{color:"#E8EDF8",fontWeight:700}}>{gs.stage==="tiebreaker"?"Desempate":(gs.slot+1)+" / "+wpr}</p>
+            </div>
+          </div>
+          {gs.stage!=="tiebreaker" && (
+            <div style={{display:"flex",gap:5,marginTop:10}}>
+              {Array.from({length:wpr}).map((_,i)=>{
+                const sv=gs.scores[gs.stage]?.[cur.id]?.v?.[i];
+                return <div key={i} className="dot" style={{background:sv==="correct"?"#22c55e":sv==="incorrect"?"#ef4444":i===gs.slot&&!aw?stCol+"60":"rgba(255,255,255,.1)"}}/>;
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Área de Concurso — Flujo por fases */}
+      {!gs.stageComplete && (
+        <div className="card" style={{marginBottom:14,minHeight:220,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:14,padding:18}}>
+
+          {/* IDLE */}
+          {(!gs.wordPhase||gs.wordPhase==="idle") && (
+            <div style={{textAlign:"center"}}>
+              <p style={{color:"#4B5A78",marginBottom:18}}>El concurso está listo para comenzar.</p>
+              {(isMC||isCreator) && <button className="btn btn-gold" style={{padding:"12px 32px"}} onClick={doStartContestants}>▶ Iniciar Concurso</button>}
+              {!isMC&&!isCreator&&<p style={{color:"#2D3A55"}}>Esperando al Maestro de Ceremonia...</p>}
+            </div>
+          )}
+
+          {/* CONTESTANT REVEAL — judges press ready */}
+          {gs.wordPhase==="contestant_reveal" && cur && (
+            <div style={{textAlign:"center",width:"100%"}} className="fade-up">
+              {isPresenter && (
+                <>
+                  <p style={{color:"#4B5A78",fontSize:".75rem",marginBottom:8}}>Próximo concursante:</p>
+                  <p className="word-font" style={{fontSize:"2rem",color:"#E8A200"}}>{cur.name}</p>
+                </>
+              )}
+              {isJudge && (
+                <>
+                  <p style={{color:"#4B5A78",fontSize:".8rem",marginBottom:8}}>Concursante:</p>
+                  <p className="word-font" style={{fontSize:"2rem",color:"#E8EDF8",marginBottom:16}}>{cur.name}</p>
+                  <button className="btn btn-gold" style={{padding:"13px 36px"}}
+                    onClick={doJudgeReady} disabled={!!(gs.judgesReady||{})[role]}>
+                    {(gs.judgesReady||{})[role]?"✅ Listo":"✋ Listo — presiona cuando estés preparado"}
+                  </button>
+                  <p style={{color:"#4B5A78",fontSize:".72rem",marginTop:8}}>
+                    Listos: {Object.keys(gs.judgesReady||{}).length}/{numJudges}
+                  </p>
+                </>
+              )}
+              {(isMC||isCreator) && (
+                <>
+                  <p style={{color:"#4B5A78",fontSize:".8rem",marginBottom:6}}>En turno:</p>
+                  <p className="word-font" style={{fontSize:"2rem",color:"#E8EDF8"}}>{cur.name}</p>
+                  <p style={{color:"#2D3A55",fontSize:".8rem",marginTop:10}}>
+                    Esperando que los {numJudges} jurados confirmen listos... ({Object.keys(gs.judgesReady||{}).length}/{numJudges})
+                  </p>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* WORD SHOW */}
+          {gs.wordPhase==="word_show" && cur && (()=>{
+            const cw=(gs.currentWords||[])[gs.currentWordIdx||0];
+            const wi=gs.currentWordIdx||0;
+            const myVote=((gs.wordJudgments||{})[wi]||{})[role];
+            const totalVotes=Object.keys((gs.wordJudgments||{})[wi]||{}).length;
+            return (
+              <div style={{width:"100%",textAlign:"center"}} className="pop">
+                <p style={{color:"#4B5A78",fontSize:".72rem",marginBottom:4}}>{cur.name} — Palabra {wi+1} de 3</p>
+                <div className="word-font" style={{fontSize:"clamp(1.8rem,5vw,3rem)",marginBottom:8,color:"#22c55e"}}>{(cw?.word||"").toUpperCase()}</div>
+                <div className="ph-font" style={{fontSize:"1rem",marginBottom:14}}>{cw?.phonetic||""}</div>
+                {isJudge && !myVote && (() => {
+                  const letters=(cw?.word||"").split("");
+                  const REASONS=[
+                    {id:"no_before",  ico:"🗣", lbl:"No dijo\nal inicio"},
+                    {id:"no_after",   ico:"🗣", lbl:"No dijo\nal final"},
+                    {id:"too_slow",   ico:"⏱", lbl:"No empezó\na tiempo"},
+                    {id:"discontinuous",ico:"⏸",lbl:"Deletreo\ndiscontinuo"},
+                  ];
+                  const RLABELS={
+                    no_before:"No pronunció la palabra al inicio",
+                    no_after:"No pronunció la palabra al final",
+                    too_slow:"No inició en tiempo (>10 seg)",
+                    discontinuous:"Deletreo discontinuo / se detuvo",
+                  };
+                  const hasSelection=markedLetterIdx!==null||markedReason!==null;
+                  const selParts=[];
+                  if(markedLetterIdx!==null) selParts.push("Letra: "+((cw?.word||"")[markedLetterIdx]||"").toUpperCase()+" (pos. "+(markedLetterIdx+1)+")");
+                  if(markedReason) selParts.push(RLABELS[markedReason]||markedReason);
+                  return (
+                    <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
+
+                      {/* Letter tiles */}
+                      <div style={{width:"100%"}}>
+                        <p style={{fontSize:".68rem",color:"#4B5A78",letterSpacing:"1px",marginBottom:5,fontWeight:600}}>
+                          LETRA INCORRECTA <span style={{fontWeight:400,opacity:.7}}>(opcional — toca la letra)</span>
+                        </p>
+                        <div style={{display:"flex",flexWrap:"wrap",gap:4,justifyContent:"center"}}>
+                          {letters.map((ch,i)=>{
+                            const isW=markedLetterIdx===i;
+                            return(
+                              <button key={i}
+                                onClick={()=>setMarkedLetterIdx(isW?null:i)}
+                                title={"Marcar "+ch.toUpperCase()+" como incorrecta"}
+                                style={{
+                                  width:ch===" "?"14px":"32px",minWidth:ch===" "?"14px":"32px",
+                                  height:"40px",borderRadius:7,fontWeight:700,fontSize:"1rem",
+                                  cursor:"pointer",fontFamily:"inherit",
+                                  display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+                                  gap:1,lineHeight:1,
+                                  background:isW?"#dc2626":"rgba(255,255,255,.07)",
+                                  color:isW?"#fff":"#E8EDF8",
+                                  border:isW?"2px solid #ef4444":"1px solid rgba(255,255,255,.15)",
+                                  transform:isW?"scale(1.1)":"scale(1)",
+                                  transition:"all .12s",
+                                  boxShadow:isW?"0 0 0 3px rgba(239,68,68,.25)":"none",
+                                }}>
+                                {ch===" "?"·":ch.toUpperCase()}
+                                {isW&&<span style={{fontSize:"7px",opacity:.8}}>✕ {i+1}</span>}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Reason buttons */}
+                      <div style={{width:"100%"}}>
+                        <p style={{fontSize:".68rem",color:"#4B5A78",letterSpacing:"1px",marginBottom:5,fontWeight:600}}>
+                          RAZÓN <span style={{fontWeight:400,opacity:.7}}>(opcional)</span>
+                        </p>
+                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:5}}>
+                          {REASONS.map(r=>{
+                            const isSel=markedReason===r.id;
+                            return(
+                              <button key={r.id}
+                                onClick={()=>setMarkedReason(isSel?null:r.id)}
+                                style={{
+                                  padding:"7px 5px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",
+                                  textAlign:"center",lineHeight:1.4,fontSize:"9px",
+                                  border:isSel?"1px solid rgba(245,158,11,.5)":"1px solid rgba(255,255,255,.1)",
+                                  background:isSel?"rgba(245,158,11,.13)":"rgba(255,255,255,.05)",
+                                  color:isSel?"#f59e0b":"#6B7FA3",
+                                  transition:"all .12s",
+                                }}>
+                                <span style={{fontSize:"15px",display:"block",marginBottom:2}}>{r.ico}</span>
+                                {r.lbl}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Selection summary */}
+                      <div style={{
+                        width:"100%",minHeight:24,borderRadius:7,padding:"5px 8px",
+                        background:hasSelection?"rgba(239,68,68,.08)":"rgba(255,255,255,.03)",
+                        border:"1px solid "+(hasSelection?"rgba(239,68,68,.2)":"rgba(255,255,255,.07)"),
+                        fontSize:".74rem",color:hasSelection?"#ef4444":"#4B5A78",textAlign:"center",
+                      }}>
+                        {hasSelection
+                          ? selParts.join(" · ")
+                          : "Nada seleccionado — puedes votar directo"}
+                      </div>
+
+                      {/* Verdict buttons */}
+                      <div style={{display:"flex",gap:8,width:"100%"}}>
+                        <button className="btn btn-green" style={{flex:1,padding:"10px 0",fontSize:".9rem"}}
+                          onClick={()=>{doJudgeWordVerdict("correct",null);setMarkedLetterIdx(null);setMarkedReason(null);}}>
+                          ✅ Correcta
+                        </button>
+                        <button className="btn btn-red" style={{flex:1,padding:"10px 0",fontSize:".9rem"}}
+                          onClick={()=>{
+                            const errInfo=(markedLetterIdx!==null||markedReason)
+                              ?{
+                                  letterIdx:markedLetterIdx,
+                                  letter:markedLetterIdx!==null?(cw?.word||"")[markedLetterIdx]:null,
+                                  reason:markedReason||null,
+                                }
+                              :null;
+                            doJudgeWordVerdict("incorrect",errInfo);
+                            setMarkedLetterIdx(null);setMarkedReason(null);
+                          }}>
+                          ❌ Incorrecta
+                        </button>
+                      </div>
+
+                    </div>
+                  );
+                })()}
+                {isJudge && myVote && (
+                  <div style={{background:myVote.verdict==="correct"?"rgba(22,163,74,.08)":"rgba(220,38,38,.08)",
+                    border:"1px solid "+(myVote.verdict==="correct"?"rgba(22,163,74,.25)":"rgba(220,38,38,.25)"),
+                    borderRadius:10,padding:"10px 12px",textAlign:"center"}}>
+                    <p style={{fontWeight:700,fontSize:"1rem",color:myVote.verdict==="correct"?"#22c55e":"#ef4444",marginBottom:4}}>
+                      {myVote.verdict==="correct"?"✅ Marcaste: Correcta":"❌ Marcaste: Incorrecta"}
+                    </p>
+                    {myVote.verdict==="incorrect" && (myVote.err?.letter||myVote.err?.reason) && (
+                      <div style={{fontSize:".75rem",color:"#ef4444",lineHeight:1.6}}>
+                        {myVote.err?.letter && (
+                          <span>Letra: <strong style={{letterSpacing:2}}>{myVote.err.letter.toUpperCase()}</strong> (pos. {(myVote.err?.letterIdx||0)+1})</span>
+                        )}
+                        {myVote.err?.letter && myVote.err?.reason && <span> · </span>}
+                        {myVote.err?.reason && (
+                          <span>{{no_before:"No dijo al inicio",no_after:"No dijo al final",too_slow:"No empezó a tiempo",discontinuous:"Deletreo discontinuo"}[myVote.err.reason]||myVote.err.reason}</span>
+                        )}
+                      </div>
+                    )}
+                    {myVote.verdict==="incorrect" && !myVote.err?.letter && !myVote.err?.reason && (
+                      <p style={{fontSize:".72rem",color:"rgba(239,68,68,.6)"}}>Sin detalle adicional</p>
+                    )}
+                  </div>
+                )}
+                {!isJudge && <p style={{color:"#4B5A78"}}>{totalVotes}/{numJudges} jurados calificaron</p>}
+              </div>
+            );
+          })()}
+
+          {/* DELIBERATION */}
+          {gs.wordPhase==="deliberation" && (()=>{
+            const unresolved=(gs.discrepancies||[]).filter(d=>!d.resolved);
+            const disc=unresolved[0];
+            if(!disc) return null;
+            const discIdx=(gs.discrepancies||[]).findIndex(d=>!d.resolved);
+            return (
+              <div style={{width:"100%"}} className="fade-up">
+                <p style={{color:"#fbbf24",fontWeight:700,fontSize:".8rem",marginBottom:8}}>⚠ DISCREPANCIA — Palabra {(disc.wordIdx||0)+1}</p>
+                <div className="word-font" style={{fontSize:"1.8rem",textAlign:"center",marginBottom:4}}>{(disc.word||"").toUpperCase()}</div>
+                <div className="ph-font" style={{textAlign:"center",marginBottom:12,fontSize:".9rem"}}>{disc.phonetic||""}</div>
+                {isPresenter && <p style={{color:"#4B5A78",textAlign:"center"}}>Los jurados están deliberando. El siguiente concursante es: <strong style={{color:"#E8A200"}}>{(gs.contestants?.filter(c=>c.active)||[])[(gs.cIdx||0)+1]?.name||"—"}</strong></p>}
+                {!isPresenter && (
+                  <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap",marginBottom:10}}>
+                    {Object.entries(disc.votes||{}).map(([jid,v])=>{
+                      const judgeObj=(gs.judges||[]).find(j=>j.id===jid);
+                      const lastName=(judgeObj?.name||jid).split(" ")[1]||(judgeObj?.name||jid);
+                      return (
+                        <button key={jid} className="btn" onClick={()=>doResolveDiscrepancy(discIdx,v)} style={{
+                          flexDirection:"column",gap:2,padding:"9px 14px",
+                          background:v==="correct"?"rgba(34,197,94,.15)":"rgba(248,113,113,.15)",
+                          color:v==="correct"?"#22c55e":"#f87171",
+                          border:"1px solid "+(v==="correct"?"rgba(34,197,94,.4)":"rgba(248,113,113,.4)")}}>
+                          <span>{v==="correct"?"✅ Correcta":"❌ Incorrecta"}</span>
+                          <span style={{fontSize:".68rem",opacity:.75}}>{lastName}</span>
+                          {(()=>{
+                          const fv=(disc.votes||{})[jid];
+                          const e=fv?.err;
+                          if(!e) return null;
+                          const RL={no_before:"sin inicio",no_after:"sin final",too_slow:"tardó",discontinuous:"discontinuo"};
+                          return(<span style={{fontSize:".65rem",color:"#f59e0b",display:"block",marginTop:2,lineHeight:1.4}}>
+                            {e.letter&&<span>letra {e.letter.toUpperCase()} (p.{(e.letterIdx||0)+1})</span>}
+                            {e.letter&&e.reason&&<span> · </span>}
+                            {e.reason&&<span>{RL[e.reason]||e.reason}</span>}
+                          </span>);
+                        })()}
+                        </button>
+                      );
+                    })}
+                    <button className="btn btn-ghost" style={{flexDirection:"column",gap:2,padding:"9px 12px"}}
+                      onClick={()=>{
+                        const r=window.prompt("Resultado definitivo (correct / incorrect):");
+                        if(r==="correct"||r==="incorrect") doResolveDiscrepancy(discIdx,r);
+                      }}>
+                      <span>✏️</span><span style={{fontSize:".72rem"}}>Editar</span>
+                    </button>
+                  </div>
+                )}
+                <p style={{color:"#4B5A78",fontSize:".72rem",textAlign:"center"}}>{unresolved.length} discrepancia(s) pendiente(s)</p>
+              </div>
+            );
+          })()}
+
+          {/* STAGE END per contestant */}
+          {gs.wordPhase==="stage_end" && cur && (
+            <div style={{textAlign:"center"}} className="fade-up">
+              <p style={{color:"#22c55e",fontWeight:700,fontSize:"1rem",marginBottom:10}}>✅ {cur.name} completó sus palabras</p>
+              {(isMC||isCreator) && (
+                <button className="btn btn-gold" style={{padding:"12px 28px"}} onClick={doNextContestant}>
+                  {(gs.contestants?.filter(c=>c.active)||[]).length > (gs.cIdx||0)+1 ? "▶ Siguiente Concursante" : "📊 Ver Resultados de Etapa"}
+                </button>
+              )}
+              {!isMC&&!isCreator&&<p style={{color:"#4B5A78"}}>Esperando al Maestro de Ceremonia...</p>}
+            </div>
+          )}
+
+        </div>
+      )}
+{gs.stageComplete && (
+        <div className="card fade-up" style={{marginBottom:14,borderColor:"rgba(232,162,0,.5)"}}>
+          <h3 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.4rem",marginBottom:14}}>
+            Etapa {cfg?.label} — {gs.stage==="tiebreaker"?"Ronda "+(gs.tbRound+1)+" completada":"Resultados"}
+          </h3>
+
+          {/* ── HOST: animated reveal ── */}
+          {(isMC||isCreator) && !gs.advancing.length && (
+            <p style={{color:"#4B5A78",fontSize:".84rem",textAlign:"center"}}>⏳ Esperando que los jurados entreguen resultados...</p>
+          )}
+          {(isMC||isCreator) && gs.advancing.length>0 && !revealAdvancing && (
+            <div style={{textAlign:"center",padding:"20px 0"}}>
+              <p style={{color:"#4B5A78",fontSize:".82rem",marginBottom:16}}>
+                {gs.stage==="tiebreaker"?"Los jurados han definido el desempate.":"Los jurados entregaron los resultados de esta etapa."}
+              </p>
+              <button className="btn" onClick={()=>setRevealAdvancing(true)} style={{
+                background:"linear-gradient(135deg,#E8A200,#FF7700)",color:"#0C1628",
+                padding:"18px 44px",fontSize:"1.1rem",letterSpacing:".08em",borderRadius:16,
+                boxShadow:"0 5px 28px rgba(232,162,0,.45)",animation:"pulse 1.5s infinite"
+              }}>
+                {gs.stage==="tiebreaker"
+                  ?(canResolveTop3(ranked)?"🏆 Ver Resultado Final":"➕ Nueva Ronda de Desempate")
+                  :"➡️ Ver Siguiente Etapa"}
+              </button>
+            </div>
+          )}
+          {(isMC||isCreator) && gs.advancing.length>0 && revealAdvancing && (
+            <div className="fade-up">
+              {gs.stage!=="tiebreaker" && (
+                <div style={{marginBottom:14}}>
+                  <p style={{color:"#22c55e",fontWeight:700,fontSize:".8rem",marginBottom:8,letterSpacing:".04em"}}>
+                    ✅ PARTICIPANTES QUE AVANZAN A {nextCfg?.label?.toUpperCase()||"LA SIGUIENTE ETAPA"}
+                  </p>
+                  {gs.advancing.map(id=>{
+                    const c=gs.contestants.find(x=>x.id===id);
+                    return c?(<div key={id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",background:"rgba(34,197,94,.1)",borderRadius:10,marginBottom:6,border:"1px solid rgba(34,197,94,.25)"}}>
+                      <span style={{color:"#22c55e",fontSize:"1.1rem"}}>✅</span>
+                      <span style={{color:"#E8EDF8",fontWeight:600}}>{c.name}</span>
+                    </div>):null;
+                  })}
+                  {ranked.filter(c=>!gs.advancing.includes(c.id)).length>0&&(
+                    <div style={{marginTop:10}}>
+                      <p style={{color:"#ef4444",fontWeight:700,fontSize:".8rem",marginBottom:8,letterSpacing:".04em"}}>❌ ELIMINADOS EN ESTA ETAPA</p>
+                      {ranked.filter(c=>!gs.advancing.includes(c.id)).map(c=>(
+                        <div key={c.id} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 14px",background:"rgba(239,68,68,.07)",borderRadius:10,marginBottom:5,border:"1px solid rgba(239,68,68,.2)"}}>
+                          <span style={{color:"#ef4444",fontSize:"1rem"}}>❌</span>
+                          <span style={{color:"#6B7FA3"}}>{c.name}</span>
+                          <span style={{marginLeft:"auto",color:"#4B5A78",fontSize:".78rem"}}>{c.correct}/{c.total||wpr} correctas</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {gs.stage==="tiebreaker" && (
+                <div style={{marginBottom:14}}>
+                  <p style={{color:"#a78bfa",fontWeight:700,fontSize:".8rem",marginBottom:8}}>⚡ RONDA DE DESEMPATE {gs.tbRound+1}</p>
+                  {ranked.map((c,i)=>(
+                    <div key={c.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",background:"rgba(167,139,250,.08)",borderRadius:10,marginBottom:5,border:"1px solid rgba(167,139,250,.2)"}}>
+                      <span style={{color:"#a78bfa",minWidth:20,fontWeight:700}}>{i+1}°</span>
+                      <span style={{color:"#E8EDF8",fontWeight:600,flex:1}}>{c.name}</span>
+                      <span style={{color:"#a78bfa",fontSize:".78rem"}}>{c.correct}/{c.total||1} correctas</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <button className="btn btn-gold" style={{width:"100%"}} onClick={doAdvance}>
+                {gs.stage==="tiebreaker"
+                  ?(canResolveTop3(ranked)?"🏆 Confirmar y Ver Resultados Finales":"➕ Iniciar Nueva Ronda de Desempate")
+                  :"🚀 Iniciar Etapa "+( nextCfg?.label||"Siguiente")}
+              </button>
+            </div>
+          )}
+
+          {/* ── JUDGES: results + tiebreaker controls ── */}
+          {isJudge && (
+            <div>
+              <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:12}}>
+                {ranked.map((c,i)=>(
+                  <div key={c.id} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",background:"rgba(255,255,255,.04)",borderRadius:10}}>
+                    <span style={{color:"#4B5A78",fontSize:".78rem",width:18,textAlign:"right"}}>{i+1}</span>
+                    <span style={{flex:1,fontSize:".88rem"}}>{c.name}</span>
+                    <div style={{display:"flex",gap:3}}>{(c.words||[]).slice(0,wpr).map((vv,vi)=><div key={vi} className="dot" style={{background:vv==="correct"?"#22c55e":vv==="incorrect"?"#ef4444":"rgba(255,255,255,.1)"}}/>)}</div>
+                    <span style={{fontSize:".84rem",fontWeight:700,minWidth:32,textAlign:"right",color:c.correct>=2?"#22c55e":c.correct===1?"#f59e0b":"#ef4444"}}>{c.correct}/{c.total||wpr}</span>
+                  </div>
+                ))}
+              </div>
+              {!gs.advancing.length && (
+                <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                  {gs.stage==="tiebreaker" ? (
+                    <>
+                      <p style={{color:"#4B5A78",fontSize:".78rem",textAlign:"center",marginBottom:4}}>
+                        Ronda {gs.tbRound+1} completada. ¿Qué desean hacer?
+                      </p>
+                      <button className="btn" style={{width:"100%",background:"rgba(167,139,250,.18)",color:"#a78bfa",border:"1px solid rgba(167,139,250,.35)"}}
+                        onClick={()=>upd(prev=>({...prev,advancing:ranked.map(c=>c.id),tbRound:prev.tbRound}))}>
+                        ➕ Agregar otra ronda de desempate
+                      </button>
+                      <button className="btn btn-gold" style={{width:"100%"}} onClick={doSubmit}>
+                        🏆 Finalizar desempate — Entregar al Monitor
+                      </button>
+                    </>
+                  ) : (
+                    <button className="btn btn-gold" style={{width:"100%"}} onClick={doSubmit}>
+                      📤 Entregar Resultados al Monitor
+                    </button>
+                  )}
+                </div>
+              )}
+              {gs.advancing.length>0 && (
+                <p style={{color:"#22c55e",fontSize:".84rem",textAlign:"center"}}>✅ Resultados enviados. Esperando al Monitor...</p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Marcador */}
+      <div className="card">
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:10}}>
+          <p style={{color:"#4B5A78",fontSize:".72rem",fontWeight:700,letterSpacing:".06em"}}>
+            CONCURSANTES — {cfg?.label?.toUpperCase()}
+            {gs.stage==="tiebreaker"&&gs.tbLen&&<span style={{color:stCol,marginLeft:6,textTransform:"none",fontWeight:400,letterSpacing:0}}>· {gs.tbLen} letras</span>}
+          </p>
+          <span style={{color:"#2D3A55",fontSize:".68rem"}}>{active.length} participante{active.length!==1?"s":""}</span>
+        </div>
+        {ranked.map((c,i)=>(
+          <div key={c.id} style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+            <span style={{color:"#2D3A55",fontSize:".76rem",width:16,textAlign:"right"}}>{i+1}</span>
+            <span style={{flex:1,fontSize:".84rem",color:"#E8EDF8"}}>
+              {c.name}
+              {cur&&cur?.id===c.id&&!gs.stageComplete&&<span style={{marginLeft:6,fontSize:".64rem",background:stCol+"25",color:stCol,padding:"1px 6px",borderRadius:8}}>activo</span>}
+            </span>
+            <div style={{display:"flex",gap:3}}>{Array.from({length:wpr}).map((_,wi)=>{const vv=(c.words||[])[wi];return <div key={wi} className="dot" style={{width:9,height:9,background:vv==="correct"?"#22c55e":vv==="incorrect"?"#ef4444":"rgba(255,255,255,.1)"}}/>;})}</div>
+            <span style={{fontSize:".8rem",color:"#4B5A78",minWidth:28,textAlign:"right"}}>{c.correct}/{c.total||0}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<ErrorBoundary><App /></ErrorBoundary>);
+</script>
+</body>
+</html>
