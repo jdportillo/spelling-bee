@@ -170,6 +170,18 @@ function drawFairWords(bank, usedArr, targetLen) {
   return [w1,w2,w3].filter(Boolean);
 }
 
+
+/* ── DEVICE ID: persistent fingerprint for session recovery ── */
+function getDeviceId() {
+  let id = localStorage.getItem('bee_device_id');
+  if (!id) {
+    id = 'dev_' + Math.random().toString(36).slice(2,10) + '_' + Date.now().toString(36);
+    localStorage.setItem('bee_device_id', id);
+  }
+  return id;
+}
+const DEVICE_ID = getDeviceId();
+
 const STAGES = {
   basic:        { label:"Básica",     color:"#22c55e", bank:"basic",        next:"intermediate", wpr:3 },
   intermediate: { label:"Intermedia", color:"#f59e0b", bank:"intermediate", next:"advanced",     wpr:3 },
@@ -505,7 +517,7 @@ function printReport(gs, role, onDone) {
     : role==="presenter" ? "Presentador"
     : "Judge "+role.replace("J","")+", Order "+judge?.order;
   const date = new Date().toLocaleDateString("en-US",{year:"numeric",month:"long",day:"numeric"});
-  const getC = id => gs.contestants.find(c=>c.id===id);
+  const getC = id => (Array.isArray(gs?.contestants)?gs.contestants:[]).find(c=>c.id===id);
 
   /* ── Placement map ── */
   const placeMap = {};
@@ -913,7 +925,7 @@ function App() {
   const [files,    setFiles]    = useState({basic:null,inter:null,adv:null,pax:null});
   const [status,   setStatus]   = useState("");
   const [busy,     setBusy]     = useState(false);
-  const [tab,      setTab]      = useState("banks");
+  const [tab,      setTab]      = useState("judges");
   const [editBanks,setEditBanks]= useState({basic:[],intermediate:[],advanced:[]});
   const [progress, setProgress] = useState(null);
   const [ltrModal, setLtrModal] = useState(null);
@@ -924,7 +936,8 @@ function App() {
   const [pasteMode,  setPasteMode]  = useState({basic:false,inter:false,adv:false,pax:false});
   const [isMobile, setIsMobile] = useState(typeof window!=="undefined"&&window.innerWidth<640);
   const [adminUser,   setAdminUser]   = useState(null);   // {type,username,roomLimit,activeRooms} or {type:"master",uid,email}
-  const [showAdmin,   setShowAdmin]   = useState(false);  // show admin overlay
+  const [showAdmin,   setShowAdmin]   = useState(false);
+  const [userRooms,   setUserRooms]   = useState([]);   // [{id, institution, createdAt, status}]  // show admin overlay
   const [adminView,   setAdminView]   = useState("login"); // "login"|"dashboard"|"setup-master"
   const [adminUsers,  setAdminUsers]  = useState([]);
   const [adminBusy,   setAdminBusy]   = useState(false);
@@ -993,6 +1006,25 @@ function App() {
     return () => ref.off("value", h);
   }, [role, roomId]);
 
+  /* Save room session on every meaningful state change for reload recovery */
+  useEffect(()=>{
+    if(!roomId) return;
+    const inRoom = ["setup","setup-wait","competition","results"].includes(screen);
+    if(inRoom){
+      try{
+        localStorage.setItem('bee_room_session', JSON.stringify({
+          roomId, role, nameIn, screen,
+          deviceId: DEVICE_ID,
+          ts: Date.now()
+        }));
+      }catch(e){}
+    }
+    if(screen==="landing"){
+      // Left the room — clear room session
+      try{ localStorage.removeItem('bee_room_session'); }catch(e){}
+    }
+  },[screen, roomId, role, nameIn]);
+
   useEffect(() => { if(gs?.stage||gs?.stageComplete===false) setRevealAdvancing(false); }, [gs?.stage]);
   useEffect(() => {
     const h=()=>setIsMobile(window.innerWidth<640);
@@ -1002,6 +1034,57 @@ function App() {
 
   /* Force re-check FIREBASE_OK once Firebase finishes async init */
   useEffect(() => {
+    // ── Restore ADMIN session ──
+    try {
+      const saved = localStorage.getItem('bee_admin_session');
+      if (saved) {
+        const {user, ts} = JSON.parse(saved);
+        const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
+        if (user && Date.now() - ts < THIRTY_DAYS) {
+          setAdminUser(user);
+        } else {
+          localStorage.removeItem('bee_admin_session');
+        }
+      }
+    } catch(e) { localStorage.removeItem('bee_admin_session'); }
+
+    // ── Restore ROOM session (role + room after page reload) ──
+    try {
+      const rs = localStorage.getItem('bee_room_session');
+      if (rs) {
+        const {roomId:rid, role:rl, nameIn:nm, ts} = JSON.parse(rs);
+        const EIGHT_HOURS = 8 * 60 * 60 * 1000;
+        if (rid && rl && Date.now() - ts < EIGHT_HOURS) {
+          // Wait for Firebase then rejoin
+          const rejoin = () => {
+            window.rtdb.ref("spellingbee/rooms/"+rid+"/state").once("value").then(snap=>{
+              const s = fixArrays(snap.val());
+              if (!s || s.phase==="archived") {
+                localStorage.removeItem('bee_room_session'); return;
+              }
+              setGs(s);
+              setRoomId(rid);
+              roomRef.current = rid;
+              setRole(rl);
+              setNameIn(nm || "");
+              if (rl === "mc" || rl === "presenter") {
+                sessionStorage.setItem("creator-"+rid, "1");
+              }
+              // Navigate to correct screen
+              if (s.phase==="competition")      setScreen("competition");
+              else if (s.phase==="setup")       setScreen("setup");
+              else if (s.phase==="results")     setScreen("results");
+              else                              setScreen("setup");
+            }).catch(()=>localStorage.removeItem('bee_room_session'));
+          };
+          if (window.FIREBASE_OK) rejoin();
+          else window.addEventListener('firebase-ready', rejoin, {once:true});
+        } else {
+          localStorage.removeItem('bee_room_session');
+        }
+      }
+    } catch(e) { localStorage.removeItem('bee_room_session'); }
+
     if (window.FIREBASE_OK) { ensureMasterExists().catch(console.error); return; }
     const onReady = () => { ensureMasterExists().catch(console.error); setScreen(s => s); };
     window.addEventListener('firebase-ready', onReady);
@@ -1031,6 +1114,8 @@ function App() {
     const res = await loginOperator(operLogin.username, operLogin.password);
     if (res.ok) {
       setAdminUser(res.user);
+      // Persist session for PWA — survives close/reopen
+      try{ localStorage.setItem('bee_admin_session', JSON.stringify({user:res.user, ts:Date.now()})); }catch(e){}
       if (res.user.type==="master") {
         const users = await loadAdminUsers();
         setAdminUsers(users);
@@ -1045,6 +1130,8 @@ function App() {
   };
 
   const doAdminLogout = async () => {
+    try{ localStorage.removeItem('bee_admin_session'); }catch(e){}
+    try{ localStorage.removeItem('bee_room_session'); }catch(e){}
     setAdminUser(null); setShowAdmin(false); setAdminView("login"); setOperLogin({username:"",password:""});
   };
 
@@ -1090,6 +1177,44 @@ function App() {
   };
 
   /* ── CREATE ROOM ── */
+
+  /* Load user's rooms when admin logs in */
+  useEffect(()=>{
+    if(!adminUser?.username||!window.FIREBASE_OK) return;
+    const ref=window.rtdb.ref("spellingbee/userRooms/"+adminUser.username);
+    ref.on("value",snap=>{
+      if(!snap.val()){setUserRooms([]);return;}
+      const rooms=Object.entries(snap.val()).map(([id,d])=>({id,...d}))
+        .sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+      setUserRooms(rooms);
+    });
+    return ()=>ref.off();
+  },[adminUser?.username]);
+
+
+  const doCloseRoom = async (roomId) => {
+    if(!confirm("¿Cerrar la sala "+roomId+"? Los datos se conservarán.")) return;
+    await window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").update({phase:"archived"});
+    await window.rtdb.ref("spellingbee/userRooms/"+(adminUser?.username||"_")+"/"+roomId).update({status:"closed"});
+  };
+
+  const doReenterRoom = (roomId) => {
+    setRoomId(roomId);
+    roomRef.current = roomId;
+    sessionStorage.setItem("creator-"+roomId,"1");
+    window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").once("value").then(snap=>{
+      const s=fixArrays(snap.val());
+      if(!s){alert("Sala no encontrada");return;}
+      setGs(s);
+      setRole("mc");
+      setNameIn(adminUser?.username||"Configurador");
+      if(s.phase==="setup") setScreen("setup");
+      else if(s.phase==="competition") setScreen("competition");
+      else if(s.phase==="archived") alert("Esta sala ya fue cerrada.");
+      else setScreen("setup");
+    });
+  };
+
   const doCreateRoom = async () => {
     if (!inst.trim()) return;
     if (!window.FIREBASE_OK) {
@@ -1110,7 +1235,18 @@ function App() {
     await window.rtdb.ref("spellingbee/rooms/"+newId+"/state").set(ns);
     sessionStorage.setItem("creator-"+newId, "1");
     window.history.pushState({}, "", window.location.pathname+"?room="+newId);
-    setRoomId(newId); roomRef.current = newId; setGs(ns); setScreen("share-link");
+    // Auto-login creator as MC and go straight to config
+      const mcName = adminUser?.username || "Configurador";
+      const ns2 = {...ns, mc:{name:mcName, ts:Date.now()}, createdBy:adminUser?.username||""};
+      window.rtdb.ref("spellingbee/rooms/"+newId+"/state").update({mc:{name:mcName,ts:Date.now()},createdBy:adminUser?.username||""});
+      // Track room per user for home listing
+      window.rtdb.ref("spellingbee/userRooms/"+(adminUser?.username||"_")+"/"+newId).set({
+        institution: inst.trim(), createdAt: Date.now(), status:"setup"
+      });
+      sessionStorage.setItem("creator-"+newId,"1");
+      setRole("mc"); setNameIn(mcName);
+      setRoomId(newId); roomRef.current = newId; setGs(ns2);
+      setScreen("setup");
   };
 
   const doJoinByCode = () => {
@@ -1364,6 +1500,7 @@ function App() {
   /* ── GAME ── */
   const doSpin = () => {
     const s=gsRef.current; if(!s) return;
+    const cfg2=STAGES[s.stage]; if(!cfg2||!s.banks?.[cfg2.bank]?.length) return;
     const active=s.contestants.filter(c=>c.active);
     const cur=active[s.cIdx]; if(!cur) return;
     const cfg=STAGES[s.stage];
@@ -1802,13 +1939,53 @@ function App() {
         </div>
       )}
 
+      {/* ─── Mis salas ─── */}
+      {adminUser && userRooms.length>0 && (
+        <div style={{maxWidth:560,width:"100%"}}>
+          <p style={{fontSize:".72rem",color:"#4B5A78",letterSpacing:"1.5px",fontWeight:700,marginBottom:8}}>MIS SALAS</p>
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {userRooms.map(r=>{
+              const isActive=r.status!=="closed";
+              const date=r.createdAt?new Date(r.createdAt).toLocaleDateString("es-SV",{day:"2-digit",month:"2-digit",year:"numeric"}):"-";
+              return(
+                <div key={r.id} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 13px",background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.08)",borderRadius:10,flexWrap:"wrap"}}>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontWeight:600,fontSize:".84rem",color:isActive?"#E8EDF8":"#4B5A78",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.institution||"Sin nombre"}</div>
+                    <div style={{fontSize:".7rem",color:"#2D3A55",display:"flex",gap:8,marginTop:2}}>
+                      <span style={{fontFamily:"monospace",color:"#a78bfa"}}>{r.id}</span>
+                      <span>{date}</span>
+                    </div>
+                  </div>
+                  <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                    <span style={{padding:"2px 8px",borderRadius:10,fontSize:".68rem",fontWeight:600,
+                      background:isActive?"rgba(34,197,94,.12)":"rgba(100,100,100,.12)",
+                      color:isActive?"#22c55e":"#4B5A78"}}>
+                      {r.status==="closed"?"Cerrada":r.status==="setup"?"Config":"Activa"}
+                    </span>
+                    {isActive && (
+                      <button className="btn btn-ghost" style={{padding:"3px 10px",fontSize:".72rem",color:"#E8A200",borderColor:"rgba(232,162,0,.3)"}}
+                        onClick={()=>doReenterRoom(r.id)}>↩ Reingresar</button>
+                    )}
+                    {isActive && (
+                      <button className="btn btn-ghost" style={{padding:"3px 8px",fontSize:".72rem",color:"#ef4444",borderColor:"rgba(239,68,68,.2)"}}
+                        onClick={()=>doCloseRoom(r.id)}>✕ Cerrar</button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Admin status + button */}
       <div style={{display:"flex",alignItems:"center",gap:10,marginTop:4}}>
         {adminUser ? (
           <div style={{display:"flex",alignItems:"center",gap:8,padding:"5px 12px",background:"rgba(34,197,94,.1)",border:"1px solid rgba(34,197,94,.25)",borderRadius:16}}>
             <span style={{fontSize:".72rem",color:"#22c55e"}}>
-              {adminUser.type==="master"?"👑 Maestro: "+adminUser.username:"⚙️ "+adminUser.username+" · "+adminUser.activeRooms+"/"+adminUser.roomLimit+" salas"}
+              {adminUser.type==="master"?"👑 Maestro: "+adminUser.username:"⚙️ "+adminUser.username+(adminUser.activeRooms!==undefined?" · "+adminUser.activeRooms+"/"+adminUser.roomLimit+" salas":"")}
             </span>
+            <span style={{fontSize:".65rem",color:"#2D3A55",marginLeft:2}}>📱 sesión activa</span>
             <button className="btn btn-ghost" style={{padding:"2px 8px",fontSize:".68rem"}} onClick={doAdminLogout}>Salir</button>
             {adminUser.type==="master" && <button className="btn btn-ghost" style={{padding:"2px 8px",fontSize:".68rem"}} onClick={()=>{setAdminView("dashboard");setShowAdmin(true);}}>Panel</button>}
           </div>
@@ -2021,13 +2198,12 @@ function App() {
             </p>
             <button className="btn btn-gold" style={{width:"100%",padding:12,marginBottom:12,fontSize:".9rem",display:"flex",alignItems:"center",justifyContent:"center",gap:8}}
               onClick={()=>{
-                setEditBanks({
-                  basic:BUILT_IN_BANKS.basic,
-                  intermediate:BUILT_IN_BANKS.intermediate,
-                  advanced:BUILT_IN_BANKS.advanced
-                });
-                setTab("banks");
-                setStatus("✅ Banco Macmillan 2026 listo — "+BUILT_IN_BANKS.basic.length+" básicas · "+BUILT_IN_BANKS.intermediate.length+" intermedias · "+BUILT_IN_BANKS.advanced.length+" avanzadas. Revisa y guarda.");
+                const banks={basic:BUILT_IN_BANKS.basic,intermediate:BUILT_IN_BANKS.intermediate,advanced:BUILT_IN_BANKS.advanced};
+                setEditBanks(banks);
+                // Auto-save to Firebase and advance to contestants
+                upd(prev=>({...prev,banks}));
+                setStatus("✅ Banco Macmillan 2026 cargado y guardado automáticamente.");
+                setTimeout(()=>setTab("contestants"),400);
               }}>
               🐝 Cargar banco Macmillan 2026
               <span style={{fontSize:".74rem",opacity:.7,fontWeight:400}}>({BUILT_IN_BANKS.basic.length+BUILT_IN_BANKS.intermediate.length+BUILT_IN_BANKS.advanced.length} palabras)</span>
@@ -2127,11 +2303,11 @@ function App() {
             {gs?.contestants?.length>0 && (
               <div style={{marginTop:14}}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-                  <p style={{color:"#4B5A78",fontSize:".72rem",fontWeight:700,letterSpacing:".05em"}}>{gs.contestants.length} CONCURSANTES {gs.contestantsConfirmed?"✅ CONFIRMADOS":"— SIN CONFIRMAR"}</p>
+                  <p style={{color:"#4B5A78",fontSize:".72rem",fontWeight:700,letterSpacing:".05em"}}>{(Array.isArray(gs?.contestants)?gs.contestants:[]).length} CONCURSANTES {gs.contestantsConfirmed?"✅ CONFIRMADOS":"— SIN CONFIRMAR"}</p>
                   {gs.contestantsConfirmed && <button className="btn btn-ghost" style={{padding:"3px 10px",fontSize:".72rem"}} onClick={()=>upd(prev=>({...prev,contestantsConfirmed:false}))}>✏️ Editar</button>}
                 </div>
                 <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:240,overflowY:"auto"}}>
-                  {gs.contestants.map((c,i)=>(
+                  {(Array.isArray(gs?.contestants)?gs.contestants:[]).map((c,i)=>(
                     <div key={c.id} style={{display:"flex",alignItems:"center",gap:7,padding:"6px 10px",background:"rgba(255,255,255,.04)",borderRadius:8}}>
                       <span style={{color:"#4B5A78",fontSize:".72rem",width:20,textAlign:"right",flexShrink:0}}>{i+1}</span>
                       {!gs.contestantsConfirmed ? (
@@ -2288,7 +2464,13 @@ function App() {
           </span>
           {(isMC||isCreator)&&<span style={{fontSize:".68rem",color:"#2D3A55",marginLeft:8}}>{active.length} activos</span>}
         </div>
-        <div style={{color:"#4B5A78",fontSize:".76rem"}}>{isMC?(gs?.mc?.name||"Maestro de Ceremonia"):isPresenter?(gs?.presenter?.name||"Presentador"):myJudge?.name||"Jurado"}</div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{color:"#4B5A78",fontSize:".76rem"}}>{isMC?(gs?.mc?.name||"Maestro de Ceremonia"):isPresenter?(gs?.presenter?.name||"Presentador"):myJudge?.name||"Jurado"}</span>
+          <span style={{fontSize:".62rem",color:"#2D3A55",padding:"1px 6px",background:"rgba(34,197,94,.06)",borderRadius:8}} title={"Dispositivo: "+DEVICE_ID}>🔒</span>
+          {(isMC||isCreator) && (
+            <button className="btn btn-ghost" style={{fontSize:".7rem",padding:"4px 10px"}} onClick={()=>setScreen("setup")}>⚙ Config</button>
+          )}
+        </div>
       </div>
 
       {/* Dispute indicator */}
@@ -2627,7 +2809,7 @@ function App() {
                     ✅ PARTICIPANTES QUE AVANZAN A {nextCfg?.label?.toUpperCase()||"LA SIGUIENTE ETAPA"}
                   </p>
                   {gs.advancing.map(id=>{
-                    const c=gs.contestants.find(x=>x.id===id);
+                    const c=(Array.isArray(gs?.contestants)?gs.contestants:[]).find(x=>x.id===id);
                     return c?(<div key={id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",background:"rgba(34,197,94,.1)",borderRadius:10,marginBottom:6,border:"1px solid rgba(34,197,94,.25)"}}>
                       <span style={{color:"#22c55e",fontSize:"1.1rem"}}>✅</span>
                       <span style={{color:"#E8EDF8",fontWeight:600}}>{c.name}</span>
@@ -2741,11 +2923,10 @@ root.render(<ErrorBoundary><App /></ErrorBoundary>);
 
 <script>
 (function(){
-  if('serviceWorker' in navigator){
+  var _swHost=location.hostname;
+  if('serviceWorker' in navigator && !_swHost.includes('claudeusercontent') && _swHost!=='localhost' && _swHost!=='127.0.0.1'){
     window.addEventListener('load',function(){
-      navigator.serviceWorker.register('/sw.js',{scope:'/'})
-        .then(function(r){console.log('SW:',r.scope);})
-        .catch(function(e){console.warn('SW err:',e);});
+      navigator.serviceWorker.register('/sw.js',{scope:'/'}).catch(function(){});
     });
   }
   var installed=window.matchMedia('(display-mode:standalone)').matches||navigator.standalone===true;
