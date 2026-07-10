@@ -491,9 +491,10 @@ function getScore(scores, stage, cId) {
 }
 function rankActive(contestants, scores, stage) {
   if(!contestants||!Array.isArray(contestants)) return [];
+  // Ties keep the ORDER THE CONTESTANTS WERE ENTERED (never alphabetical).
   return contestants.filter(c=>c.active)
-    .map(c=>({...c,...getScore(scores,stage,c.id)}))
-    .sort((a,b)=>b.correct-a.correct||a.name.localeCompare(b.name));
+    .map((c,i)=>({...c,...getScore(scores,stage,c.id),_ord:i}))
+    .sort((a,b)=>b.correct-a.correct||a._ord-b._ord);
 }
 function canResolveTop3(r) {
   if (!r.length) return false;
@@ -1127,7 +1128,12 @@ function App() {
           window.rtdb.ref("spellingbee/rooms/"+rid+"/state/phase").set("archived");
           setScreen("room-closed"); return;
         }
-        setGs(s); setScreen("login");
+        // If a saved session exists for THIS room, let the restore effect set role + screen
+        // (avoids a cold reload racing the user onto the login screen).
+        let hasSession=false;
+        try{ const rs=localStorage.getItem('bee_room_session'); if(rs){const ss=JSON.parse(rs); hasSession=!!(ss&&ss.roomId===rid&&ss.role&&(Date.now()-(ss.ts||0)<8*3600*1000));} }catch(e){}
+        setGs(s);
+        if(!hasSession) setScreen("login");
       }).catch(() => setScreen("room-not-found"));
     };
     if (!window.FIREBASE_OK) {
@@ -1169,6 +1175,7 @@ function App() {
         localStorage.setItem('bee_room_session', JSON.stringify({
           roomId, role, nameIn, screen,
           deviceId: DEVICE_ID,
+          creator: !!sessionStorage.getItem("creator-"+roomId),
           ts: Date.now()
         }));
       }catch(e){}
@@ -1206,7 +1213,7 @@ function App() {
     try {
       const rs = localStorage.getItem('bee_room_session');
       if (rs) {
-        const {roomId:rid, role:rl, nameIn:nm, ts} = JSON.parse(rs);
+        const {roomId:rid, role:rl, nameIn:nm, creator:cr, ts} = JSON.parse(rs);
         const EIGHT_HOURS = 8 * 60 * 60 * 1000;
         if (rid && rl && Date.now() - ts < EIGHT_HOURS) {
           // Wait for Firebase then rejoin
@@ -1221,14 +1228,13 @@ function App() {
               roomRef.current = rid;
               setRole(rl);
               setNameIn(nm || "");
-              if (rl === "mc" || rl === "presenter" || rl === "config") {
-                sessionStorage.setItem("creator-"+rid, "1");
-              }
-              // Navigate to correct screen
+              // Only the ACTUAL creator regains creator powers (cr came from their own session).
+              if (cr) { sessionStorage.setItem("creator-"+rid, "1"); }
+              // Navigate to correct screen (a plain judge/presenter waits; creator or MC configures)
               if (s.phase==="competition")      setScreen("competition");
-              else if (s.phase==="setup")       setScreen("setup");
+              else if (s.phase==="setup")       setScreen((cr || rl==="mc") ? "setup" : "setup-wait");
               else if (s.phase==="results")     setScreen("results");
-              else                              setScreen("setup");
+              else                              setScreen((cr || rl==="mc") ? "setup" : "setup-wait");
             }).catch(()=>localStorage.removeItem('bee_room_session'));
           };
           if (window.FIREBASE_OK) rejoin();
@@ -1433,6 +1439,45 @@ function App() {
     roomRef.current = null; setRoomId(null);
     window.history.pushState({},"",window.location.pathname);
     setScreen("landing");
+  };
+
+  /* Creator/organizer picks their OWN role: stay organizer, or take Judge / MC / Presenter.
+     Vacates any seat they currently hold before taking the new one. Merges seats from the
+     LATEST state inside the updater so a judge joining concurrently is never clobbered. */
+  const doSetMyRole = (choice) => {
+    const s0 = gsRef.current || gs; if(!s0) return;
+    // Don't allow seat changes while a round is actually running (would orphan ready/vote tallies).
+    if (s0.phase==="competition" && s0.wordPhase && s0.wordPhase!=="idle") {
+      alert("No puedes cambiar de rol con una ronda en curso. Espera a que termine el concurso o la etapa.");
+      return;
+    }
+    const name = (nameIn||"").trim() || (adminUser?.username||"");
+    if (choice!=="config" && !name) { alert("Escribe tu nombre antes de tomar un rol."); return; }
+    // Pre-flight occupancy checks against the freshest snapshot
+    if (choice==="mc" && s0.mc?.name && role!=="mc") { alert("El Maestro de Ceremonia ya está ocupado por "+s0.mc.name+"."); return; }
+    if (choice==="presenter" && s0.presenter?.name && role!=="presenter") { alert("El Presentador ya está ocupado por "+s0.presenter.name+"."); return; }
+    let assignedJudgeId = null;
+    if (choice==="judge") {
+      const others = (s0.judges||[]).filter(j=>j.id!==role).map(j=>j.id);
+      const maxSlots = ["J1","J2","J3","J4","J5","J6","J7","J8","J9","J10"].slice(0,s0.judgeCount||3);
+      assignedJudgeId = maxSlots.find(id=>!others.includes(id));
+      if(!assignedJudgeId){ alert("No hay lugares de jurado libres. Sube el número de jurados en la pestaña Jurados."); return; }
+    }
+    upd(prev=>{
+      let judges = (prev.judges||[]).filter(j=>j.id!==role); // vacate MY judge seat only; keep others
+      let mc = (role==="mc") ? {name:"",ts:0} : (prev.mc||{name:"",ts:0});
+      let presenter = (role==="presenter") ? {name:"",ts:0} : (prev.presenter||{name:"",ts:0});
+      const judgesReady = {...(prev.judgesReady||{})}; delete judgesReady[role]; // clear my stale "ready"
+      if (choice==="mc") mc = {name, ts:Date.now()};
+      else if (choice==="presenter") presenter = {name, ts:Date.now()};
+      else if (choice==="judge") {
+        const order = Math.max(0, ...judges.map(j=>j.order||0)) + 1;
+        judges = [...judges, {id:assignedJudgeId, name, order, ts:Date.now()}];
+      }
+      return {...prev, mc, presenter, judges, judgesReady};
+    });
+    setRole(choice==="judge" ? assignedJudgeId : choice==="mc" ? "mc" : choice==="presenter" ? "presenter" : "config");
+    if(name && nameIn!==name) setNameIn(name);
   };
 
   const doCreateRoom = async () => {
@@ -1707,6 +1752,26 @@ function App() {
       currentWords:[],wordJudgments:{},discrepancies:[],judgesReady:{}}));
   },[]);
 
+  /* Judges-only rooms auto-begin: with NO MC/presenter, once all expected judges
+     have joined the contest starts by itself — no configurator press required. */
+  useEffect(()=>{
+    const g=gs;
+    if(screen!=="competition"||!g) return;
+    // Only the pre-contest idle (NOT the between-stages results view, which is also
+    // wordPhase "idle" but with stageComplete=true).
+    if(g.phase!=="competition"||g.wordPhase!=="idle"||g.stageComplete) return;
+    const noHostNow=!(g.mc&&g.mc.name)&&!(g.presenter&&g.presenter.name);
+    if(!noHostNow) return;
+    const judgesArr=g.judges||[];
+    const needed=g.judgeCount||3;
+    if(judgesArr.length<2||judgesArr.length<needed) return;
+    // Only ONE client triggers (avoids duplicate writes): creator or the first judge.
+    const primaryId=(judgesArr.slice().sort((a,b)=>(a.order||0)-(b.order||0))[0]||{}).id;
+    const amCreator=!!sessionStorage.getItem("creator-"+(g.roomId||roomId||""));
+    if(!(amCreator||role===primaryId)) return;
+    doStartContestants();
+  },[screen, gs?.phase, gs?.wordPhase, gs?.stageComplete, (gs?.judges||[]).length, gs?.judgeCount, gs?.mc?.name, gs?.presenter?.name, role, roomId, doStartContestants]);
+
   const doConfirmContestants = () => {
     upd(prev=>({...prev, contestantsConfirmed:true}));
   };
@@ -1915,11 +1980,12 @@ function App() {
   const isCreator   = !!sessionStorage.getItem("creator-"+roomId);
   const myJudge     = (gs?.judges||[]).find(j=>j.id===role);
   const numJudges   = gs?.judgeCount||3;
+  const seatedJudges = (gs?.judges||[]).length || numJudges; // actual count that gates ready/vote advance
   /* Game controller: MC → Presenter → organizer(creator) → first Judge (order 1).
      Lets a judges-only room run with no MC/presenter at all. */
   const primaryJudgeId = ((gs?.judges||[]).slice().sort((a,b)=>(a.order||0)-(b.order||0))[0]||{}).id;
   const noHost      = !gs?.mc?.name && !gs?.presenter?.name;
-  const isController = isMC || isPresenter || isCreator || (noHost && isJudge && role===primaryJudgeId);
+  const isController = isMC || isPresenter || (isCreator && !isJudge) || (noHost && isJudge && role===primaryJudgeId);
   const allJudgesReady = (gs?.judges||[]).length>=numJudges && 
     (gs?.judges||[]).every(j=>(gs?.judgesReady||{})[j.id]);
   const active=gs?.contestants?.filter(c=>c.active)||[];
@@ -2498,6 +2564,37 @@ function App() {
         <p style={{color:"#a78bfa",fontSize:".74rem",lineHeight:1.5}}>💡 Puedes dejar la sala lista con solo el <strong>banco de palabras</strong> y el número de jurados. Los <strong>nombres de los concursantes</strong> y el <strong>logo</strong> se pueden agregar el día del evento antes de iniciar. La silla de <strong>Maestro de Ceremonia</strong> queda libre para quien dirija.</p>
       </div>
 
+      {/* Creator can take a playing role for themselves */}
+      <div className="card" style={{marginBottom:14,borderColor:"rgba(232,162,0,.35)"}}>
+        <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:6}}>🙋 MI ROL EN EL CONCURSO</p>
+        <p style={{color:"#4B5A78",fontSize:".74rem",marginBottom:10}}>
+          Puedes solo organizar, o tomar tú mismo un rol para participar.{" "}
+          <strong style={{color:"#E8EDF8"}}>{isJudge?("Actual: Jurado ("+role+").") : isMC?"Actual: Maestro de Ceremonia." : isPresenter?"Actual: Presentador." : "Actual: solo organizador."}</strong>
+        </p>
+        <input className="field" placeholder="Tu nombre (para tu rol)" value={nameIn} onChange={e=>setNameIn(e.target.value)} style={{marginBottom:10,fontSize:".9rem"}}/>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+          {[
+            {id:"config",icon:"🛠",l:"Solo organizador"},
+            {id:"judge",icon:"⚖️",l:"Jurado"},
+            {id:"mc",icon:"🎙",l:"M. de Ceremonia"},
+            {id:"presenter",icon:"🎤",l:"Presentador"},
+          ].map(r=>{
+            const activeRole=(r.id==="config"&&role==="config")||(r.id==="mc"&&isMC)||(r.id==="presenter"&&isPresenter)||(r.id==="judge"&&isJudge);
+            return (
+              <button key={r.id} className="btn" onClick={()=>doSetMyRole(r.id)} style={{
+                flexDirection:"row",gap:8,padding:"10px 12px",fontSize:".84rem",justifyContent:"flex-start",
+                background:activeRole?"#E8A200":"rgba(255,255,255,.05)",
+                color:activeRole?"#0C1628":"#E8EDF8",
+                border:activeRole?"none":"1px solid rgba(255,255,255,.1)"}}>
+                <span style={{fontSize:"1.1rem"}}>{r.icon}</span>
+                <span style={{fontWeight:700}}>{r.l}{r.id==="judge"&&isJudge?" ("+role+")":""}</span>
+              </button>
+            );
+          })}
+        </div>
+        <p style={{color:"#2D3A55",fontSize:".7rem",marginTop:8}}>Si tomas un rol, tu nombre aparece en las actas y la silla queda ocupada. Puedes volver a "Solo organizador" cuando quieras.</p>
+      </div>
+
       {tab==="judges" && (
         <div className="card fade-up" style={{marginBottom:14}}>
           <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:4}}>👥 JURADOS CONECTADOS</p>
@@ -2509,7 +2606,7 @@ function App() {
               ? <span style={{fontSize:".76rem",background:"rgba(34,197,94,.15)",color:"#22c55e",padding:"2px 9px",borderRadius:10,border:"1px solid rgba(34,197,94,.3)"}}>✅ {gs.mc.name}</span>
               : <span style={{fontSize:".76rem",color:"#3B4B6A"}}>Sin conectar</span>}
           </div>
-          {[0,1,2].map(i=>{
+          {Array.from({length:Math.max(3,numJudges)}).map((_,i)=>{
             const jj=(gs?.judges||[])[i];
             return(<div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",background:"rgba(255,255,255,.04)",borderRadius:10,marginBottom:6}}>
               <span style={{fontSize:"1.1rem"}}>⚖️</span>
@@ -2889,7 +2986,13 @@ function App() {
           {(!gs.wordPhase||gs.wordPhase==="idle") && (
             <div style={{textAlign:"center"}}>
               <p style={{color:"#4B5A78",marginBottom:18}}>El concurso está listo para comenzar.</p>
-              {isController && <button className="btn btn-gold" style={{padding:"12px 32px"}} onClick={doStartContestants}>▶ Iniciar Concurso</button>}
+              {isController && <button className="btn btn-gold" style={{padding:"12px 32px",opacity:(gs?.judges||[]).length===0?.5:1}} disabled={(gs?.judges||[]).length===0} onClick={doStartContestants}>▶ Iniciar Concurso</button>}
+              {isController && (gs?.judges||[]).length===0 && (
+                <p style={{color:"#f59e0b",fontSize:".78rem",marginTop:8}}>Se necesita al menos 1 jurado conectado para iniciar.</p>
+              )}
+              {noHost && (gs?.judges||[]).length>0 && (gs?.judges||[]).length < numJudges && (
+                <p style={{color:"#2D3A55",fontSize:".8rem",marginTop:10}}>Iniciará automáticamente al conectarse los {numJudges} jurados ({(gs?.judges||[]).length}/{numJudges}).</p>
+              )}
               {!isController&&<p style={{color:"#2D3A55"}}>Esperando a quien dirige el concurso...</p>}
             </div>
           )}
@@ -2913,16 +3016,16 @@ function App() {
                     {(gs.judgesReady||{})[role]?"✅ Listo":"✋ Listo — presiona cuando estés preparado"}
                   </button>
                   <p style={{color:"#4B5A78",fontSize:".72rem",marginTop:8}}>
-                    Listos: {Object.keys(gs.judgesReady||{}).length}/{numJudges}
+                    Listos: {Object.keys(gs.judgesReady||{}).length}/{seatedJudges}
                   </p>
                 </>
               )}
-              {(isMC||isCreator) && (
+              {(isMC||isCreator) && !isJudge && (
                 <>
                   <p style={{color:"#4B5A78",fontSize:".8rem",marginBottom:6}}>En turno:</p>
                   <p className="word-font" style={{fontSize:"2rem",color:"#E8EDF8"}}>{cur.name}</p>
                   <p style={{color:"#2D3A55",fontSize:".8rem",marginTop:10}}>
-                    Esperando que los {numJudges} jurados confirmen listos... ({Object.keys(gs.judgesReady||{}).length}/{numJudges})
+                    Esperando que los {seatedJudges} jurados confirmen listos... ({Object.keys(gs.judgesReady||{}).length}/{seatedJudges})
                   </p>
                 </>
               )}
@@ -3081,7 +3184,7 @@ function App() {
                     )}
                   </div>
                 )}
-                {!isJudge && <p style={{color:"#4B5A78"}}>{totalVotes}/{numJudges} jurados calificaron</p>}
+                {!isJudge && <p style={{color:"#4B5A78"}}>{totalVotes}/{seatedJudges} jurados calificaron</p>}
               </div>
             );
           })()}
