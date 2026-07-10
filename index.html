@@ -107,6 +107,18 @@ function fixArrays(data) {
       });
     });
   }
+  // Firebase drops empty arrays/objects — re-seed them so no spread ([...x]) ever
+  // hits undefined (root cause of "undefined is not iterable").
+  if(!Array.isArray(data.history)) data.history=[];
+  if(!Array.isArray(data.discrepancies)) data.discrepancies=[];
+  if(!Array.isArray(data.advancing)) data.advancing=[];
+  if(!Array.isArray(data.currentWords)) data.currentWords=[];
+  if(!Array.isArray(data.contestants)) data.contestants=[];
+  if(!Array.isArray(data.judges)) data.judges=[];
+  if(!data.judgesReady||typeof data.judgesReady!=='object') data.judgesReady={};
+  if(!data.wordJudgments||typeof data.wordJudgments!=='object') data.wordJudgments={};
+  if(!data.usedWords||typeof data.usedWords!=='object') data.usedWords={basic:[],intermediate:[],advanced:[]};
+  ['basic','intermediate','advanced'].forEach(k=>{ if(!Array.isArray(data.usedWords[k])) data.usedWords[k]=toArr(data.usedWords[k]); });
   return data;
 }
 
@@ -1716,8 +1728,8 @@ function App() {
         const nv=[...pv]; nv[wi]=finalV;
         ns[prev.stage]={...ns[prev.stage],[cur?.id]:{v:nv}};
         const nextWi=wi+1;
-        const isLast=nextWi>=prev.currentWords.length;
-        return {...prev,history:[...prev.history,hEntry],scores:ns,
+        const isLast=nextWi>=(prev.currentWords||[]).length;
+        return {...prev,history:[...(prev.history||[]),hEntry],scores:ns,
           wordPhase:isLast?"stage_end":"word_show",
           currentWordIdx:isLast?wi:nextWi,
           judgesReady:isLast?{}:prev.judgesReady};
@@ -1725,7 +1737,7 @@ function App() {
       const disc={wordIdx:wi,word:word?.word,phonetic:word?.phonetic,
         votes:Object.fromEntries(seatedVotes.map(([jid,v])=>[jid,v.verdict])),
         resolved:false,final:null};
-      return {...prev,discrepancies:[...prev.discrepancies,disc],wordPhase:"deliberation"};
+      return {...prev,discrepancies:[...(prev.discrepancies||[]),disc],wordPhase:"deliberation"};
     });
   },[]);
 
