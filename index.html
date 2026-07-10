@@ -749,7 +749,7 @@ function printReport(gs, role, onDone) {
 ════════════════════════════════════════════════════ */
 const ADMIN_PATH   = "spellingbee/admin";
 const ROOMS_PATH   = "spellingbee/rooms";
-const DEFAULT_PWD  = "jd-reset-2025";    // contraseña por defecto al crear/resetear
+const DEFAULT_PWD  = "jd-reset-2025";
 
 /* Hashing SHA-256 con Web Crypto */
 async function hashPwd(pwd) {
@@ -816,16 +816,21 @@ async function loginOperator(username, password) {
   return {ok:true, user:{type:"operator",username,roomLimit:u.roomLimit||6,activeRooms:active}};
 }
 
-/* Seed master user on first load */
+/* Check if master user exists — if not, show first-run setup */
 async function ensureMasterExists() {
   const snap = await window.rtdb.ref(ADMIN_PATH+"/master").once("value");
-  if (!snap.val()) {
-    await window.rtdb.ref(ADMIN_PATH+"/master").set({
-      username:"dportillo",
-      passwordHash:"55f4662ff1f5fa7f28ea4c0edfa4a7c2d9663609bade88d5f951e2f8fe390344",
-      createdAt:Date.now()
-    });
-  }
+  window._needsMasterSetup = !snap.val();
+}
+
+/* Create master user (first-run only) */
+async function createMasterUser(username, password) {
+  const existing = await window.rtdb.ref(ADMIN_PATH+"/master").once("value");
+  if (existing.val()) throw new Error("El usuario maestro ya existe.");
+  const pwdHash = await hashPwd(password);
+  await window.rtdb.ref(ADMIN_PATH+"/master").set({
+    username, passwordHash:pwdHash, createdAt:Date.now()
+  });
+  window._needsMasterSetup = false;
 }
 
 /* Login master with username/password */
@@ -836,6 +841,15 @@ async function loginMaster(username, password) {
   const hash = await hashPwd(password);
   if (hash !== m.passwordHash) return {ok:false, err:"Contraseña incorrecta"};
   return {ok:true};
+}
+
+/* ── Bee Logo SVG (Google Noto Emoji) ── */
+const BEE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%"><path d="M0 0 C4.956 4.131 7.418 8.104 8.176 14.516 C9.178 44.68 -13.229 77.41 -27.609 102.449 C-31.18 108.672 -34.639 114.955 -38.092 121.244 C-44.422 132.772 -50.854 144.235 -57.416 155.633 C-59.321 158.95 -61.218 162.271 -63.113 165.594 C-63.466 166.211 -63.818 166.829 -64.181 167.465 C-65.582 169.92 -66.983 172.376 -68.384 174.832 C-69.981 177.631 -71.581 180.429 -73.186 183.223 C-74.478 185.479 -75.759 187.739 -77.029 190.007 C-77.652 191.107 -78.276 192.207 -78.918 193.34 C-79.475 194.332 -80.032 195.325 -80.606 196.347 C-81.087 197.058 -81.567 197.768 -82.063 198.5 C-82.723 198.5 -83.383 198.5 -84.063 198.5 C-84.393 197.84 -84.723 197.18 -85.063 196.5 C-89.985 196.942 -93 199.469 -96.688 202.5 C-102.709 207.382 -102.709 207.382 -106.063 208.5 C-112.345 200.77 -113.901 193.346 -115.188 183.688 C-117.247 167.504 -117.247 167.504 -123.839 152.714 C-131.206 140.945 -129.878 128.322 -129.563 114.875 C-129.529 112.388 -129.498 109.9 -129.47 107.413 C-129.394 101.464 -129.276 95.518 -129.135 89.571 C-129.072 86.891 -129.016 84.211 -128.966 81.531 C-127.94 28.624 -127.94 28.624 -112.875 12.75 C-86.454 -12.033 -30.631 -22.616 0 0 Z" fill="#FD8D00" transform="translate(350.063,45.5)"/><path d="M0 0 C11.977 3.081 22.565 7.733 29.566 18.383 C38.238 34.277 41.339 53.294 44 71 C44.109 71.684 44.218 72.369 44.33 73.074 C44.997 77.928 45.007 82.707 44.93 87.598 C44.916 89.702 44.906 91.807 44.898 93.911 C44.883 95.348 44.849 96.784 44.798 98.219 C44.361 107.061 44.361 107.061 48.34 114.608 C51.142 116.623 53.984 118.327 57 120 C76.217 136.454 86.86 163.192 89 188 C90.862 220.504 81.46 252.253 60 277 C41.631 297.478 16.227 309.357 -11.168 311.215 C-35.766 311.936 -61.422 305.694 -80 289 C-80.919 288.175 -81.838 287.35 -82.785 286.5 C-89.617 280.034 -94.497 273.233 -99 265 C-99.544 264.033 -100.088 263.066 -100.648 262.07 C-111.555 241.641 -113.939 218.775 -111 196 C-112.031 195.959 -113.063 195.918 -114.125 195.875 C-118.984 194.778 -121.15 193.006 -124 189 C-128.871 177.929 -125.668 164.982 -122 154 C-119.155 147.655 -116.294 143.294 -110 140 C-106.379 139.961 -106.379 139.961 -102.563 140.375 C-97.103 140.674 -97.103 140.674 -92.645 137.965 C-90.919 135.378 -89.45 132.748 -88 130 C-85.5 127.313 -85.5 127.313 -83 125 C-82.559 124.505 -82.118 124.01 -81.664 123.5 C-73.49 114.538 -61.444 106.911 -50 103 C-49.01 103 -48.02 103 -47 103 C-55.217 68.095 -55.217 68.095 -77 41 C-81.838 39.404 -86.494 38.579 -91.551 38.035 C-92.986 37.873 -94.422 37.711 -95.857 37.549 C-98.082 37.305 -100.306 37.063 -102.531 36.825 C-123.181 34.597 -123.181 34.597 -130.125 29.875 C-132.399 26.389 -132.661 24.12 -132.43 20.023 C-132 18 -132 18 -130.188 16 C-117.411 10.159 -97.376 13.441 -83.75 15.25 C-82.89 15.359 -82.03 15.468 -81.143 15.581 C-69.099 17.894 -60.817 22.89 -53.524 32.503 C-53.042 33.162 -52.56 33.821 -52.063 34.5 C-51.545 35.204 -51.028 35.907 -50.495 36.632 C-38.713 52.914 -26 76.318 -26 97 C-25.287 96.979 -24.574 96.958 -23.839 96.937 C-8.33 96.543 5.942 97.154 21 101 C21.562 81.417 19.424 62.89 13.634 44.127 C13.048 42.16 12.56 40.164 12.082 38.168 C10.655 33.661 9.285 30.292 5.015 27.877 C-1.107 25.214 -7.545 23.633 -14 22 C-16.931 21.21 -19.856 20.405 -22.779 19.586 C-24.596 19.081 -26.419 18.594 -28.246 18.127 C-32.805 16.909 -36.123 16.004 -39 12 C-40.176 7.381 -40.435 4.173 -38 0 C-29.997 -7.741 -9.837 -2.19 0 0 Z" fill="#FDBA00" transform="translate(148,46)"/><path d="M0 0 C16.458 8.365 26.431 25.081 32.234 42 C38.793 62.306 41.822 86.29 31.965 106.004 C28.546 111.802 24.274 116.517 19.59 121.316 C18.704 122.264 17.819 123.211 16.906 124.188 C9.222 132.278 0.648 138.833 -8.41 145.316 C-7.371 145.813 -6.332 146.309 -5.262 146.82 C12.866 155.604 12.866 155.604 19.293 162.016 C26.257 165.96 37.99 162.741 45.619 162.027 C62.92 160.482 62.92 160.482 66.59 162.316 C65.557 171.908 58.103 178.806 52.09 185.941 C51.626 186.494 51.163 187.046 50.685 187.615 C48.562 190.114 46.433 192.468 44.074 194.754 C39.921 198.68 39.921 198.68 38.324 203.961 C38.593 206.79 39.067 209.524 39.59 212.316 C41.475 238.794 30.878 263.345 14.094 283.281 C5.563 293.029 -4.807 303.364 -16.41 309.316 C-17.4 309.316 -18.39 309.316 -19.41 309.316 C-19.394 307.777 -19.394 307.777 -19.378 306.206 C-19.342 302.303 -19.319 298.4 -19.3 294.497 C-19.29 292.825 -19.277 291.154 -19.259 289.482 C-19.091 273.084 -20.293 257.298 -24.16 241.316 C-24.425 240.208 -24.691 239.099 -24.964 237.956 C-30.266 216.296 -38.352 189.601 -56.242 174.801 C-59.778 174.011 -62.518 175.77 -65.66 177.254 C-82.465 184.658 -100.42 188.901 -118.41 192.316 C-118.41 191.326 -118.41 190.336 -118.41 189.316 C-125.01 188.656 -131.61 187.996 -138.41 187.316 C-138.74 181.376 -139.07 175.436 -139.41 169.316 C-144.222 169.316 -147.786 169.415 -152.348 170.316 C-153.305 170.502 -154.263 170.688 -155.25 170.879 C-156.319 171.095 -156.319 171.095 -157.41 171.316 C-158.658 167.574 -159.025 164.198 -158.41 160.316 C-156.877 157.772 -155.526 155.877 -153.598 153.691 C-152.58 152.47 -151.563 151.249 -150.547 150.027 C-150.024 149.412 -149.501 148.797 -148.962 148.163 C-146.534 145.274 -144.227 142.295 -141.91 139.316 C-140.994 138.149 -140.077 136.983 -139.16 135.816 C-138.706 135.239 -138.253 134.661 -137.785 134.066 C-122.66 114.816 -122.66 114.816 -121.286 113.067 C-120.367 111.898 -119.448 110.728 -118.529 109.558 C-116.276 106.69 -114.022 103.822 -111.766 100.957 C-104.881 92.209 -98.042 83.426 -91.213 74.635 C-89.432 72.344 -87.648 70.054 -85.863 67.766 C-74.835 53.618 -63.849 39.452 -53.342 24.91 C-40.481 7.262 -23.27 -9.582 0 0 Z" fill="#6EA2AF" transform="translate(428.41,92.684)"/><path d="M0 0 C4.956 4.131 7.418 8.104 8.176 14.516 C9.178 44.68 -13.229 77.41 -27.609 102.449 C-31.18 108.672 -34.639 114.955 -38.092 121.244 C-44.422 132.772 -50.854 144.235 -57.416 155.633 C-59.321 158.95 -61.218 162.271 -63.113 165.594 C-63.466 166.211 -63.818 166.829 -64.181 167.465 C-65.582 169.92 -66.983 172.376 -68.384 174.832 C-69.981 177.631 -71.581 180.429 -73.186 183.223 C-74.478 185.479 -75.759 187.739 -77.029 190.007 C-77.652 191.107 -78.276 192.207 -78.918 193.34 C-79.475 194.332 -80.032 195.325 -80.606 196.347 C-81.087 197.058 -81.567 197.768 -82.063 198.5 C-82.723 198.5 -83.383 198.5 -84.063 198.5 C-84.393 197.84 -84.723 197.18 -85.063 196.5 C-89.985 196.942 -93 199.469 -96.688 202.5 C-102.709 207.382 -102.709 207.382 -106.063 208.5 C-112.345 200.77 -113.901 193.346 -115.188 183.688 C-117.247 167.504 -117.247 167.504 -123.839 152.714 C-131.206 140.945 -129.878 128.322 -129.563 114.875 C-129.529 112.388 -129.498 109.9 -129.47 107.413 C-129.394 101.464 -129.276 95.518 -129.135 89.571 C-129.072 86.891 -129.016 84.211 -128.966 81.531 C-127.94 28.624 -127.94 28.624 -112.875 12.75 C-86.454 -12.033 -30.631 -22.616 0 0 Z" fill="#A1C5C9" transform="translate(350.063,45.5)"/><path d="M0 0 C20.688 13.645 29.521 49.144 34.249 71.725 C37.145 86.241 38.041 100.26 38.061 115.048 C38.062 115.762 38.063 116.476 38.064 117.212 C38.064 119.268 38.054 121.324 38.041 123.38 C38.03 125.18 38.03 125.18 38.018 127.016 C37.889 129.877 37.53 132.454 36.873 135.235 C37.533 135.565 38.193 135.895 38.873 136.235 C24.059 145.626 5.758 154.488 -12.127 154.235 C-12.157 152.909 -12.157 152.909 -12.187 151.555 C-13.243 106.589 -16.073 61.538 -40.127 22.235 C-40.927 20.926 -40.927 20.926 -41.744 19.591 C-42.857 17.796 -43.989 16.014 -45.127 14.235 C-44.432 14.028 -43.737 13.82 -43.021 13.606 C-35.775 11.411 -28.568 9.104 -21.377 6.735 C-20.503 6.451 -19.629 6.167 -18.728 5.874 C-13.64 4.187 -8.884 2.271 -4.126 -0.208 C-2.127 -0.765 -2.127 -0.765 0 0 Z" fill="#FBD31E" transform="translate(372.127,266.765)"/><path d="M0 0 C17.363 9.223 28.65 34.245 34.316 51.844 C34.883 53.9 35.425 55.962 35.941 58.031 C36.351 59.582 36.351 59.582 36.77 61.164 C39.38 71.989 40.262 82.943 40.941 94.031 C41.07 95.773 41.07 95.773 41.2 97.55 C42.804 121.145 42.804 121.145 37.344 128.26 C35.526 130.225 33.6 132.029 31.517 133.713 C29.759 135.184 28.201 136.776 26.609 138.426 C22.784 142.291 18.634 145.61 14.316 148.906 C13.21 149.776 13.21 149.776 12.082 150.664 C11.363 151.216 10.643 151.768 9.902 152.336 C8.94 153.078 8.94 153.078 7.958 153.835 C5.634 155.214 3.6 155.64 0.941 156.031 C0.952 155.005 0.962 153.978 0.973 152.92 C1.01 149.018 1.033 145.115 1.051 141.212 C1.061 139.54 1.075 137.869 1.092 136.197 C1.26 119.799 0.058 104.013 -3.809 88.031 C-4.074 86.922 -4.339 85.814 -4.613 84.671 C-9.912 63.019 -17.631 42.784 -32.16 25.527 C-33.975 23.141 -34.471 21.873 -35.059 19.031 C-34.305 18.648 -34.305 18.648 -33.537 18.256 C-23.591 13.167 -14.005 7.961 -4.844 1.551 C-2.059 0.031 -2.059 0.031 0 0 Z" fill="#42433F" transform="translate(408.059,245.969)"/><path d="M0 0 C1.693 2.022 2.978 3.823 4.313 6.063 C4.889 7.003 4.889 7.003 5.478 7.963 C6.681 9.96 7.847 11.973 9 14 C9.355 14.624 9.711 15.248 10.077 15.891 C28.236 48.462 32.268 87.15 32.063 123.813 C32.057 125.391 32.053 126.97 32.049 128.549 C32.038 132.366 32.021 136.183 32 140 C25.438 141.232 19.033 141.184 12.375 141.188 C11.167 141.2 9.959 141.212 8.715 141.225 C-9.492 141.254 -9.492 141.254 -16 138 C-16.015 136.838 -16.029 135.675 -16.044 134.478 C-16.399 104.608 -16.399 104.608 -20 75 C-20.416 71.338 -20.75 67.677 -21 64 C-18.36 63.34 -15.72 62.68 -13 62 C-15.441 55.135 -19.612 49.763 -24 44 C-21.474 40.705 -18.912 37.876 -15.75 35.188 C-14.69 34.281 -14.69 34.281 -13.609 33.355 C-13.078 32.908 -12.547 32.461 -12 32 C-12.291 28.842 -12.983 28.015 -15.434 25.895 C-16.425 25.207 -17.416 24.52 -18.438 23.813 C-19.426 23.118 -20.415 22.423 -21.434 21.707 C-23.851 20.023 -23.851 20.023 -26 19 C-24.455 13.13 -22.141 7.486 -18 3 C-12.582 0.271 -5.92 -2.403 0 0 Z" fill="#43443F" transform="translate(328,282)"/><path d="M0 0 C8.27 4.502 14.092 11.43 17.688 20.188 C20.694 30.767 19.93 43.424 14.75 53.125 C9.333 62.148 0.826 70.103 -9.574 72.707 C-21.294 74.538 -31.861 73.172 -41.625 66.25 C-49.168 60.077 -54.407 51.884 -55.475 42.057 C-56.246 27.779 -54.852 17.381 -45.188 6.188 C-32.268 -5.117 -15.533 -7.334 0 0 Z" fill="#010100" transform="translate(159.25,202.875)"/><path d="M0 0 C11.977 3.081 22.565 7.733 29.566 18.383 C38.236 34.273 41.348 53.296 44 71 C44.106 71.689 44.212 72.378 44.321 73.087 C45.228 79.891 45.151 86.73 45.13 93.582 C45.125 95.666 45.13 97.75 45.137 99.834 C45.154 129.252 45.154 129.252 38.813 136.5 C35.106 138.477 32.112 138.989 28 138 C25.309 135.824 23.545 134.089 22 131 C21.926 129.068 21.917 127.133 21.938 125.199 C21.946 124.005 21.955 122.81 21.964 121.58 C21.976 120.295 21.988 119.011 22 117.688 C22.094 92.629 21.076 68.242 13.634 44.127 C13.048 42.16 12.56 40.164 12.082 38.168 C10.655 33.661 9.285 30.292 5.015 27.877 C-1.107 25.214 -7.545 23.633 -14 22 C-16.931 21.21 -19.856 20.405 -22.779 19.586 C-24.596 19.081 -26.419 18.594 -28.246 18.127 C-32.805 16.909 -36.123 16.004 -39 12 C-40.176 7.381 -40.435 4.173 -38 0 C-29.997 -7.741 -9.837 -2.19 0 0 Z" fill="#848483" transform="translate(148,46)"/><path d="M0 0 C0.86 0.109 1.72 0.218 2.607 0.331 C14.651 2.144 22.933 7.64 30.226 17.253 C30.708 17.912 31.19 18.571 31.688 19.25 C32.205 19.954 32.722 20.657 33.255 21.382 C46.729 40.002 53.772 60.468 58.75 82.75 C56.772 83.236 54.793 83.713 52.813 84.188 C51.71 84.454 50.608 84.721 49.473 84.996 C45.244 85.853 41.041 86.341 36.75 86.75 C36.535 85.951 36.32 85.152 36.098 84.329 C28.284 52.05 28.284 52.05 8.75 26.75 C0.868 22.969 -8.117 22.64 -16.688 21.75 C-39.372 19.387 -39.372 19.387 -46.375 14.625 C-48.649 11.139 -48.911 8.87 -48.68 4.773 C-48.25 2.75 -48.25 2.75 -46.438 0.75 C-33.661 -5.091 -13.626 -1.809 0 0 Z" fill="#848484" transform="translate(64.25,61.25)"/><path d="M0 0 C3.601 1.637 6.289 3.388 8 7 C8.511 13.015 6.794 17.262 3 21.832 C-3.595 28.981 -10.497 35.803 -18 42 C-18.483 42.407 -18.966 42.814 -19.463 43.234 C-37.725 58.565 -61.635 71 -86 71 C-89.681 70.582 -92.229 69.797 -94.875 67.063 C-97.108 62.969 -97.397 59.61 -97 55 C-92.442 46.833 -81.639 44.792 -73.313 42.188 C-54.613 36.108 -40.591 26.571 -26.438 13.129 C-24.066 11.058 -21.721 9.567 -19 8 C-16.957 6.505 -14.963 4.957 -12.965 3.402 C-8.556 0.256 -5.485 -0.481 0 0 Z" fill="#848483" transform="translate(194,376)"/><path d="M0 0 C4.818 0.316 8.154 1.437 11.46 5.05 C14.412 9.852 13.242 15.959 12.244 21.284 C11.44 24.576 10.529 27.815 9.563 31.063 C9.212 32.263 8.861 33.464 8.5 34.7 C3.165 52.361 -3.931 69.496 -11.625 86.25 C-11.918 86.895 -12.212 87.541 -12.514 88.206 C-14.849 93.092 -17.641 97.562 -22.227 100.602 C-25.885 101.811 -29.393 101.789 -33.188 101.25 C-36.344 99.643 -38.382 98.276 -40.563 95.5 C-43.642 84.413 -36.89 73.397 -32.625 63.438 C-29.693 56.521 -26.893 49.575 -24.336 42.512 C-24.099 41.856 -23.861 41.2 -23.617 40.525 C-22.465 37.332 -21.328 34.134 -20.207 30.93 C-12.292 8.72 -12.292 8.72 -4.188 1.25 C-3.188 0.25 -3.188 0.25 0 0 Z" fill="#848483" transform="translate(222.188,385.75)"/><path d="M0 0 C3.191 1.711 4.413 3.8 6 7 C9.27 18.175 9.661 29.698 10.081 41.259 C10.187 44.166 10.31 47.072 10.436 49.979 C10.672 55.651 10.85 61.324 11 67 C11.027 67.924 11.054 68.849 11.082 69.801 C11.153 72.488 11.2 75.175 11.238 77.863 C11.271 79.049 11.271 79.049 11.305 80.259 C11.352 86.886 10.238 93.287 5.938 98.5 C1.856 101.66 -1.993 101.486 -7 101 C-10.722 99.382 -12.899 97.466 -15 94 C-16.26 89.809 -16.209 85.616 -16.281 81.273 C-16.3 80.412 -16.318 79.55 -16.337 78.662 C-16.396 75.9 -16.448 73.137 -16.5 70.375 C-16.713 59.275 -16.989 48.2 -17.649 37.117 C-17.992 31.346 -18.214 25.593 -18.25 19.813 C-18.271 18.951 -18.291 18.089 -18.313 17.201 C-18.351 10.914 -17.739 5.809 -13.148 1.102 C-8.908 -1.073 -4.602 -0.874 0 0 Z" fill="#848483" transform="translate(267,386)"/><path d="M0 0 C0 1.98 0 3.96 0 6 C6.27 6 12.54 6 19 6 C19.391 15.082 19.391 15.082 19 18 C0.142 34.746 -40.682 38.882 -64.883 38.289 C-70.094 37.806 -74.999 37.106 -78.711 33.199 C-80.974 29.339 -80.52 25.337 -80 21 C-78.769 18.045 -77.966 16.602 -75.265 14.919 C-72.471 13.785 -70.01 13.544 -67.004 13.289 C-65.816 13.181 -64.628 13.073 -63.404 12.962 C-62.137 12.851 -60.869 12.74 -59.563 12.625 C-40.034 10.73 -22.276 7.297 -3.822 0.579 C-2 0 -2 0 0 0 Z" fill="#5A6065" transform="translate(152,361)"/><path d="M0 0 C3.3 0 6.6 0 10 0 C12.032 4.064 12.828 7.709 13.563 12.125 C13.688 12.834 13.814 13.543 13.943 14.273 C15.482 23.232 16.152 32.079 16.098 41.164 C16.096 42.082 16.095 43 16.093 43.946 C16.088 46.839 16.075 49.732 16.063 52.625 C16.057 54.603 16.053 56.581 16.049 58.559 C16.038 63.372 16.021 68.186 16 73 C8.004 71.627 0.587 69.915 -7 67 C-8.243 66.563 -9.485 66.126 -10.766 65.676 C-14.56 64.195 -17.804 62.583 -21 60 C-23.027 55.372 -23.579 51 -24 46 C-24.495 44.515 -24.495 44.515 -25 43 C-20.05 41.68 -15.1 40.36 -10 39 C-11.399 34.803 -12.468 31.909 -14.625 28.25 C-17 24.214 -17 24.214 -17 22 C-7.1 21.505 -7.1 21.505 3 21 C2.449 13.834 1.527 7.022 0 0 Z" fill="#FBD31E" transform="translate(296,347)"/><path d="M0 0 C12.25 6.651 22.475 15.37 32.527 24.906 C23.916 32.013 11.288 34.705 0.777 37.781 C-0.813 38.247 -0.813 38.247 -2.435 38.722 C-10.074 40.906 -10.074 40.906 -13.473 40.906 C-15.383 38.816 -15.383 38.816 -17.535 35.969 C-23.833 28.012 -31.072 21.568 -39.473 15.906 C-32.969 9.082 -24.623 5.358 -16.16 1.469 C-15.383 1.102 -14.607 0.736 -13.806 0.358 C-8.344 -2.085 -5.571 -2.464 0 0 Z" fill="#97B084" transform="translate(339.473,240.094)"/><path d="M0 0 C1.152 -0.027 2.304 -0.054 3.491 -0.082 C11.813 0.005 17.367 2.155 24.25 6.75 C25.184 7.365 25.184 7.365 26.137 7.992 C27.599 8.996 29.021 10.058 30.438 11.125 C31.359 11.813 32.281 12.502 33.23 13.211 C33.897 13.719 34.563 14.227 35.25 14.75 C31.468 17.923 27.49 20.555 23.25 23.063 C22.6 23.449 21.95 23.836 21.281 24.234 C3.476 34.75 3.476 34.75 0.25 34.75 C-0.245 35.74 -0.245 35.74 -0.75 36.75 C-1.093 36.3 -1.436 35.85 -1.789 35.387 C-11.346 23.64 -24.337 15.456 -37.75 8.75 C-37.75 8.09 -37.75 7.43 -37.75 6.75 C-25.233 2.614 -13.222 0.127 0 0 Z" fill="#60868D" transform="translate(372.75,230.25)"/><path d="M0 0 C0.66 0.33 1.32 0.66 2 1 C0.43 5.886 -1.261 10.672 -3.155 15.442 C-8.291 28.535 -10.931 42.116 -13 56 C-17.709 55.838 -20.849 55.657 -24.375 52.375 C-29.148 46.875 -29.453 40.462 -29.313 33.449 C-28.234 21.545 -24.951 10.096 -16.438 1.375 C-11.085 -0.766 -5.694 -0.48 0 0 Z" fill="#010100" transform="translate(51,186)"/><path d="M0 0 C-1.522 14.131 -18.721 28.71 -28 39 C-30.728 36.272 -30.963 33.273 -31.75 29.625 C-33.764 20.944 -36.536 12.387 -43 6 C-43 5.34 -43 4.68 -43 4 C-43.66 4 -44.32 4 -45 4 C-45 3.34 -45 2.68 -45 2 C-40.484 1.567 -35.967 1.14 -31.45 0.718 C-29.918 0.574 -28.386 0.429 -26.854 0.282 C-3.851 -1.925 -3.851 -1.925 0 0 Z" fill="#5C6062" transform="translate(495,255)"/><path d="M0 0 C2.201 1.564 4.171 3.103 6.188 4.875 C6.75 5.36 7.312 5.846 7.891 6.345 C13.339 11.136 18.528 16.276 23 22 C23 22.66 23 23.32 23 24 C17.72 25.32 12.44 26.64 7 28 C7 27.01 7 26.02 7 25 C0.4 24.34 -6.2 23.68 -13 23 C-13.955 6.527 -13.955 6.527 -11.395 2.434 C-7.466 -0.625 -4.833 -1.695 0 0 Z" fill="#62868B" transform="translate(303,257)"/><path d="M0 0 C2.438 2.063 2.438 2.063 4 5 C4.305 8.964 3.605 11.164 1.277 14.379 C-4.709 21.35 -4.709 21.35 -9 23 C-15.333 23.444 -15.333 23.444 -19 21 C-19.544 16.957 -19.33 14.634 -17.438 11 C-7.745 -0.929 -7.745 -0.929 0 0 Z" fill="#FE8E00" transform="translate(68,290)"/><path d="M0 0 C7.248 0.519 14.084 1.797 21.125 3.563 C22.081 3.796 23.038 4.03 24.023 4.271 C26.351 4.842 28.676 5.418 31 6 C22.172 13.118 22.172 13.118 19.184 12.816 C16.248 11.719 14.112 10.027 11.625 8.125 C7.889 5.273 4.259 2.998 0 1 C0 0.67 0 0.34 0 0 Z" fill="#96AF84" transform="translate(388,232)"/></svg>`;
+function BeeLogo({size=80}) {
+  return React.createElement("div", {
+    dangerouslySetInnerHTML:{__html:BEE_SVG},
+    style:{width:size,height:size,display:"inline-block"}
+  });
 }
 
 /* ── CSS ── */
@@ -903,7 +917,7 @@ class ErrorBoundary extends React.Component {
   render(){
     if(this.state.err) return React.createElement("div",
       {style:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",background:"#0C1628",color:"#E8EDF8",gap:16,padding:24,fontFamily:"sans-serif"}},
-      React.createElement("div",{style:{fontSize:"3rem"}},"🐝"),
+      React.createElement(BeeLogo,{size:64}),
       React.createElement("h2",{style:{color:"#E8A200",marginBottom:8}},"Ocurrió un error"),
       React.createElement("p",{style:{color:"#4B5A78",fontSize:".9rem",maxWidth:400,textAlign:"center"}},String(this.state.err?.message||"Error inesperado")),
       React.createElement("button",{style:{padding:"10px 24px",background:"#E8A200",color:"#0C1628",border:"none",borderRadius:10,fontWeight:700,cursor:"pointer",fontSize:"1rem"},
@@ -945,7 +959,7 @@ class ErrorBoundary extends React.Component {
      ROOMS MANAGEMENT PANEL COMPONENT
      Shows all rooms with enter/close/delete
   ═════════════════════════════════════════ */
-  function RoomsPanel({visible, onClose, adminUser, userRooms, allRooms, onEnter, onClose2, onDelete}){
+  function RoomsPanel({visible, onClose, adminUser, userRooms, allRooms, onEnter, onClose2, onDelete, onOpenAdmin}){
     const rooms = adminUser?.type==="master" ? allRooms : userRooms;
     if(!visible) return null;
     const statusColor = {setup:"#a78bfa", competition:"#22c55e", archived:"#4B5A78", active:"#22c55e"};
@@ -1038,7 +1052,7 @@ class ErrorBoundary extends React.Component {
           {/* Footer */}
           <div style={{padding:"10px 14px",borderTop:"1px solid rgba(255,255,255,.06)",flexShrink:0}}>
             <button style={{width:"100%",padding:"9px",background:"rgba(232,162,0,.1)",color:"#E8A200",border:"1px solid rgba(232,162,0,.25)",borderRadius:8,cursor:"pointer",fontSize:".8rem",fontWeight:600}}
-              onClick={()=>{onClose();setTimeout(()=>setShowAdmin(true),150);}}>
+              onClick={()=>{onClose();if(onOpenAdmin)setTimeout(onOpenAdmin,150);}}>
               ⚙ Abrir panel de administración
             </button>
           </div>
@@ -1077,6 +1091,8 @@ function App() {
   const [showRoomsPanel, setShowRoomsPanel] = useState(false);
   const [allRooms,       setAllRooms]       = useState([]);  // master: all rooms across users
   const [adminView,   setAdminView]   = useState("login"); // "login"|"dashboard"|"setup-master"
+  const [needsMasterSetup, setNeedsMasterSetup] = useState(false);
+  const [masterSetupForm, setMasterSetupForm] = useState({username:"",password:"",confirm:""});
   const [adminUsers,  setAdminUsers]  = useState([]);
   const [adminBusy,   setAdminBusy]   = useState(false);
   const [adminStatus, setAdminStatus] = useState("");
@@ -1097,11 +1113,26 @@ function App() {
     const room = (new URLSearchParams(window.location.search).get("room")||'').toLowerCase().trim();
     if (!room) { setScreen("landing"); return; }
     setRoomId(room); roomRef.current = room;
+    const doCheckRoom = (rid) => {
+      setScreen("checking");
+      window.rtdb.ref("spellingbee/rooms/"+rid+"/state").once("value").then(snap => {
+        const s = fixArrays(snap.val());
+        if (!s) { setScreen("room-not-found"); return; }
+        if (s.phase==="archived") { setScreen("room-closed"); return; }
+        const last = s.lastActivity || s.expiresAt - 72*3600*1000 || 0;
+        const actaExpired = s.actasClosedAt && (Date.now()-s.actasClosedAt > 36*3600*1000);
+        const expired = actaExpired || (s.expiresAt ? Date.now()>s.expiresAt : (Date.now()-last>72*3600*1000));
+        if (expired) {
+          window.rtdb.ref("spellingbee/rooms/"+rid+"/state/phase").set("archived");
+          setScreen("room-closed"); return;
+        }
+        setGs(s); setScreen("login");
+      }).catch(() => setScreen("room-not-found"));
+    };
     if (!window.FIREBASE_OK) {
-      /* Firebase still initializing — wait for it */
       const waitAndCheck = () => {
         if (window.FIREBASE_OK) {
-          checkRoom(room);
+          doCheckRoom(room);
         } else {
           setTimeout(waitAndCheck, 80);
         }
@@ -1109,23 +1140,7 @@ function App() {
       waitAndCheck();
       return;
     }
-    setScreen("checking");
-    window.rtdb.ref("spellingbee/rooms/"+room+"/state").once("value").then(snap => {
-      const s = fixArrays(snap.val());
-      if (!s) { setScreen("room-not-found"); return; }
-      if (s.phase==="archived") { setScreen("room-closed"); return; }
-      // Auto-expire after 72 hours of inactivity
-      const last = s.lastActivity || s.expiresAt - 72*3600*1000 || 0;
-      // 36h after all actas downloaded
-      const actaExpired = s.actasClosedAt && (Date.now()-s.actasClosedAt > 36*3600*1000);
-      // 72h inactivity
-      const expired = actaExpired || (s.expiresAt ? Date.now()>s.expiresAt : (Date.now()-last>72*3600*1000));
-      if (expired) {
-        window.rtdb.ref("spellingbee/rooms/"+room+"/state/phase").set("archived");
-        setScreen("room-closed"); return;
-      }
-      setGs(s); setScreen("login");
-    }).catch(() => setScreen("room-not-found"));
+    doCheckRoom(room);
   }, []);
 
   /* Firebase real-time subscription */
@@ -1223,15 +1238,15 @@ function App() {
       }
     } catch(e) { localStorage.removeItem('bee_room_session'); }
 
-    if (window.FIREBASE_OK) {
-      ensureMasterExists().catch(e=>{
-        console.error("ensureMasterExists failed:", e.code, e.message);
-        if(e.code==="PERMISSION_DENIED" || e.message?.includes("permission"))
-          console.error("→ RTDB rules are blocking access. Set .read:true .write:true in Firebase Console");
-      });
-      return;
-    }
-    const onReady = () => { ensureMasterExists().catch(console.error); setScreen(s => s); };
+    const checkMaster = () => ensureMasterExists().then(()=>{
+      if(window._needsMasterSetup) setNeedsMasterSetup(true);
+    }).catch(e=>{
+      console.error("ensureMasterExists failed:", e.code, e.message);
+      if(e.code==="PERMISSION_DENIED" || e.message?.includes("permission"))
+        console.error("→ RTDB rules are blocking access. Check firebase-rules.json");
+    });
+    if (window.FIREBASE_OK) { checkMaster(); return; }
+    const onReady = () => { checkMaster(); setScreen(s => s); };
     window.addEventListener('firebase-ready', onReady);
     // After 12s, if still not ready, show error
     const timeout = setTimeout(() => {
@@ -1967,8 +1982,49 @@ function App() {
           <button className="btn btn-ghost" style={{padding:"4px 10px",fontSize:".76rem"}} onClick={()=>setShowAdmin(false)}>✕</button>
         </div>
 
+        {/* ── SETUP MASTER VIEW (first run only) ── */}
+        {adminView==="login" && needsMasterSetup && (
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            <div style={{padding:"10px 14px",background:"rgba(167,139,250,.1)",border:"1px solid rgba(167,139,250,.3)",borderRadius:10}}>
+              <p style={{color:"#a78bfa",fontSize:".82rem",fontWeight:700,marginBottom:4}}>Primera vez — Crear usuario maestro</p>
+              <p style={{color:"#4B5A78",fontSize:".74rem",lineHeight:1.5}}>No hay ningún administrador registrado. Crea el usuario maestro para gestionar el sistema.</p>
+            </div>
+            <input className="field" placeholder="Nombre de usuario maestro" value={masterSetupForm.username}
+              onChange={e=>setMasterSetupForm(p=>({...p,username:e.target.value.replace(/\s/g,"")}))} style={{fontSize:".90rem"}}
+              autoComplete="username"/>
+            <input className="field" placeholder="Contraseña" type="password" value={masterSetupForm.password}
+              onChange={e=>setMasterSetupForm(p=>({...p,password:e.target.value}))} style={{fontSize:".90rem"}}
+              autoComplete="new-password"/>
+            <input className="field" placeholder="Confirmar contraseña" type="password" value={masterSetupForm.confirm}
+              onChange={e=>setMasterSetupForm(p=>({...p,confirm:e.target.value}))}
+              onKeyDown={e=>{if(e.key==="Enter"&&masterSetupForm.username&&masterSetupForm.password&&masterSetupForm.password===masterSetupForm.confirm){
+                setAdminBusy(true);setAdminStatus("");
+                createMasterUser(masterSetupForm.username,masterSetupForm.password)
+                  .then(()=>{setNeedsMasterSetup(false);setAdminStatus("Usuario maestro creado. Inicia sesión.");setMasterSetupForm({username:"",password:"",confirm:""});})
+                  .catch(e2=>setAdminStatus("Error: "+e2.message))
+                  .finally(()=>setAdminBusy(false));
+              }}} style={{fontSize:".90rem"}}
+              autoComplete="new-password"/>
+            {masterSetupForm.password&&masterSetupForm.confirm&&masterSetupForm.password!==masterSetupForm.confirm&&(
+              <p style={{color:"#f87171",fontSize:".76rem"}}>Las contraseñas no coinciden</p>
+            )}
+            <button className="btn btn-gold" style={{width:"100%",padding:13}}
+              disabled={adminBusy||!masterSetupForm.username||!masterSetupForm.password||masterSetupForm.password!==masterSetupForm.confirm}
+              onClick={()=>{
+                setAdminBusy(true);setAdminStatus("");
+                createMasterUser(masterSetupForm.username,masterSetupForm.password)
+                  .then(()=>{setNeedsMasterSetup(false);setAdminStatus("Usuario maestro creado. Inicia sesión.");setMasterSetupForm({username:"",password:"",confirm:""});})
+                  .catch(e2=>setAdminStatus("Error: "+e2.message))
+                  .finally(()=>setAdminBusy(false));
+              }}>
+              {adminBusy?"Creando...":"Crear Usuario Maestro"}
+            </button>
+            {adminStatus && <p style={{color:adminStatus.startsWith("✅")||adminStatus.startsWith("Usuario")?"#22c55e":"#f87171",fontSize:".82rem"}}>{adminStatus}</p>}
+          </div>
+        )}
+
         {/* ── LOGIN VIEW ── */}
-        {adminView==="login" && (
+        {adminView==="login" && !needsMasterSetup && (
           <div style={{display:"flex",flexDirection:"column",gap:12}}>
             <p style={{color:"#4B5A78",fontSize:".80rem",lineHeight:1.6}}>Ingresa con tu nombre de usuario y contraseña para acceder al sistema.</p>
             <input className="field" placeholder="Nombre de usuario" value={operLogin.username}
@@ -1989,7 +2045,7 @@ function App() {
         {adminView==="dashboard" && (adminUser?.type==="master") && (
           <div style={{display:"flex",flexDirection:"column",gap:14}}>
             <div style={{padding:"8px 12px",background:"rgba(232,162,0,.1)",border:"1px solid rgba(232,162,0,.25)",borderRadius:10}}>
-              <p style={{color:"#E8A200",fontSize:".78rem",fontWeight:700}}>👑 Maestro: {adminUser.email}</p>
+              <p style={{color:"#E8A200",fontSize:".78rem",fontWeight:700}}>👑 Maestro: {adminUser.username}</p>
             </div>
 
             {/* Create new user */}
@@ -2065,7 +2121,7 @@ function App() {
     <div className="sb" style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:20}}>
       <style>{CSS}</style>
       <div className="card" style={{maxWidth:500,width:"100%",textAlign:"center",gap:14,display:"flex",flexDirection:"column"}}>
-        <div className="pulse" style={{fontSize:"3rem"}}>🐝</div>
+        <div className="pulse"><BeeLogo size={64}/></div>
         <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.6rem"}}>Conectando con Firebase...</h2>
         <p style={{color:"#6B7FA3",fontSize:".88rem",lineHeight:1.7}}>
           Si este mensaje no desaparece en 10 segundos, verifica tu conexión a internet o que Firebase esté habilitado en el archivo <code style={{background:"rgba(255,255,255,.1)",padding:"2px 6px",borderRadius:4}}>index.html</code>.
@@ -2079,7 +2135,7 @@ function App() {
   if (screen==="checking") return (
     <div className="sb" style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",gap:16}}>
       <style>{CSS}</style>
-      <div className="pulse" style={{fontSize:"3rem"}}>🐝</div>
+      <div className="pulse"><BeeLogo size={64}/></div>
       <p style={{color:"#4B5A78"}}>Verificando sala {roomId}...</p>
     </div>
   );
@@ -2115,7 +2171,7 @@ function App() {
     <div className="sb" style={{minHeight:"100vh",display:"flex",flexDirection:"column"}}>
       <style>{CSS}</style>
       {AdminModal}
-      {showRoomsPanel && <RoomsPanel visible={showRoomsPanel} onClose={()=>setShowRoomsPanel(false)} adminUser={adminUser} userRooms={userRooms} allRooms={allRooms} onEnter={doEnterRoomAsMC} onClose2={doCloseRoom} onDelete={doDeleteRoom}/>}
+      {showRoomsPanel && <RoomsPanel visible={showRoomsPanel} onClose={()=>setShowRoomsPanel(false)} adminUser={adminUser} userRooms={userRooms} allRooms={allRooms} onEnter={doEnterRoomAsMC} onClose2={doCloseRoom} onDelete={doDeleteRoom} onOpenAdmin={()=>setShowAdmin(true)}/>}
 
       {adminUser ? (
 
@@ -2125,7 +2181,7 @@ function App() {
           {/* Header admin */}
           <div style={{width:"100%",maxWidth:560,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
             <div style={{display:"flex",alignItems:"center",gap:10}}>
-              <span style={{fontSize:"2rem"}}>🐝</span>
+              <BeeLogo size={40}/>
               <div>
                 <p style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.1rem",fontWeight:700,lineHeight:1}}>Spelling Bee</p>
                 <p style={{fontSize:".7rem",color:"#4B5A78"}}>
@@ -2211,7 +2267,7 @@ function App() {
 
           {/* Logo */}
           <div style={{textAlign:"center",marginBottom:40}}>
-            <div style={{fontSize:"5rem",lineHeight:1,marginBottom:16}}>🐝</div>
+            <BeeLogo size={100}/>
             <h1 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"2.8rem",fontWeight:700,color:"#E8A200",marginBottom:6}}>Spelling Bee</h1>
             <p style={{color:"#4B5A78",fontSize:".9rem"}}>Panel de Jurado</p>
           </div>
@@ -2249,7 +2305,7 @@ function App() {
     <div className="sb" style={{maxWidth:580,margin:"0 auto",padding:"24px 16px",display:"flex",flexDirection:"column",gap:16}}>
       <style>{CSS}</style>
       <div style={{textAlign:"center"}}>
-        <div style={{fontSize:"2.5rem"}}>🐝</div>
+        <BeeLogo size={56}/>
         <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#22c55e",fontSize:"1.8rem",fontWeight:700,margin:"4px 0"}}>¡Sala creada!</h2>
         <p style={{color:"#4B5A78",fontSize:".85rem"}}>{gs?.institution}{gs?.level?" · "+gs.level:""}</p>
       </div>
@@ -2284,8 +2340,8 @@ function App() {
     <div className="sb" style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:20,gap:22}}>
       <style>{CSS}</style>
       <div style={{textAlign:"center"}}>
-        <div style={{fontSize:"3rem",marginBottom:4}}>🐝</div>
-        <h1 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"2.2rem",fontWeight:700,color:"#E8A200"}}>Spelling Bee</h1>
+        <BeeLogo size={64}/>
+        <h1 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"2.2rem",fontWeight:700,color:"#E8A200",marginTop:4}}>Spelling Bee</h1>
         {gs?.institution && <p style={{color:"#4B5A78",fontSize:".85rem",marginTop:4}}>{gs.institution}{gs?.level?" · "+gs.level:""}</p>}
         <div style={{marginTop:6,display:"inline-flex",alignItems:"center",gap:6,padding:"3px 12px",borderRadius:16,background:"rgba(167,139,250,.15)",border:"1px solid rgba(167,139,250,.35)",fontSize:".74rem",color:"#a78bfa"}}>
           Sala: {roomId}
@@ -2358,10 +2414,10 @@ function App() {
   if (screen==="setup") return (
     <div className="sb" style={{maxWidth:720,margin:"0 auto",padding:"20px 16px 80px"}}>
       <style>{CSS}</style>
-      {showRoomsPanel && <RoomsPanel visible={showRoomsPanel} onClose={()=>setShowRoomsPanel(false)} adminUser={adminUser} userRooms={userRooms} allRooms={allRooms} onEnter={doEnterRoomAsMC} onClose2={doCloseRoom} onDelete={doDeleteRoom}/>}
+      {showRoomsPanel && <RoomsPanel visible={showRoomsPanel} onClose={()=>setShowRoomsPanel(false)} adminUser={adminUser} userRooms={userRooms} allRooms={allRooms} onEnter={doEnterRoomAsMC} onClose2={doCloseRoom} onDelete={doDeleteRoom} onOpenAdmin={()=>setShowAdmin(true)}/>}
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:10}}>
         <div style={{display:"flex",alignItems:"center",gap:12}}>
-          <span style={{fontSize:"2rem"}}>🐝</span>
+          <BeeLogo size={40}/>
           <div>
             <h1 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.8rem",fontWeight:700}}>Configuración</h1>
             <p style={{color:"#4B5A78",fontSize:".78rem"}}>{gs?.institution}{gs?.level?" · "+gs.level:""}</p>
@@ -2386,8 +2442,8 @@ function App() {
           <div style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",background:"rgba(255,255,255,.04)",borderRadius:10,marginBottom:6}}>
             <span style={{fontSize:"1.1rem"}}>🎤</span>
             <span style={{flex:1,fontSize:".88rem",color:"#E8EDF8",fontWeight:600}}>Monitor</span>
-            {gs?.host?.name
-              ? <span style={{fontSize:".76rem",background:"rgba(34,197,94,.15)",color:"#22c55e",padding:"2px 9px",borderRadius:10,border:"1px solid rgba(34,197,94,.3)"}}>✅ {gs.host.name}</span>
+            {gs?.mc?.name
+              ? <span style={{fontSize:".76rem",background:"rgba(34,197,94,.15)",color:"#22c55e",padding:"2px 9px",borderRadius:10,border:"1px solid rgba(34,197,94,.3)"}}>✅ {gs.mc.name}</span>
               : <span style={{fontSize:".76rem",color:"#3B4B6A"}}>Sin conectar</span>}
           </div>
           {[0,1,2].map(i=>{
@@ -2600,7 +2656,7 @@ function App() {
   if (screen==="setup-wait") return (
     <div className="sb" style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",gap:20,padding:24}}>
       <style>{CSS}</style>
-      <div className="pulse" style={{fontSize:"3.5rem"}}>🐝</div>
+      <div className="pulse"><BeeLogo size={72}/></div>
       <h2 style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"2.2rem",fontWeight:700}}>Esperando configuración...</h2>
       {gs?.institution && <p style={{color:"#4B5A78"}}>{gs.institution}{gs?.level?" · "+gs.level:""}</p>}
       <div className="card" style={{textAlign:"center"}}>
@@ -2700,12 +2756,12 @@ function App() {
     <div className="sb" style={{maxWidth:680,margin:"0 auto",padding:"16px 14px 80px"}}>
       <style>{CSS}</style>
       {LtrModal}{OvrModal}{DisputeModal}
-      {showRoomsPanel && <RoomsPanel visible={showRoomsPanel} onClose={()=>setShowRoomsPanel(false)} adminUser={adminUser} userRooms={userRooms} allRooms={allRooms} onEnter={doEnterRoomAsMC} onClose2={doCloseRoom} onDelete={doDeleteRoom}/>}
+      {showRoomsPanel && <RoomsPanel visible={showRoomsPanel} onClose={()=>setShowRoomsPanel(false)} adminUser={adminUser} userRooms={userRooms} allRooms={allRooms} onEnter={doEnterRoomAsMC} onClose2={doCloseRoom} onDelete={doDeleteRoom} onOpenAdmin={()=>setShowAdmin(true)}/>}
 
       {/* Header */}
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18,paddingTop:6}}>
         <div style={{display:"flex",alignItems:"center",gap:10}}>
-          <span>🐝</span>
+          <BeeLogo size={28}/>
           <span style={{display:"inline-flex",alignItems:"center",gap:6,padding:"4px 13px",borderRadius:18,fontSize:".74rem",fontWeight:700,background:stCol+"1A",border:"1px solid "+stCol+"45",color:stCol}}>
             Etapa {cfg?.label}
             {gs.stage==="tiebreaker"&&gs.tbRound>0&&<span style={{opacity:.7}}> · Ronda {gs.tbRound+1}</span>}
@@ -2716,8 +2772,10 @@ function App() {
           <span style={{color:"#4B5A78",fontSize:".76rem"}}>{isMC?(gs?.mc?.name||"Maestro de Ceremonia"):isPresenter?(gs?.presenter?.name||"Presentador"):myJudge?.name||"Jurado"}</span>
           <span style={{fontSize:".62rem",color:"#2D3A55",padding:"1px 6px",background:"rgba(34,197,94,.06)",borderRadius:8}} title={"Dispositivo: "+DEVICE_ID}>🔒</span>
           {(isMC||isCreator) && (
-            <button className="btn btn-ghost" style={{fontSize:".7rem",padding:"4px 10px"}} onClick={()=>setScreen("setup")}>⚙ Config</button>
-          {adminUser&&<button className="btn btn-ghost" style={{fontSize:".7rem",padding:"4px 10px",color:"#E8A200"}} onClick={()=>setShowRoomsPanel(true)}>🏠</button>}
+            <>
+              <button className="btn btn-ghost" style={{fontSize:".7rem",padding:"4px 10px"}} onClick={()=>setScreen("setup")}>⚙ Config</button>
+              {adminUser&&<button className="btn btn-ghost" style={{fontSize:".7rem",padding:"4px 10px",color:"#E8A200"}} onClick={()=>setShowRoomsPanel(true)}>🏠</button>}
+            </>
           )}
         </div>
       </div>

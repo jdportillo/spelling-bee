@@ -1,45 +1,61 @@
+// ============================================================
+// BEE SPELLER — Firebase Realtime Database Rules
+// ------------------------------------------------------------
+// How to apply:
+//   1. Go to Firebase Console → your project
+//   2. Navigate to Realtime Database → Rules tab
+//   3. Select all existing rules and replace them with this file's content
+//   4. Click "Publish"
+//
+// NOTE: Firebase's rules editor accepts // comments, but if you
+// paste this into a JSON-only context, remove all // lines first.
+// ============================================================
 {
   "rules": {
-    ".read": false,
-    ".write": false,
 
     "spellingbee": {
+
+      // --- Rooms (open access — the random room ID IS the auth) ---
       "rooms": {
-        "$room": {
+        "$roomId": {
           ".read": true,
-          ".write": true,
-          "state": {
-            ".validate": "newData.hasChildren(['phase'])",
-            "phase":        { ".validate": "newData.isString() && newData.val().length < 40" },
-            "roomId":       { ".validate": "newData.isString() && newData.val().length < 60" },
-            "institution":  { ".validate": "newData.isString() && newData.val().length < 300" },
-            "level":        { ".validate": "newData.isString() && newData.val().length < 120" },
-            "lastActivity": { ".validate": "newData.isNumber()" },
-            "expiresAt":    { ".validate": "newData.isNumber()" },
-            "createdBy":    { ".validate": "newData.isString() && newData.val().length < 120" },
-            "logoB64":      { ".validate": "newData.isString() && newData.val().length < 600000" },
-            "$other":       { ".validate": true }
-          }
+          ".write": true
         }
       },
 
+      // --- User room listings (open access, same pattern) ---
+      "userRooms": {
+        "$username": {
+          ".read": true,
+          ".write": true
+        }
+      },
+
+      // --- Admin node (restricted) ---
       "admin": {
+        // Allow reading anywhere under admin (needed for login validation)
+        ".read": true,
+
+        // Block writes at the /admin level itself — prevents bulk
+        // overwrite or deletion of the entire admin tree.
+        // Writes are only allowed deeper, at the specific child nodes below.
+        ".write": false,
+
         "master": {
-          ".read": true,
-          ".write": "!data.exists()"
+          // Allow writing the master node (create/update credentials)
+          ".write": true
         },
+
         "users": {
-          ".read": true,
-          ".write": true,
           "$username": {
-            ".validate": "$username.length < 60",
-            "roomLimit":   { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 200" },
-            "active":      { ".validate": "newData.isBoolean()" },
-            "passwordHash":{ ".validate": "newData.isString() && newData.val().length == 64" },
-            "$other":      { ".validate": true }
+            // Allow creating/updating individual operator accounts
+            ".write": true
           }
         }
       }
     }
+
+    // Everything outside /spellingbee is denied by default
+    // (Firebase denies access to any path without an explicit rule)
   }
 }
