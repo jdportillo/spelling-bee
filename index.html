@@ -1532,25 +1532,43 @@ function App() {
   /* ── LOGIN ── */
   const doLogin = async () => {
     if (!role||!nameIn.trim()) return;
-    const snap = await window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").once("value");
-    let s = fixArrays(snap.val()) || gs || initState();
-    if (role==="mc") {
-      s = {...s, mc:{name:nameIn.trim(),ts:Date.now()}};
-    } else if (role==="presenter") {
-      s = {...s, presenter:{name:nameIn.trim(),ts:Date.now()}};
+    const name=nameIn.trim();
+    const base="spellingbee/rooms/"+roomId+"/state";
+    // Claim the seat ATOMICALLY so simultaneous joiners never overwrite each other.
+    if (role==="mc" || role==="presenter") {
+      const res=await window.rtdb.ref(base+"/"+role).transaction(cur=>{
+        if(cur && cur.name) return; // already taken → abort
+        return {name, ts:Date.now()};
+      });
+      const val=res.snapshot && res.snapshot.val();
+      if(!res.committed || !(val && val.name===name)){
+        alert("Ese rol ya fue tomado por otra persona. Elige otro.");
+        return;
+      }
     } else if (role==="judge") {
-      const taken=(s.judges||[]).map(j=>j.id);
-      const maxSlots=["J1","J2","J3","J4","J5","J6","J7","J8","J9","J10"].slice(0,s.judgeCount||3);
-      const available=maxSlots.find(id=>!taken.includes(id));
-      if(!available){alert("No hay más lugares de jurado disponibles.");return;}
-      const newJudge={id:available,name:nameIn.trim(),order:taken.length+1,ts:Date.now()};
-      s={...s,judges:[...(s.judges||[]),newJudge]};
-      setRole(available);
+      const jc=(gsRef.current?.judgeCount)||(gs?.judgeCount)||3;
+      const jt=(DEVICE_ID||"d")+"-"+Date.now()+"-"+Math.random().toString(36).slice(2,7);
+      const res=await window.rtdb.ref(base+"/judges").transaction(cur=>{
+        const arr=Array.isArray(cur)?cur.filter(Boolean):(cur?Object.values(cur).filter(Boolean):[]);
+        const taken=arr.map(j=>j&&j.id);
+        const maxSlots=["J1","J2","J3","J4","J5","J6","J7","J8","J9","J10"].slice(0,jc);
+        const available=maxSlots.find(id=>!taken.includes(id));
+        if(!available) return; // full → abort
+        arr.push({id:available, name, order:arr.length+1, ts:Date.now(), jt});
+        return arr;
+      });
+      if(!res.committed){ alert("No hay más lugares de jurado disponibles."); return; }
+      const rawArr=res.snapshot && res.snapshot.val();
+      const arr=Array.isArray(rawArr)?rawArr:Object.values(rawArr||{});
+      const mine=arr.filter(Boolean).find(j=>j.jt===jt);
+      if(!mine){ alert("No se pudo tomar un lugar de jurado. Intenta de nuevo."); return; }
+      setRole(mine.id);
     }
-    window.rtdb.ref("spellingbee/rooms/"+roomId+"/state").set(s); setGs(s);
+    // Read fresh state only for navigation (never write the whole tree here).
+    const snap=await window.rtdb.ref(base).once("value");
+    const s=fixArrays(snap.val())||gs||initState();
+    setGs(s);
     const isCreator = sessionStorage.getItem("creator-"+roomId)==="1";
-    // During setup, the creator OR whoever takes the MC seat can finish the
-    // configuration (contestant names + logo) live before starting.
     if (s.phase==="setup") setScreen((isCreator || role==="mc") ? "setup" : "setup-wait");
     else if (s.phase==="competition") setScreen("competition");
     else setScreen("results");
@@ -1631,77 +1649,100 @@ function App() {
   useEffect(()=>{setMarkedLetterIdx(null);setMarkedReason(null);},[gs?.currentWordIdx]);
 
   const doJudgeReady = useCallback(() => {
-    const s=gsRef.current; if(!s) return;
-    upd(prev=>{
-      const newReady={...prev.judgesReady,[role]:true};
-      const numJudges=(prev.judges||[]).length||prev.judgeCount||3;
-      const allReady=Object.keys(newReady).length>=numJudges;
-      if(!allReady) return {...prev,judgesReady:newReady};
-      // Draw 3 words for current contestant — FAIR tiered selection
-      const cfg=STAGES[prev.stage];
-      const used=[...prev.usedWords[cfg.bank]];
-      // Compute average word length already used this stage for length fairness
-      const stageScores=prev.scores[prev.stage]||{};
-      const usedLengths=used.map(w=>w.length).filter(l=>l>0);
-      const targetLen=usedLengths.length
-        ? Math.round(usedLengths.reduce((a,b)=>a+b,0)/usedLengths.length)
-        : null;
-      const drawn=drawFairWords(prev.banks[cfg.bank],used,targetLen);
-      const newUsed=[...used,...drawn.map(w=>w.word)];
-      return {...prev,judgesReady:newReady,currentWords:drawn,currentWordIdx:0,
-        wordJudgments:{},wordPhase:"word_show",
-        usedWords:{...prev.usedWords,[cfg.bank]:newUsed}};
-    });
+    const s=gsRef.current; if(!s||!roomRef.current||!role) return;
+    // ATOMIC per-judge write: only my own ready flag. Concurrent "Listo" presses
+    // from different judges never overwrite each other. The word draw happens once,
+    // triggered by the single finalizer client (see the finalizer effect below).
+    window.rtdb.ref("spellingbee/rooms/"+roomRef.current+"/state/judgesReady/"+role).set(true).catch(()=>{});
+    setGs(prev=>prev?{...prev,judgesReady:{...(prev.judgesReady||{}),[role]:true}}:prev); // optimistic echo
   },[role]);
 
   /* Judge submits verdict for current word */
   const doJudgeWordVerdict = useCallback((verdict, errInfo) => {
-    const s=gsRef.current; if(!s) return;
-    const wi=s.currentWordIdx;
+    const s=gsRef.current; if(!s||!roomRef.current||!role) return;
+    const wi=s.currentWordIdx||0;
+    const myVote={verdict, err:errInfo||null, ts:Date.now()};
+    // ATOMIC per-judge write: only my own vote for this word. Concurrent votes from
+    // different judges never overwrite each other. Aggregation (all-voted → record /
+    // next word / deliberation) is done once by the finalizer client (effect below).
+    window.rtdb.ref("spellingbee/rooms/"+roomRef.current+"/state/wordJudgments/"+wi+"/"+role).set(myVote).catch(()=>{});
+    setGs(prev=>{ if(!prev) return prev; const wj={...(prev.wordJudgments||{})}; wj[wi]={...(wj[wi]||{}),[role]:myVote}; return {...prev,wordJudgments:wj}; }); // optimistic echo
+  },[role]);
+
+  /* ── FINALIZER: a single client (host → primary judge) consolidates once every
+     seated judge has acted, so per-judge atomic writes are never lost. ── */
+  const finalizerRole = (gs2) => {
+    const g=gs2||gsRef.current; if(!g) return null;
+    // ALWAYS the first-seated judge: they vote/mark-ready too, so their client is
+    // guaranteed present the moment everyone has acted (an MC could have disconnected).
+    return ((g.judges||[]).slice().sort((a,b)=>(a.order||0)-(b.order||0))[0]||{}).id||null;
+  };
+
+  const finalizeDrawWords = useCallback(() => {
     upd(prev=>{
-      const prevWJ=prev.wordJudgments||{};
-      const prevWord=prevWJ[wi]||{};
-      const myVote={verdict, err:errInfo||null, ts:Date.now()};
-      const updWord={...prevWord,[role]:myVote};
-      const newWJ={...prevWJ,[wi]:updWord};
-      const numJudges=(prev.judges||[]).length||prev.judgeCount||3;
-      const allVoted=Object.keys(updWord).length>=numJudges;
-      if(!allVoted) return {...prev,wordJudgments:newWJ};
-      // All judges voted — check discrepancies
-      const votes=Object.values(updWord);
-      const verdicts=votes.map(v=>v.verdict);
+      if(prev.wordPhase!=="contestant_reveal" || (prev.currentWords||[]).length>0) return prev; // already drawn / stale
+      const cfg=STAGES[prev.stage];
+      const used=[...(prev.usedWords?.[cfg.bank]||[])];
+      const usedLengths=used.map(w=>w.length).filter(l=>l>0);
+      const targetLen=usedLengths.length?Math.round(usedLengths.reduce((a,b)=>a+b,0)/usedLengths.length):null;
+      const drawn=drawFairWords(prev.banks[cfg.bank],used,targetLen);
+      const newUsed=[...used,...drawn.map(w=>w.word)];
+      return {...prev,currentWords:drawn,currentWordIdx:0,wordJudgments:{},wordPhase:"word_show",
+        usedWords:{...prev.usedWords,[cfg.bank]:newUsed}};
+    });
+  },[]);
+
+  const finalizeWord = useCallback((wiArg) => {
+    upd(prev=>{
+      const wi=wiArg;
+      if(prev.wordPhase!=="word_show" || (prev.currentWordIdx||0)!==wi) return prev; // stale
+      const seatedIds=new Set((prev.judges||[]).map(j=>j.id));
+      const votesObj=(prev.wordJudgments||{})[wi]||{};
+      const seatedVotes=Object.entries(votesObj).filter(([id])=>seatedIds.has(id));
+      if(seatedIds.size<1 || seatedVotes.length<seatedIds.size) return prev; // not everyone in
+      const verdicts=seatedVotes.map(([,v])=>v.verdict);
       const hasDisc=verdicts.some(v=>v!==verdicts[0]);
       const word=prev.currentWords[wi];
-      // Record to history if all agree
       if(!hasDisc){
         const finalV=verdicts[0];
         const active=prev.contestants.filter(c=>c.active);
         const cur=active[prev.cIdx];
+        const anyErr=seatedVotes.map(([,v])=>v.err).find(e=>e)||null;
         const hEntry={stage:prev.stage,stageLabel:STAGES[prev.stage].label,
           cId:cur?.id,cName:cur?.name,word:word?.word||"",phonetic:word?.phonetic||"",
-          result:finalV,reasons:{override:null,err:errInfo,start:true,end:true}};
+          result:finalV,reasons:{override:null,err:anyErr,start:true,end:true}};
         const ns={...prev.scores};
         const pv=ns[prev.stage]?.[cur?.id]?.v||[];
         const nv=[...pv]; nv[wi]=finalV;
         ns[prev.stage]={...ns[prev.stage],[cur?.id]:{v:nv}};
-        // Move to next word or stage_end
         const nextWi=wi+1;
         const isLast=nextWi>=prev.currentWords.length;
-        return {...prev,wordJudgments:newWJ,
-          history:[...prev.history,hEntry],scores:ns,
+        return {...prev,history:[...prev.history,hEntry],scores:ns,
           wordPhase:isLast?"stage_end":"word_show",
           currentWordIdx:isLast?wi:nextWi,
           judgesReady:isLast?{}:prev.judgesReady};
       }
-      // Has discrepancy — add to list
       const disc={wordIdx:wi,word:word?.word,phonetic:word?.phonetic,
-        votes:Object.fromEntries(Object.entries(updWord).map(([jid,v])=>[jid,v.verdict])),
+        votes:Object.fromEntries(seatedVotes.map(([jid,v])=>[jid,v.verdict])),
         resolved:false,final:null};
-      return {...prev,wordJudgments:newWJ,
-        discrepancies:[...prev.discrepancies,disc],
-        wordPhase:"deliberation"};
+      return {...prev,discrepancies:[...prev.discrepancies,disc],wordPhase:"deliberation"};
     });
-  },[role]);
+  },[]);
+
+  useEffect(()=>{
+    const g=gs; if(!g||g.phase!=="competition") return;
+    if(role!==finalizerRole(g)) return; // only the single finalizer acts
+    const seatedIds=new Set((g.judges||[]).map(j=>j.id));
+    if(seatedIds.size<1) return;
+    if(g.wordPhase==="contestant_reveal"){
+      const readyCount=Object.keys(g.judgesReady||{}).filter(id=>seatedIds.has(id)).length;
+      if(readyCount>=seatedIds.size && (g.currentWords||[]).length===0) finalizeDrawWords();
+    } else if(g.wordPhase==="word_show"){
+      const wi=g.currentWordIdx||0;
+      const votedCount=Object.keys((g.wordJudgments||{})[wi]||{}).filter(id=>seatedIds.has(id)).length;
+      if(votedCount>=seatedIds.size) finalizeWord(wi);
+    }
+  },[gs?.phase, gs?.wordPhase, gs?.currentWordIdx, gs?.judgesReady, gs?.wordJudgments, gs?.judges, gs?.mc?.name, gs?.presenter?.name, role, finalizeDrawWords, finalizeWord]);
 
   /* Resolve discrepancy — pick one judge's verdict or custom */
   const doResolveDiscrepancy = useCallback((discIdx, finalVerdict) => {
@@ -2383,37 +2424,39 @@ function App() {
       ) : (
 
         /* ═══════════ VISTA PÚBLICA (sin sesión) ═══════════ */
-        <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",flex:1,padding:"40px 24px",gap:0}}>
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",flex:1,padding:"36px 22px 120px",gap:0}}>
 
           {/* Logo */}
-          <div style={{textAlign:"center",marginBottom:40}}>
-            <BeeLogo size={100}/>
-            <h1 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"2.8rem",fontWeight:700,color:"#E8A200",marginBottom:6}}>Spelling Bee</h1>
+          <div style={{textAlign:"center",marginBottom:26}}>
+            <BeeLogo size={92}/>
+            <h1 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"2.6rem",fontWeight:700,color:"#E8A200",marginTop:6,marginBottom:4}}>Spelling Bee</h1>
             <p style={{color:"#4B5A78",fontSize:".9rem"}}>Panel de Jurado</p>
           </div>
 
-          {/* Join form — prominente, centrado */}
-          <div style={{width:"100%",maxWidth:400,display:"flex",flexDirection:"column",gap:12}}>
+          {/* Tarjeta de ingreso — para jurados/participantes */}
+          <div className="card" style={{width:"100%",maxWidth:400,borderColor:"rgba(232,162,0,.25)"}}>
+            <p style={{color:"#E8A200",fontWeight:700,fontSize:".74rem",letterSpacing:".06em",marginBottom:6}}>ENTRAR AL CONCURSO</p>
+            <p style={{color:"#4B5A78",fontSize:".78rem",lineHeight:1.5,marginBottom:12}}>Escribe el código que te dieron, o abre el enlace / escanea el QR que recibiste.</p>
             <input className="field" placeholder="Código de sala (ej: jd-952476)" value={joinCode}
               onChange={e=>setJoinCode(e.target.value)}
               onKeyDown={e=>e.key==="Enter"&&doJoinByCode()}
-              style={{fontSize:"1rem",padding:"14px 16px",letterSpacing:".05em",textAlign:"center"}}/>
+              style={{fontSize:"1rem",padding:"14px 16px",letterSpacing:".05em",textAlign:"center",marginBottom:10}}/>
             <button className="btn btn-gold" disabled={!joinCode.trim()} onClick={doJoinByCode}
               style={{width:"100%",padding:"14px",fontSize:"1rem",fontWeight:700}}>
               Entrar a la sala →
             </button>
-            <p style={{color:"#2D3A55",fontSize:".78rem",textAlign:"center",marginTop:4}}>
-              o abrí el enlace / escaneá el QR que recibiste
-            </p>
           </div>
 
-          {/* Acceso operador — discreto, al fondo */}
-          <div style={{position:"fixed",bottom:24,left:"50%",transform:"translateX(-50%)"}}>
-            <button style={{padding:"7px 18px",background:"transparent",color:"#2D3A55",border:"1px solid rgba(255,255,255,.07)",borderRadius:20,fontSize:".75rem",cursor:"pointer"}}
-              onClick={()=>{setAdminView("login");setShowAdmin(true);}}>
-              🔐 Acceso de operador
-            </button>
+          {/* Separador + acceso de operador — inline (ya no lo tapa el banner de instalación) */}
+          <div style={{width:"100%",maxWidth:400,marginTop:20,display:"flex",alignItems:"center",gap:10}}>
+            <div style={{flex:1,height:1,background:"rgba(255,255,255,.07)"}}/>
+            <span style={{color:"#2D3A55",fontSize:".72rem"}}>¿Organizas el concurso?</span>
+            <div style={{flex:1,height:1,background:"rgba(255,255,255,.07)"}}/>
           </div>
+          <button style={{marginTop:12,padding:"11px 20px",background:"rgba(255,255,255,.04)",color:"#8fa3c4",border:"1px solid rgba(255,255,255,.1)",borderRadius:12,fontSize:".84rem",cursor:"pointer",fontWeight:600,width:"100%",maxWidth:400}}
+            onClick={()=>{setAdminView("login");setShowAdmin(true);}}>
+            🔐 Acceso de operador
+          </button>
 
         </div>
 
