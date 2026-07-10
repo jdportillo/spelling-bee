@@ -57,6 +57,11 @@ window.FIREBASE_OK = false;
     }
     window.rtdb = firebase.database();
     window.FIREBASE_OK = true;
+    /* Test RTDB connectivity */
+    window.rtdb.ref(".info/connected").on("value", function(snap){
+      window._rtdbConnected = snap.val();
+      if(!snap.val()) console.warn("🔥 RTDB: sin conexión (.info/connected=false). ¿Base de datos activada en Firebase Console?");
+    });
     /* Notify React that Firebase is ready */
     window.dispatchEvent(new Event('firebase-ready'));
   } catch(e) {
@@ -911,6 +916,137 @@ class ErrorBoundary extends React.Component {
 /* ════════════════════════════════════════════
    APP
 ════════════════════════════════════════════ */
+
+  /* ── RTDB Connection Status Component ── */
+  function RtdbStatus() {
+    const [connected, setConnected] = React.useState(null);
+    useEffect(()=>{
+      if(!window.FIREBASE_OK||!window.rtdb) return;
+      const ref = window.rtdb.ref(".info/connected");
+      const h = snap => setConnected(snap.val());
+      ref.on("value", h);
+      return ()=>ref.off("value", h);
+    },[]);
+    if(connected===null) return null;
+    if(connected) return null; // all good, no noise
+    return (
+      <div style={{maxWidth:560,width:"100%",padding:"10px 14px",background:"rgba(239,68,68,.08)",border:"1px solid rgba(239,68,68,.3)",borderRadius:10,color:"#f87171",fontSize:".82rem",lineHeight:1.6}}>
+        ⚠️ <strong>Firebase RTDB sin conexión.</strong><br/>
+        Probable causa: la base de datos no está activada.<br/>
+        <span style={{color:"#4B5A78"}}>Ve a </span>
+        <strong style={{color:"#f87171"}}>console.firebase.google.com → beespeller-6ebea → Realtime Database → Crear base de datos → Modo de prueba</strong><br/>
+        <span style={{color:"#4B5A78",fontSize:".75rem"}}>Luego ve a Reglas y asegurate de que ".read":true y ".write":true</span>
+      </div>
+    );
+  }
+
+
+  /* ════════════════════════════════════════
+     ROOMS MANAGEMENT PANEL COMPONENT
+     Shows all rooms with enter/close/delete
+  ═════════════════════════════════════════ */
+  function RoomsPanel({visible, onClose, adminUser, userRooms, allRooms, onEnter, onClose2, onDelete}){
+    const rooms = adminUser?.type==="master" ? allRooms : userRooms;
+    if(!visible) return null;
+    const statusColor = {setup:"#a78bfa", competition:"#22c55e", archived:"#4B5A78", active:"#22c55e"};
+    const statusLabel = {setup:"Config", competition:"Activa", archived:"Cerrada", active:"Activa"};
+    const fmt = ts => ts ? new Date(ts).toLocaleDateString("es-SV",{day:"2-digit",month:"2-digit",year:"2-digit",hour:"2-digit",minute:"2-digit"}) : "-";
+    return(
+      <div style={{position:"fixed",inset:0,zIndex:1000,display:"flex",alignItems:"flex-start",justifyContent:"flex-end"}}
+        onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
+        {/* Backdrop */}
+        <div style={{position:"absolute",inset:0,background:"rgba(0,0,0,.55)"}} onClick={onClose}/>
+        {/* Panel */}
+        <div style={{position:"relative",width:"min(100vw,480px)",height:"100vh",background:"#0F1E38",borderLeft:"1px solid rgba(255,255,255,.1)",display:"flex",flexDirection:"column",overflowY:"hidden"}}>
+          {/* Header */}
+          <div style={{padding:"16px 18px 12px",borderBottom:"1px solid rgba(255,255,255,.08)",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
+            <div>
+              <h2 style={{color:"#E8A200",fontFamily:"'Cormorant Garamond',serif",fontSize:"1.4rem",fontWeight:700,marginBottom:2}}>
+                🏠 Gestión de Salas
+              </h2>
+              <p style={{color:"#4B5A78",fontSize:".74rem"}}>
+                {adminUser?.type==="master"?"Todas las salas":"Tus salas"} · {rooms.length} {rooms.length===1?"sala":"salas"}
+              </p>
+            </div>
+            <button onClick={onClose} style={{background:"rgba(255,255,255,.07)",border:"none",color:"#E8EDF8",width:32,height:32,borderRadius:8,cursor:"pointer",fontSize:"1rem",display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+          </div>
+          {/* Rooms list */}
+          <div style={{flex:1,overflowY:"auto",padding:"12px 14px",display:"flex",flexDirection:"column",gap:8}}>
+            {rooms.length===0 && (
+              <div style={{textAlign:"center",color:"#4B5A78",padding:40,fontSize:".88rem"}}>
+                No hay salas activas
+              </div>
+            )}
+            {rooms.map(r=>{
+              const phase = r.phase||r.status||"setup";
+              const col = statusColor[phase]||"#4B5A78";
+              const lbl = statusLabel[phase]||phase;
+              const isClosed = phase==="archived"||r.status==="closed";
+              return(
+                <div key={r.id} style={{background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.08)",borderRadius:10,padding:"11px 13px",display:"flex",flexDirection:"column",gap:6}}>
+                  {/* Top row */}
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:6}}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontWeight:600,fontSize:".88rem",color:"#E8EDF8",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                        {r.institution||"Sin nombre"}
+                      </div>
+                      <div style={{display:"flex",gap:8,marginTop:3,flexWrap:"wrap"}}>
+                        <span style={{fontFamily:"monospace",fontSize:".7rem",color:"#a78bfa"}}>{r.id}</span>
+                        {adminUser?.type==="master"&&r.createdBy&&<span style={{fontSize:".68rem",color:"#4B5A78"}}>por {r.createdBy}</span>}
+                        <span style={{fontSize:".68rem",color:"#2D3A55"}}>{fmt(r.createdAt)}</span>
+                      </div>
+                    </div>
+                    <span style={{padding:"3px 9px",borderRadius:10,fontSize:".68rem",fontWeight:600,background:col+"18",color:col,border:"1px solid "+col+"30",flexShrink:0}}>
+                      {lbl}
+                    </span>
+                  </div>
+                  {/* Stats row */}
+                  {(r.contestants>0||r.judges>0)&&(
+                    <div style={{display:"flex",gap:12,fontSize:".7rem",color:"#4B5A78"}}>
+                      {r.contestants>0&&<span>👤 {r.contestants} concursantes</span>}
+                      {r.judges>0&&<span>⚖️ {r.judges} jurados</span>}
+                    </div>
+                  )}
+                  {/* Actions */}
+                  {!isClosed&&(
+                    <div style={{display:"flex",gap:6,marginTop:2}}>
+                      <button style={{flex:1,padding:"6px 0",background:"rgba(232,162,0,.12)",color:"#E8A200",border:"1px solid rgba(232,162,0,.3)",borderRadius:7,fontSize:".75rem",cursor:"pointer",fontWeight:600}}
+                        onClick={()=>onEnter(r.id)}>
+                        ↩ Entrar como MC
+                      </button>
+                      <button style={{padding:"6px 10px",background:"rgba(239,68,68,.08)",color:"#ef4444",border:"1px solid rgba(239,68,68,.2)",borderRadius:7,fontSize:".75rem",cursor:"pointer"}}
+                        onClick={()=>onClose2(r.id)}
+                        title="Cerrar sala (conserva datos)">
+                        🔒 Cerrar
+                      </button>
+                      {adminUser?.type==="master"&&(
+                        <button style={{padding:"6px 10px",background:"rgba(239,68,68,.08)",color:"#ef4444",border:"1px solid rgba(239,68,68,.3)",borderRadius:7,fontSize:".75rem",cursor:"pointer"}}
+                          onClick={()=>onDelete(r.id)}
+                          title="Eliminar permanentemente">
+                          🗑
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {isClosed&&(
+                    <div style={{fontSize:".7rem",color:"#4B5A78",fontStyle:"italic"}}>Sala cerrada</div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          {/* Footer */}
+          <div style={{padding:"10px 14px",borderTop:"1px solid rgba(255,255,255,.06)",flexShrink:0}}>
+            <button style={{width:"100%",padding:"9px",background:"rgba(232,162,0,.1)",color:"#E8A200",border:"1px solid rgba(232,162,0,.25)",borderRadius:8,cursor:"pointer",fontSize:".8rem",fontWeight:600}}
+              onClick={()=>{onClose();setTimeout(()=>setShowAdmin(true),150);}}>
+              ⚙ Abrir panel de administración
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
 function App() {
   const [screen,   setScreen]   = useState("init");
   const [roomId,   setRoomId]   = useState(null);
@@ -938,6 +1074,8 @@ function App() {
   const [adminUser,   setAdminUser]   = useState(null);   // {type,username,roomLimit,activeRooms} or {type:"master",uid,email}
   const [showAdmin,   setShowAdmin]   = useState(false);
   const [userRooms,   setUserRooms]   = useState([]);   // [{id, institution, createdAt, status}]  // show admin overlay
+  const [showRoomsPanel, setShowRoomsPanel] = useState(false);
+  const [allRooms,       setAllRooms]       = useState([]);  // master: all rooms across users
   const [adminView,   setAdminView]   = useState("login"); // "login"|"dashboard"|"setup-master"
   const [adminUsers,  setAdminUsers]  = useState([]);
   const [adminBusy,   setAdminBusy]   = useState(false);
@@ -956,7 +1094,7 @@ function App() {
 
   /* Init — read ?room= from URL */
   useEffect(() => {
-    const room = new URLSearchParams(window.location.search).get("room");
+    const room = (new URLSearchParams(window.location.search).get("room")||'').toLowerCase().trim();
     if (!room) { setScreen("landing"); return; }
     setRoomId(room); roomRef.current = room;
     if (!window.FIREBASE_OK) {
@@ -1085,7 +1223,14 @@ function App() {
       }
     } catch(e) { localStorage.removeItem('bee_room_session'); }
 
-    if (window.FIREBASE_OK) { ensureMasterExists().catch(console.error); return; }
+    if (window.FIREBASE_OK) {
+      ensureMasterExists().catch(e=>{
+        console.error("ensureMasterExists failed:", e.code, e.message);
+        if(e.code==="PERMISSION_DENIED" || e.message?.includes("permission"))
+          console.error("→ RTDB rules are blocking access. Set .read:true .write:true in Firebase Console");
+      });
+      return;
+    }
     const onReady = () => { ensureMasterExists().catch(console.error); setScreen(s => s); };
     window.addEventListener('firebase-ready', onReady);
     // After 12s, if still not ready, show error
@@ -1100,7 +1245,12 @@ function App() {
       const base = typeof fn==="function" ? fn(prev||initState()) : fn;
       const next = {...base, lastActivity:Date.now()};
       if (roomRef.current && window.FIREBASE_OK)
-        window.rtdb.ref("spellingbee/rooms/"+roomRef.current+"/state").set(next);
+        window.rtdb.ref("spellingbee/rooms/"+roomRef.current+"/state").set(next)
+          .catch(e=>{
+            if(e.code==="PERMISSION_DENIED")
+              console.error("🔥 RTDB REGLAS: acceso denegado. Ve a Firebase Console → RTDB → Reglas y pon .read:true .write:true");
+            else console.error("🔥 RTDB write error:", e.code, e.message);
+          });
       return next;
     });
   }, []);
@@ -1191,6 +1341,50 @@ function App() {
     return ()=>ref.off();
   },[adminUser?.username]);
 
+  /* Load ALL rooms for master admin — real-time */
+  useEffect(()=>{
+    if(!adminUser||!window.FIREBASE_OK) return;
+    if(adminUser.type!=="master") return; // operators only see own rooms via userRooms
+    const ref = window.rtdb.ref("spellingbee/rooms");
+    ref.orderByChild("lastActivity").on("value", snap=>{
+      if(!snap.val()){setAllRooms([]);return;}
+      const list = Object.entries(snap.val())
+        .map(([id,d])=>({
+          id,
+          institution: d.state?.institution||d.institution||"Sin nombre",
+          phase:       d.state?.phase||d.phase||"setup",
+          createdBy:   d.state?.createdBy||d.createdBy||"?",
+          createdAt:   d.state?.createdAt||d.createdAt||d.state?.lastActivity||0,
+          contestants: Array.isArray(d.state?.contestants)?d.state.contestants.length:0,
+          judges:      Array.isArray(d.state?.judges)?d.state.judges.filter(j=>j?.name).length:0,
+        }))
+        .filter(r=>r.phase!=="archived")
+        .sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+      setAllRooms(list);
+    });
+    return ()=>ref.off();
+  },[adminUser?.username, adminUser?.type]);
+
+  const doDeleteRoom = async (roomId) => {
+    if(!confirm("¿Eliminar permanentemente la sala "+roomId+"?\nEsta acción no se puede deshacer.")) return;
+    await window.rtdb.ref("spellingbee/rooms/"+roomId).remove().catch(()=>{});
+    // Remove from all userRooms
+    const snap = await window.rtdb.ref("spellingbee/userRooms").once("value").catch(()=>null);
+    if(snap?.val()){
+      const updates = {};
+      Object.keys(snap.val()).forEach(user=>{
+        if(snap.val()[user][roomId]) updates["spellingbee/userRooms/"+user+"/"+roomId] = null;
+      });
+      if(Object.keys(updates).length) await window.rtdb.ref().update(updates).catch(()=>{});
+    }
+    setAllRooms(prev=>prev.filter(r=>r.id!==roomId));
+  };
+
+  const doEnterRoomAsMC = (roomId) => {
+    setShowRoomsPanel(false);
+    setTimeout(()=>doReenterRoom(roomId), 100);
+  };
+
 
   const doCloseRoom = async (roomId) => {
     if(!confirm("¿Cerrar la sala "+roomId+"? Los datos se conservarán.")) return;
@@ -1232,17 +1426,25 @@ function App() {
     }
     const newId = generateRoomId();
     const ns = {...initState(), roomId:newId, institution:inst.trim(), level:lvl.trim(), createdBy:adminUser?.username||adminUser?.email||"master", expiresAt:Date.now()+72*3600*1000, lastActivity:Date.now()};
-    await window.rtdb.ref("spellingbee/rooms/"+newId+"/state").set(ns);
+    try {
+      await window.rtdb.ref("spellingbee/rooms/"+newId+"/state").set(ns);
+    } catch(e) {
+      const msg = e.code==="PERMISSION_DENIED"
+        ? "❌ Firebase RTDB: acceso denegado.\n\nVe a Firebase Console → beespeller-6ebea → Realtime Database → Reglas y cambia a .read:true y .write:true"
+        : "❌ No se pudo crear la sala: "+e.message+"\n\n¿Está activada la Realtime Database en Firebase Console?";
+      alert(msg);
+      return;
+    }
     sessionStorage.setItem("creator-"+newId, "1");
     window.history.pushState({}, "", window.location.pathname+"?room="+newId);
     // Auto-login creator as MC and go straight to config
       const mcName = adminUser?.username || "Configurador";
       const ns2 = {...ns, mc:{name:mcName, ts:Date.now()}, createdBy:adminUser?.username||""};
-      window.rtdb.ref("spellingbee/rooms/"+newId+"/state").update({mc:{name:mcName,ts:Date.now()},createdBy:adminUser?.username||""});
+      window.rtdb.ref("spellingbee/rooms/"+newId+"/state").update({mc:{name:mcName,ts:Date.now()},createdBy:adminUser?.username||""}).catch(()=>{});
       // Track room per user for home listing
       window.rtdb.ref("spellingbee/userRooms/"+(adminUser?.username||"_")+"/"+newId).set({
         institution: inst.trim(), createdAt: Date.now(), status:"setup"
-      });
+      }).catch(()=>{});
       sessionStorage.setItem("creator-"+newId,"1");
       setRole("mc"); setNameIn(mcName);
       setRoomId(newId); roomRef.current = newId; setGs(ns2);
@@ -1250,7 +1452,8 @@ function App() {
   };
 
   const doJoinByCode = () => {
-    const code = joinCode.trim().toUpperCase(); if (!code) return;
+    // Room IDs are lowercase (jd-XXXXXX) — don't uppercase
+    const code = joinCode.trim().toLowerCase().replace(/\s+/g,''); if (!code) return;
     window.location.href = window.location.pathname+"?room="+code;
   };
 
@@ -1909,94 +2112,137 @@ function App() {
 
   /* LANDING */
   if (screen==="landing") return (
-    <div className="sb" style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:24,gap:28}}>
+    <div className="sb" style={{minHeight:"100vh",display:"flex",flexDirection:"column"}}>
       <style>{CSS}</style>
       {AdminModal}
-      <div style={{textAlign:"center"}}>
-        <div style={{fontSize:"3.5rem",lineHeight:1.1,marginBottom:6}}>🐝</div>
-        <h1 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"3rem",fontWeight:700,color:"#E8A200",lineHeight:1}}>Spelling Bee</h1>
-        <p style={{color:"#4B5A78",marginTop:5,fontSize:".85rem"}}>Sistema Multi-sala · Tiempo real · Actas PDF</p>
-      </div>
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,width:"100%",maxWidth:560}}>
-        <div className="card" style={{display:"flex",flexDirection:"column",gap:12,borderColor:"rgba(232,162,0,.35)"}}>
-          <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em"}}>🆕 CREAR CONCURSO</p>
-          <p style={{color:"#4B5A78",fontSize:".78rem",lineHeight:1.5}}>Genera una sala única con enlace y QR para compartir con los jurados</p>
-          <input className="field" placeholder="Nombre de la institución *" value={inst} onChange={e=>setInst(e.target.value)} style={{fontSize:".84rem"}}/>
-          <input className="field" placeholder="Grado / Nivel (opcional)" value={lvl} onChange={e=>setLvl(e.target.value)} style={{fontSize:".84rem"}}/>
-          <button className="btn btn-gold" disabled={!inst.trim()||!window.FIREBASE_OK} onClick={doCreateRoom} style={{width:"100%"}}>Generar Sala →</button>
-        </div>
-        <div className="card" style={{display:"flex",flexDirection:"column",gap:12}}>
-          <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em"}}>🔗 UNIRSE A SALA</p>
-          <p style={{color:"#4B5A78",fontSize:".78rem",lineHeight:1.5}}>Escribe el código de sala que te compartió el configurador del concurso</p>
-          <input className="field" placeholder="Código (ej: UNAB-K7X2)" value={joinCode} onChange={e=>setJoinCode(e.target.value.toUpperCase())} onKeyDown={e=>e.key==="Enter"&&doJoinByCode()} style={{fontSize:".84rem",letterSpacing:".06em"}}/>
-          <button className="btn btn-ghost" disabled={!joinCode.trim()} onClick={doJoinByCode} style={{width:"100%"}}>Entrar →</button>
-          <p style={{color:"#2D3A55",fontSize:".72rem",textAlign:"center"}}>o abre el enlace / escanea el QR que recibiste</p>
-        </div>
-      </div>
-      {!window.FIREBASE_OK && (
-        <div style={{maxWidth:560,width:"100%",padding:"10px 14px",background:"rgba(239,68,68,.1)",border:"1px solid rgba(239,68,68,.3)",borderRadius:10,color:"#f87171",fontSize:".82rem"}}>
-          ⚠️ Firebase no configurado — edita index.html con tus credenciales (ver SETUP.md)
-        </div>
-      )}
+      {showRoomsPanel && <RoomsPanel visible={showRoomsPanel} onClose={()=>setShowRoomsPanel(false)} adminUser={adminUser} userRooms={userRooms} allRooms={allRooms} onEnter={doEnterRoomAsMC} onClose2={doCloseRoom} onDelete={doDeleteRoom}/>}
 
-      {/* ─── Mis salas ─── */}
-      {adminUser && userRooms.length>0 && (
-        <div style={{maxWidth:560,width:"100%"}}>
-          <p style={{fontSize:".72rem",color:"#4B5A78",letterSpacing:"1.5px",fontWeight:700,marginBottom:8}}>MIS SALAS</p>
-          <div style={{display:"flex",flexDirection:"column",gap:6}}>
-            {userRooms.map(r=>{
-              const isActive=r.status!=="closed";
-              const date=r.createdAt?new Date(r.createdAt).toLocaleDateString("es-SV",{day:"2-digit",month:"2-digit",year:"numeric"}):"-";
-              return(
-                <div key={r.id} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 13px",background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.08)",borderRadius:10,flexWrap:"wrap"}}>
-                  <div style={{flex:1,minWidth:0}}>
-                    <div style={{fontWeight:600,fontSize:".84rem",color:isActive?"#E8EDF8":"#4B5A78",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.institution||"Sin nombre"}</div>
-                    <div style={{fontSize:".7rem",color:"#2D3A55",display:"flex",gap:8,marginTop:2}}>
-                      <span style={{fontFamily:"monospace",color:"#a78bfa"}}>{r.id}</span>
-                      <span>{date}</span>
+      {adminUser ? (
+
+        /* ═══════════ VISTA ADMIN (sesión iniciada) ═══════════ */
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",flex:1,padding:"24px 20px",gap:24}}>
+
+          {/* Header admin */}
+          <div style={{width:"100%",maxWidth:560,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <span style={{fontSize:"2rem"}}>🐝</span>
+              <div>
+                <p style={{fontFamily:"'Cormorant Garamond',serif",color:"#E8A200",fontSize:"1.1rem",fontWeight:700,lineHeight:1}}>Spelling Bee</p>
+                <p style={{fontSize:".7rem",color:"#4B5A78"}}>
+                  {adminUser.type==="master"?"👑 "+adminUser.username:"⚙️ "+adminUser.username}
+                </p>
+              </div>
+            </div>
+            <div style={{display:"flex",gap:6}}>
+              <button style={{padding:"6px 14px",background:"rgba(232,162,0,.1)",color:"#E8A200",border:"1px solid rgba(232,162,0,.3)",borderRadius:20,fontSize:".76rem",cursor:"pointer",fontWeight:600}}
+                onClick={()=>setShowRoomsPanel(true)}>
+                🏠 Mis Salas
+                {((adminUser?.type==="master"?allRooms:userRooms).filter(r=>r.phase!=="archived"&&r.status!=="closed").length>0)&&
+                  <span style={{background:"#E8A200",color:"#0C1628",borderRadius:10,padding:"0 5px",marginLeft:5,fontSize:".65rem",fontWeight:700}}>
+                    {(adminUser?.type==="master"?allRooms:userRooms).filter(r=>r.phase!=="archived"&&r.status!=="closed").length}
+                  </span>
+                }
+              </button>
+              <button style={{padding:"6px 10px",background:"rgba(255,255,255,.05)",color:"#4B5A78",border:"1px solid rgba(255,255,255,.08)",borderRadius:20,fontSize:".72rem",cursor:"pointer"}}
+                onClick={doAdminLogout}>Salir</button>
+            </div>
+          </div>
+
+          {/* Create room card */}
+          <div className="card" style={{width:"100%",maxWidth:560,borderColor:"rgba(232,162,0,.3)"}}>
+            <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:4}}>🆕 CREAR NUEVO CONCURSO</p>
+            <p style={{color:"#4B5A78",fontSize:".78rem",lineHeight:1.5,marginBottom:12}}>Genera una sala con código y enlace para compartir con los jurados</p>
+            <input className="field" placeholder="Nombre de la institución *" value={inst} onChange={e=>setInst(e.target.value)} style={{fontSize:".84rem",marginBottom:8}}/>
+            <input className="field" placeholder="Grado / Nivel (opcional)" value={lvl} onChange={e=>setLvl(e.target.value)} style={{fontSize:".84rem",marginBottom:10}}/>
+            <button className="btn btn-gold" disabled={!inst.trim()||!window.FIREBASE_OK} onClick={doCreateRoom} style={{width:"100%"}}>
+              Generar Sala →
+            </button>
+            {!window.FIREBASE_OK&&<p style={{color:"#ef4444",fontSize:".72rem",marginTop:5,textAlign:"center"}}>⚠️ Firebase no listo</p>}
+          </div>
+
+          {/* Join card */}
+          <div className="card" style={{width:"100%",maxWidth:560}}>
+            <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:4}}>🔗 UNIRSE A UNA SALA</p>
+            <div style={{display:"flex",gap:8}}>
+              <input className="field" placeholder="Código de sala (ej: jd-952476)" value={joinCode}
+                onChange={e=>setJoinCode(e.target.value)}
+                onKeyDown={e=>e.key==="Enter"&&doJoinByCode()}
+                style={{flex:1,fontSize:".84rem",letterSpacing:".04em"}}/>
+              <button className="btn btn-ghost" disabled={!joinCode.trim()} onClick={doJoinByCode} style={{padding:"0 16px"}}>
+                Entrar →
+              </button>
+            </div>
+          </div>
+
+          {/* Firebase status */}
+          {window.FIREBASE_OK && <RtdbStatus/>}
+          {/* Rooms list preview */}
+          {userRooms.filter(r=>r.status!=="closed").length>0&&(
+            <div style={{width:"100%",maxWidth:560}}>
+              <p style={{fontSize:".7rem",color:"#4B5A78",letterSpacing:"1.5px",fontWeight:700,marginBottom:6}}>SALAS RECIENTES</p>
+              <div style={{display:"flex",flexDirection:"column",gap:5}}>
+                {userRooms.filter(r=>r.status!=="closed").slice(0,3).map(r=>{
+                  const date=r.createdAt?new Date(r.createdAt).toLocaleDateString("es-SV",{day:"2-digit",month:"2-digit"}):"-";
+                  return(
+                    <div key={r.id} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 11px",background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.06)",borderRadius:8}}>
+                      <span style={{fontFamily:"monospace",fontSize:".74rem",color:"#a78bfa",flex:1}}>{r.id}</span>
+                      <span style={{fontSize:".74rem",color:"#E8EDF8",flex:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.institution||""}</span>
+                      <span style={{fontSize:".68rem",color:"#2D3A55"}}>{date}</span>
+                      <button style={{padding:"3px 9px",background:"rgba(232,162,0,.1)",color:"#E8A200",border:"1px solid rgba(232,162,0,.25)",borderRadius:6,fontSize:".7rem",cursor:"pointer"}}
+                        onClick={()=>doReenterRoom(r.id)}>↩</button>
                     </div>
-                  </div>
-                  <div style={{display:"flex",gap:6,alignItems:"center"}}>
-                    <span style={{padding:"2px 8px",borderRadius:10,fontSize:".68rem",fontWeight:600,
-                      background:isActive?"rgba(34,197,94,.12)":"rgba(100,100,100,.12)",
-                      color:isActive?"#22c55e":"#4B5A78"}}>
-                      {r.status==="closed"?"Cerrada":r.status==="setup"?"Config":"Activa"}
-                    </span>
-                    {isActive && (
-                      <button className="btn btn-ghost" style={{padding:"3px 10px",fontSize:".72rem",color:"#E8A200",borderColor:"rgba(232,162,0,.3)"}}
-                        onClick={()=>doReenterRoom(r.id)}>↩ Reingresar</button>
-                    )}
-                    {isActive && (
-                      <button className="btn btn-ghost" style={{padding:"3px 8px",fontSize:".72rem",color:"#ef4444",borderColor:"rgba(239,68,68,.2)"}}
-                        onClick={()=>doCloseRoom(r.id)}>✕ Cerrar</button>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+                  );
+                })}
+                {userRooms.filter(r=>r.status!=="closed").length>3&&(
+                  <button style={{background:"none",border:"none",color:"#4B5A78",fontSize:".72rem",cursor:"pointer",textAlign:"left",padding:"2px 4px"}}
+                    onClick={()=>setShowRoomsPanel(true)}>
+                    + {userRooms.filter(r=>r.status!=="closed").length-3} más — ver todas →
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
         </div>
-      )}
 
-      {/* Admin status + button */}
-      <div style={{display:"flex",alignItems:"center",gap:10,marginTop:4}}>
-        {adminUser ? (
-          <div style={{display:"flex",alignItems:"center",gap:8,padding:"5px 12px",background:"rgba(34,197,94,.1)",border:"1px solid rgba(34,197,94,.25)",borderRadius:16}}>
-            <span style={{fontSize:".72rem",color:"#22c55e"}}>
-              {adminUser.type==="master"?"👑 Maestro: "+adminUser.username:"⚙️ "+adminUser.username+(adminUser.activeRooms!==undefined?" · "+adminUser.activeRooms+"/"+adminUser.roomLimit+" salas":"")}
-            </span>
-            <span style={{fontSize:".65rem",color:"#2D3A55",marginLeft:2}}>📱 sesión activa</span>
-            <button className="btn btn-ghost" style={{padding:"2px 8px",fontSize:".68rem"}} onClick={doAdminLogout}>Salir</button>
-            {adminUser.type==="master" && <button className="btn btn-ghost" style={{padding:"2px 8px",fontSize:".68rem"}} onClick={()=>{setAdminView("dashboard");setShowAdmin(true);}}>Panel</button>}
+      ) : (
+
+        /* ═══════════ VISTA PÚBLICA (sin sesión) ═══════════ */
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",flex:1,padding:"40px 24px",gap:0}}>
+
+          {/* Logo */}
+          <div style={{textAlign:"center",marginBottom:40}}>
+            <div style={{fontSize:"5rem",lineHeight:1,marginBottom:16}}>🐝</div>
+            <h1 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:"2.8rem",fontWeight:700,color:"#E8A200",marginBottom:6}}>Spelling Bee</h1>
+            <p style={{color:"#4B5A78",fontSize:".9rem"}}>Panel de Jurado</p>
           </div>
-        ) : (
-          <button className="btn btn-ghost" style={{padding:"5px 12px",fontSize:".72rem",color:"#4B5A78",borderColor:"rgba(255,255,255,.08)"}} onClick={()=>{setAdminView("login");setShowAdmin(true);}}>
-            🔐 Acceso de operador
-          </button>
-        )}
-      </div>
-    </div>
-  );
+
+          {/* Join form — prominente, centrado */}
+          <div style={{width:"100%",maxWidth:400,display:"flex",flexDirection:"column",gap:12}}>
+            <input className="field" placeholder="Código de sala (ej: jd-952476)" value={joinCode}
+              onChange={e=>setJoinCode(e.target.value)}
+              onKeyDown={e=>e.key==="Enter"&&doJoinByCode()}
+              style={{fontSize:"1rem",padding:"14px 16px",letterSpacing:".05em",textAlign:"center"}}/>
+            <button className="btn btn-gold" disabled={!joinCode.trim()} onClick={doJoinByCode}
+              style={{width:"100%",padding:"14px",fontSize:"1rem",fontWeight:700}}>
+              Entrar a la sala →
+            </button>
+            <p style={{color:"#2D3A55",fontSize:".78rem",textAlign:"center",marginTop:4}}>
+              o abrí el enlace / escaneá el QR que recibiste
+            </p>
+          </div>
+
+          {/* Acceso operador — discreto, al fondo */}
+          <div style={{position:"fixed",bottom:24,left:"50%",transform:"translateX(-50%)"}}>
+            <button style={{padding:"7px 18px",background:"transparent",color:"#2D3A55",border:"1px solid rgba(255,255,255,.07)",borderRadius:20,fontSize:".75rem",cursor:"pointer"}}
+              onClick={()=>{setAdminView("login");setShowAdmin(true);}}>
+              🔐 Acceso de operador
+            </button>
+          </div>
+
+        </div>
+
+      )}
+    </div>  );
 
   /* SHARE LINK */
   if (screen==="share-link") return (
@@ -2112,6 +2358,7 @@ function App() {
   if (screen==="setup") return (
     <div className="sb" style={{maxWidth:720,margin:"0 auto",padding:"20px 16px 80px"}}>
       <style>{CSS}</style>
+      {showRoomsPanel && <RoomsPanel visible={showRoomsPanel} onClose={()=>setShowRoomsPanel(false)} adminUser={adminUser} userRooms={userRooms} allRooms={allRooms} onEnter={doEnterRoomAsMC} onClose2={doCloseRoom} onDelete={doDeleteRoom}/>}
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:10}}>
         <div style={{display:"flex",alignItems:"center",gap:12}}>
           <span style={{fontSize:"2rem"}}>🐝</span>
@@ -2453,6 +2700,7 @@ function App() {
     <div className="sb" style={{maxWidth:680,margin:"0 auto",padding:"16px 14px 80px"}}>
       <style>{CSS}</style>
       {LtrModal}{OvrModal}{DisputeModal}
+      {showRoomsPanel && <RoomsPanel visible={showRoomsPanel} onClose={()=>setShowRoomsPanel(false)} adminUser={adminUser} userRooms={userRooms} allRooms={allRooms} onEnter={doEnterRoomAsMC} onClose2={doCloseRoom} onDelete={doDeleteRoom}/>}
 
       {/* Header */}
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18,paddingTop:6}}>
@@ -2469,6 +2717,7 @@ function App() {
           <span style={{fontSize:".62rem",color:"#2D3A55",padding:"1px 6px",background:"rgba(34,197,94,.06)",borderRadius:8}} title={"Dispositivo: "+DEVICE_ID}>🔒</span>
           {(isMC||isCreator) && (
             <button className="btn btn-ghost" style={{fontSize:".7rem",padding:"4px 10px"}} onClick={()=>setScreen("setup")}>⚙ Config</button>
+          {adminUser&&<button className="btn btn-ghost" style={{fontSize:".7rem",padding:"4px 10px",color:"#E8A200"}} onClick={()=>setShowRoomsPanel(true)}>🏠</button>}
           )}
         </div>
       </div>
