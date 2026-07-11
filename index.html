@@ -119,6 +119,10 @@ function fixArrays(data) {
   if(!data.wordJudgments||typeof data.wordJudgments!=='object') data.wordJudgments={};
   if(!data.usedWords||typeof data.usedWords!=='object') data.usedWords={basic:[],intermediate:[],advanced:[]};
   ['basic','intermediate','advanced'].forEach(k=>{ if(!Array.isArray(data.usedWords[k])) data.usedWords[k]=toArr(data.usedWords[k]); });
+  // Re-seed word banks too (an empty stage bank is dropped by Firebase → would crash the draw).
+  if(!data.banks||typeof data.banks!=='object') data.banks={basic:[],intermediate:[],advanced:[]};
+  ['basic','intermediate','advanced'].forEach(k=>{ if(!Array.isArray(data.banks[k])) data.banks[k]=toArr(data.banks[k]); });
+  if(!data.presence||typeof data.presence!=='object') data.presence={};
   return data;
 }
 
@@ -495,7 +499,7 @@ function detectDiscrepancy(j) {
 function getScore(scores, stage, cId) {
   if (!scores) return {correct:0,total:0,words:[]};   // guard: scores undefined
   if (stage==="tiebreaker") {
-    const r=scores.tiebreaker?.[cId]?.rounds||[];
+    const r=scores.tiebreaker?.[cId]?.v||[]; // read the SAME field the voting flow writes (was ".rounds" → always 0 → infinite loop)
     return {correct:r.filter(x=>x==="correct").length,total:r.length,words:r};
   }
   const v=scores[stage]?.[cId]?.v||[];
@@ -1178,6 +1182,16 @@ function App() {
     return () => ref.off("value", h);
   }, [role, roomId]);
 
+  /* Presence: mark my role online and auto-clear it if my device disconnects, so the
+     finalizer election and the ready/vote thresholds can ignore judges who dropped. */
+  useEffect(()=>{
+    if(!role||!roomId||!window.FIREBASE_OK) return;
+    const pRef=window.rtdb.ref("spellingbee/rooms/"+roomId+"/state/presence/"+role);
+    pRef.set(true).catch(()=>{});
+    pRef.onDisconnect().remove();
+    return ()=>{ try{pRef.onDisconnect().cancel();}catch(e){} pRef.remove().catch(()=>{}); };
+  }, [role, roomId]);
+
   /* Save room session on every meaningful state change for reload recovery */
   useEffect(()=>{
     if(!roomId) return;
@@ -1277,14 +1291,20 @@ function App() {
   const upd = useCallback(fn => {
     setGs(prev => {
       const base = typeof fn==="function" ? fn(prev||initState()) : fn;
+      if (base === prev) return prev; // reducer said "no change" → don't write (avoids clobbering)
       const next = {...base, lastActivity:Date.now()};
-      if (roomRef.current && window.FIREBASE_OK)
-        window.rtdb.ref("spellingbee/rooms/"+roomRef.current+"/state").set(next)
+      if (roomRef.current && window.FIREBASE_OK) {
+        // Seat/roster nodes are owned by atomic transactions/sub-writes (join, ready,
+        // vote, presence). Writing them here would overwrite concurrent joins/votes, so
+        // merge everything EXCEPT them via update() (leaves those server nodes intact).
+        const {judges, mc, presenter, presence, ...rest} = next;
+        window.rtdb.ref("spellingbee/rooms/"+roomRef.current+"/state").update(rest)
           .catch(e=>{
             if(e.code==="PERMISSION_DENIED")
               console.error("🔥 RTDB REGLAS: acceso denegado. Ve a Firebase Console → RTDB → Reglas y pon .read:true .write:true");
             else console.error("🔥 RTDB write error:", e.code, e.message);
           });
+      }
       return next;
     });
   }, []);
@@ -1446,6 +1466,21 @@ function App() {
   /* Leave the current room (does NOT delete it) — clears local session and returns home */
   const doLeaveRoom = () => {
     if(!confirm("¿Salir de la sala? La sala sigue activa; puedes volver con el mismo enlace o código.")) return;
+    const rid=roomRef.current||roomId; const r=role;
+    if(rid && r && window.FIREBASE_OK){
+      const base="spellingbee/rooms/"+rid+"/state";
+      try{
+        if(r==="mc") window.rtdb.ref(base+"/mc").set({name:"",ts:0}).catch(()=>{});
+        else if(r==="presenter") window.rtdb.ref(base+"/presenter").set({name:"",ts:0}).catch(()=>{});
+        else if(/^J\d+$/.test(r)){
+          window.rtdb.ref(base+"/judges").transaction(cur=>{
+            const arr=Array.isArray(cur)?cur.filter(Boolean):(cur?Object.values(cur).filter(Boolean):[]);
+            return arr.filter(j=>j&&j.id!==r);
+          }).catch(()=>{});
+        }
+        window.rtdb.ref(base+"/presence/"+r).remove().catch(()=>{});
+      }catch(e){}
+    }
     try{ localStorage.removeItem('bee_room_session'); }catch(e){}
     setRole(null); setNameIn(""); setGs(null);
     roomRef.current = null; setRoomId(null);
@@ -1475,19 +1510,22 @@ function App() {
       assignedJudgeId = maxSlots.find(id=>!others.includes(id));
       if(!assignedJudgeId){ alert("No hay lugares de jurado libres. Sube el número de jurados en la pestaña Jurados."); return; }
     }
-    upd(prev=>{
-      let judges = (prev.judges||[]).filter(j=>j.id!==role); // vacate MY judge seat only; keep others
-      let mc = (role==="mc") ? {name:"",ts:0} : (prev.mc||{name:"",ts:0});
-      let presenter = (role==="presenter") ? {name:"",ts:0} : (prev.presenter||{name:"",ts:0});
-      const judgesReady = {...(prev.judgesReady||{})}; delete judgesReady[role]; // clear my stale "ready"
-      if (choice==="mc") mc = {name, ts:Date.now()};
-      else if (choice==="presenter") presenter = {name, ts:Date.now()};
-      else if (choice==="judge") {
-        const order = Math.max(0, ...judges.map(j=>j.order||0)) + 1;
-        judges = [...judges, {id:assignedJudgeId, name, order, ts:Date.now()}];
-      }
-      return {...prev, mc, presenter, judges, judgesReady};
-    });
+    const base="spellingbee/rooms/"+(roomRef.current||roomId)+"/state";
+    // Compute the new seat nodes and write them ATOMICALLY on their own paths
+    // (upd omits seat nodes, so these must be written directly).
+    let judges = (s0.judges||[]).filter(j=>j.id!==role); // vacate MY judge seat; keep others
+    let mc = (role==="mc") ? {name:"",ts:0} : (s0.mc||{name:"",ts:0});
+    let presenter = (role==="presenter") ? {name:"",ts:0} : (s0.presenter||{name:"",ts:0});
+    if (choice==="mc") mc = {name, ts:Date.now()};
+    else if (choice==="presenter") presenter = {name, ts:Date.now()};
+    else if (choice==="judge") {
+      const order = Math.max(0, ...judges.map(j=>j.order||0)) + 1;
+      judges = [...judges, {id:assignedJudgeId, name, order, ts:Date.now()}];
+    }
+    window.rtdb.ref(base).update({judges, mc, presenter}).catch(()=>{});
+    // Clear my stale "ready" flag (this one goes through the normal path)
+    if(role) window.rtdb.ref(base+"/judgesReady/"+role).remove().catch(()=>{});
+    setGs(prev=>prev?{...prev, judges, mc, presenter}:prev); // optimistic echo
     setRole(choice==="judge" ? assignedJudgeId : choice==="mc" ? "mc" : choice==="presenter" ? "presenter" : "config");
     if(name && nameIn!==name) setNameIn(name);
   };
@@ -1685,9 +1723,13 @@ function App() {
      seated judge has acted, so per-judge atomic writes are never lost. ── */
   const finalizerRole = (gs2) => {
     const g=gs2||gsRef.current; if(!g) return null;
-    // ALWAYS the first-seated judge: they vote/mark-ready too, so their client is
-    // guaranteed present the moment everyone has acted (an MC could have disconnected).
-    return ((g.judges||[]).slice().sort((a,b)=>(a.order||0)-(b.order||0))[0]||{}).id||null;
+    // The lowest-order judge that is currently ONLINE; falls back to lowest-order overall
+    // if presence is unknown. This survives the first judge disconnecting mid-round.
+    const pres=g.presence||{};
+    const seated=(g.judges||[]).slice().sort((a,b)=>(a.order||0)-(b.order||0));
+    const present=seated.filter(j=>pres[j.id]);
+    const pick=present[0]||seated[0];
+    return pick?pick.id:null;
   };
 
   const finalizeDrawWords = useCallback(() => {
@@ -1697,7 +1739,7 @@ function App() {
       const used=[...(prev.usedWords?.[cfg.bank]||[])];
       const usedLengths=used.map(w=>w.length).filter(l=>l>0);
       const targetLen=usedLengths.length?Math.round(usedLengths.reduce((a,b)=>a+b,0)/usedLengths.length):null;
-      const drawn=drawFairWords(prev.banks[cfg.bank],used,targetLen);
+      const drawn=drawFairWords(prev.banks[cfg.bank],used,targetLen).slice(0,cfg.wpr||3); // tiebreaker draws only 1
       const newUsed=[...used,...drawn.map(w=>w.word)];
       return {...prev,currentWords:drawn,currentWordIdx:0,wordJudgments:{},wordPhase:"word_show",
         usedWords:{...prev.usedWords,[cfg.bank]:newUsed}};
@@ -1708,10 +1750,15 @@ function App() {
     upd(prev=>{
       const wi=wiArg;
       if(prev.wordPhase!=="word_show" || (prev.currentWordIdx||0)!==wi) return prev; // stale
-      const seatedIds=new Set((prev.judges||[]).map(j=>j.id));
+      const seated=(prev.judges||[]);
+      const seatedIds=new Set(seated.map(j=>j.id));
+      const pres=prev.presence||{};
+      const presentSeated=seated.filter(j=>pres[j.id]);
+      const reqIds=(presentSeated.length?presentSeated:seated).map(j=>j.id); // only ONLINE judges must have voted
       const votesObj=(prev.wordJudgments||{})[wi]||{};
+      if(reqIds.length<1 || !reqIds.every(id=>votesObj[id])) return prev; // some online judge hasn't voted
+      // Tally EVERY seated judge's vote that exists (incl. one who voted then left).
       const seatedVotes=Object.entries(votesObj).filter(([id])=>seatedIds.has(id));
-      if(seatedIds.size<1 || seatedVotes.length<seatedIds.size) return prev; // not everyone in
       const verdicts=seatedVotes.map(([,v])=>v.verdict);
       const hasDisc=verdicts.some(v=>v!==verdicts[0]);
       const word=prev.currentWords[wi];
@@ -1735,7 +1782,7 @@ function App() {
           judgesReady:isLast?{}:prev.judgesReady};
       }
       const disc={wordIdx:wi,word:word?.word,phonetic:word?.phonetic,
-        votes:Object.fromEntries(seatedVotes.map(([jid,v])=>[jid,v.verdict])),
+        votes:Object.fromEntries(seatedVotes.map(([jid,v])=>[jid,{verdict:v.verdict,err:v.err||null}])),
         resolved:false,final:null};
       return {...prev,discrepancies:[...(prev.discrepancies||[]),disc],wordPhase:"deliberation"};
     });
@@ -1743,45 +1790,51 @@ function App() {
 
   useEffect(()=>{
     const g=gs; if(!g||g.phase!=="competition") return;
-    if(role!==finalizerRole(g)) return; // only the single finalizer acts
-    const seatedIds=new Set((g.judges||[]).map(j=>j.id));
-    if(seatedIds.size<1) return;
+    if(role!==finalizerRole(g)) return; // only the single (online) finalizer acts
+    const seated=(g.judges||[]);
+    const pres=g.presence||{};
+    const presentSeated=seated.filter(j=>pres[j.id]);
+    const reqIds=(presentSeated.length?presentSeated:seated).map(j=>j.id); // gate on ONLINE judges only
+    if(reqIds.length<1) return;
     if(g.wordPhase==="contestant_reveal"){
-      const readyCount=Object.keys(g.judgesReady||{}).filter(id=>seatedIds.has(id)).length;
-      if(readyCount>=seatedIds.size && (g.currentWords||[]).length===0) finalizeDrawWords();
+      const ready=g.judgesReady||{};
+      if(reqIds.every(id=>ready[id]) && (g.currentWords||[]).length===0) finalizeDrawWords();
     } else if(g.wordPhase==="word_show"){
       const wi=g.currentWordIdx||0;
-      const votedCount=Object.keys((g.wordJudgments||{})[wi]||{}).filter(id=>seatedIds.has(id)).length;
-      if(votedCount>=seatedIds.size) finalizeWord(wi);
+      const votes=(g.wordJudgments||{})[wi]||{};
+      if(reqIds.every(id=>votes[id])) finalizeWord(wi);
     }
-  },[gs?.phase, gs?.wordPhase, gs?.currentWordIdx, gs?.judgesReady, gs?.wordJudgments, gs?.judges, gs?.mc?.name, gs?.presenter?.name, role, finalizeDrawWords, finalizeWord]);
+  },[gs?.phase, gs?.wordPhase, gs?.currentWordIdx, gs?.judgesReady, gs?.wordJudgments, gs?.judges, gs?.presence, gs?.mc?.name, gs?.presenter?.name, role, finalizeDrawWords, finalizeWord]);
 
   /* Resolve discrepancy — pick one judge's verdict or custom */
   const doResolveDiscrepancy = useCallback((discIdx, finalVerdict) => {
     const s=gsRef.current; if(!s) return;
     upd(prev=>{
-      const discs=[...prev.discrepancies];
+      const discs=[...(prev.discrepancies||[])];
+      if(!discs[discIdx]||discs[discIdx].resolved) return prev; // already handled / stale
       discs[discIdx]={...discs[discIdx],resolved:true,final:finalVerdict};
-      const allResolved=discs.every(d=>d.resolved);
-      if(!allResolved) return {...prev,discrepancies:discs};
-      // All resolved — write to history and scores
+      const d=discs[discIdx];
+      const wi=d.wordIdx;
+      // Record ONLY this resolved word to history + scores
       const active=prev.contestants.filter(c=>c.active);
       const cur=active[prev.cIdx];
-      let newHistory=[...prev.history];
+      const hEntry={stage:prev.stage,stageLabel:STAGES[prev.stage].label,
+        cId:cur?.id,cName:cur?.name,
+        word:d.word||"",phonetic:d.phonetic||"",
+        result:finalVerdict,reasons:{override:finalVerdict,err:null,start:true,end:true}};
       const ns={...prev.scores};
-      for(const d of discs){
-        const hEntry={stage:prev.stage,stageLabel:STAGES[prev.stage].label,
-          cId:cur?.id,cName:cur?.name,
-          word:d.word||"",phonetic:d.phonetic||"",
-          result:d.final,reasons:{override:d.final,err:null,start:true,end:true}};
-        newHistory=[...newHistory,hEntry];
-        const pv=ns[prev.stage]?.[cur?.id]?.v||[];
-        const nv=[...pv]; nv[d.wordIdx]=d.final;
-        ns[prev.stage]={...ns[prev.stage],[cur?.id]:{v:nv}};
-      }
-      // Also add non-discrepancy words already in wordJudgments
-      return {...prev,discrepancies:discs,history:newHistory,scores:ns,
-        wordPhase:"stage_end",judgesReady:{}};
+      const pv=ns[prev.stage]?.[cur?.id]?.v||[];
+      const nv=[...pv]; nv[wi]=finalVerdict;
+      ns[prev.stage]={...ns[prev.stage],[cur?.id]:{v:nv}};
+      // CONTINUE the SAME contestant with their remaining words — only end the turn
+      // if the disputed word was the last of the three.
+      const nextWi=wi+1;
+      const isLast=nextWi>=(prev.currentWords||[]).length;
+      return {...prev,discrepancies:discs,
+        history:[...(prev.history||[]),hEntry],scores:ns,
+        wordPhase:isLast?"stage_end":"word_show",
+        currentWordIdx:isLast?wi:nextWi,
+        judgesReady:isLast?{}:prev.judgesReady};
     });
   },[]);
 
@@ -3256,9 +3309,11 @@ function App() {
                 <div className="word-font" style={{fontSize:"1.8rem",textAlign:"center",marginBottom:4}}>{(disc.word||"").toUpperCase()}</div>
                 <div className="ph-font" style={{textAlign:"center",marginBottom:12,fontSize:".9rem"}}>{disc.phonetic||""}</div>
                 {isPresenter && <p style={{color:"#4B5A78",textAlign:"center"}}>Los jurados están deliberando. El siguiente concursante es: <strong style={{color:"#E8A200"}}>{(gs.contestants?.filter(c=>c.active)||[])[(gs.cIdx||0)+1]?.name||"—"}</strong></p>}
-                {!isPresenter && (
+                {!isPresenter && !isController && <p style={{color:"#4B5A78",textAlign:"center",fontSize:".82rem"}}>Los jurados difieren en esta letra. Quien dirige está resolviendo la discrepancia…</p>}
+                {isController && (
                   <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap",marginBottom:10}}>
-                    {Object.entries(disc.votes||{}).map(([jid,v])=>{
+                    {Object.entries(disc.votes||{}).map(([jid,vObj])=>{
+                      const v=(vObj&&typeof vObj==="object")?vObj.verdict:vObj; // votes now store {verdict,err}
                       const judgeObj=(gs.judges||[]).find(j=>j.id===jid);
                       const lastName=(judgeObj?.name||jid).split(" ")[1]||(judgeObj?.name||jid);
                       return (
@@ -3271,7 +3326,7 @@ function App() {
                           <span style={{fontSize:".68rem",opacity:.75}}>{lastName}</span>
                           {(()=>{
                           const fv=(disc.votes||{})[jid];
-                          const e=fv?.err;
+                          const e=fv&&typeof fv==="object"?fv.err:null;
                           if(!e) return null;
                           const RL={no_before:"sin inicio",no_after:"sin final",too_slow:"tardó",discontinuous:"discontinuo"};
                           return(<span style={{fontSize:".65rem",color:"#f59e0b",display:"block",marginTop:2,lineHeight:1.4}}>
