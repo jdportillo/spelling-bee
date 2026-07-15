@@ -117,11 +117,16 @@ function fixArrays(data) {
   if(!Array.isArray(data.judges)) data.judges=[];
   if(!data.judgesReady||typeof data.judgesReady!=='object') data.judgesReady={};
   if(!data.wordJudgments||typeof data.wordJudgments!=='object') data.wordJudgments={};
+  if(!data.wordHelp||typeof data.wordHelp!=='object') data.wordHelp={};
   if(!data.usedWords||typeof data.usedWords!=='object') data.usedWords={basic:[],intermediate:[],advanced:[]};
   ['basic','intermediate','advanced'].forEach(k=>{ if(!Array.isArray(data.usedWords[k])) data.usedWords[k]=toArr(data.usedWords[k]); });
   // Re-seed word banks too (an empty stage bank is dropped by Firebase → would crash the draw).
   if(!data.banks||typeof data.banks!=='object') data.banks={basic:[],intermediate:[],advanced:[]};
   ['basic','intermediate','advanced'].forEach(k=>{ if(!Array.isArray(data.banks[k])) data.banks[k]=toArr(data.banks[k]); });
+  if(!data.extraBanks||typeof data.extraBanks!=='object') data.extraBanks={basic:[],intermediate:[],advanced:[]};
+  ['basic','intermediate','advanced'].forEach(k=>{ if(!Array.isArray(data.extraBanks[k])) data.extraBanks[k]=toArr(data.extraBanks[k]); });
+  if(!Array.isArray(data.roundLens)) data.roundLens=[];
+  if(!Array.isArray(data.usedWords.extra)) data.usedWords.extra=toArr(data.usedWords.extra);
   if(!data.presence||typeof data.presence!=='object') data.presence={};
   return data;
 }
@@ -204,11 +209,17 @@ function getDeviceId() {
 const DEVICE_ID = getDeviceId();
 
 const STAGES = {
-  basic:        { label:"Básica",     color:"#22c55e", bank:"basic",        next:"intermediate", wpr:3 },
-  intermediate: { label:"Intermedia", color:"#f59e0b", bank:"intermediate", next:"advanced",     wpr:3 },
-  advanced:     { label:"Avanzada",   color:"#ef4444", bank:"advanced",     next:"tiebreaker",   wpr:3 },
-  tiebreaker:   { label:"Desempate",  color:"#a78bfa", bank:"advanced",     next:null,           wpr:1 },
+  basic:        { label:"Básica",       color:"#22c55e", bank:"basic",        next:"intermediate", wpr:3 },
+  intermediate: { label:"Intermedia",   color:"#f59e0b", bank:"intermediate", next:"advanced",     wpr:3 },
+  advanced:     { label:"Avanzada",     color:"#ef4444", bank:"advanced",     next:"extra",        wpr:3 },
+  extra:        { label:"Extra",        color:"#38bdf8", bank:"extra",        next:"tiebreaker",   wpr:3, sameLen:true },
+  tiebreaker:   { label:"Muerte súbita",color:"#a78bfa", bank:"extra",        next:null,           wpr:1, sameLen:true },
 };
+/* Words for a stage: the "extra" pool combines every level's extra list. */
+function stageBankWords(state, bankKey){
+  if(bankKey==="extra"){ const e=(state&&state.extraBanks)||{}; return [...(e.basic||[]),...(e.intermediate||[]),...(e.advanced||[])]; }
+  return ((state&&state.banks)||{})[bankKey]||[];
+}
 
 /* ── INITIAL STATE ── */
 function initState() {
@@ -221,14 +232,16 @@ function initState() {
     judgeCount:3,                       // Configured by creator (2-10)
     /* Data */
     contestants:[], banks:{basic:[],intermediate:[],advanced:[]},
-    usedWords:{basic:[],intermediate:[],advanced:[]},
+    extraBanks:{basic:[],intermediate:[],advanced:[]}, // per-level "extra round" words
+    roundLens:[], // same-length words per word-slot for a fair extra/sudden-death round
+    usedWords:{basic:[],intermediate:[],advanced:[],extra:[]},
     /* Game flow */
     stage:"basic", cIdx:0,
     /* New word-by-word flow */
     wordPhase:"idle",  // "contestant_reveal"|"ready_wait"|"word_show"|"deliberation"|"stage_end"
     currentWordIdx:0,  // 0,1,2 within the 3-word set
     currentWords:[],   // [{word,phonetic}] — 3 words pre-drawn for current contestant
-    wordJudgments:{},  // { wordIdx: { J1:{verdict,err,start,end}, J2:…, J3:… } }
+    wordJudgments:{},wordHelp:{},  // { wordIdx: { J1:{verdict,err,start,end}, J2:…, J3:… } }
     judgesReady:{},    // { J1:true, J2:true } — ready signal per word-reveal
     discrepancies:[],  // [{wordIdx, word, phonetic, votes:{J1:v,J2:v}, resolved:false, final:null}]
     /* Legacy compat */
@@ -267,6 +280,27 @@ async function getPhonetics(words, onProgress) {
     if (i+BATCH < fetchable.length) await new Promise(r => setTimeout(r, DELAY));
   }
   return map;
+}
+
+/* Live lookup of definition + example for a word (comodines). Free dictionary API. */
+async function fetchWordInfo(word){
+  const w=(word||"").trim().toLowerCase();
+  if(!w||w.includes(" ")||w.length<2) return {definition:"",example:""};
+  try{
+    const ctrl=new AbortController(); setTimeout(()=>ctrl.abort(),6000);
+    const res=await fetch("https://api.dictionaryapi.dev/api/v2/entries/en/"+encodeURIComponent(w),{signal:ctrl.signal});
+    if(!res.ok) return {definition:"",example:""};
+    const d=await res.json();
+    let definition="",example="";
+    for(const m of (d[0]?.meanings||[])){
+      for(const def of (m?.definitions||[])){
+        if(!definition&&def?.definition) definition=def.definition;
+        if(!example&&def?.example) example=def.example;
+      }
+      if(definition&&example) break;
+    }
+    return {definition,example};
+  }catch{ return {definition:"",example:""}; }
 }
 
 /* ── DOCUMENT PARSING (Word .docx + PDF + plain text) ── */
@@ -535,7 +569,10 @@ function reasonText(reasons, result) {
   const issues=[];
   if (!reasons.start) issues.push("No pronunció al inicio");
   if (!reasons.end)   issues.push("No pronunció al final");
-  if (reasons.err) issues.push((reasons.err.type==="skipped"?"Omitió":"Deletreó mal")+" la letra «"+reasons.err.letter.toUpperCase()+"»");
+  const {letters,reasons:rs}=normErr(reasons.err);
+  const RL={no_before:"No pronunció al inicio",no_after:"No pronunció al final",too_slow:"No empezó a tiempo",discontinuous:"Deletreo discontinuo"};
+  rs.forEach(id=>issues.push(RL[id]||id));
+  if(letters.length) issues.push((letters.length>1?"Deletreó mal las letras ":"Deletreó mal la letra ")+letters.map(l=>"«"+((l.letter||"").toUpperCase())+"»").join(", "));
   return issues.length ? issues.join("; ") : "Incorrecto";
 }
 
@@ -580,8 +617,10 @@ function printReport(gs, role, onDone) {
     const issues=[];
     if (!r.start) issues.push("Did not pronounce the word at the start");
     if (!r.end)   issues.push("Did not pronounce the word at the end");
-    if (r.err) issues.push((r.err.type==="skipped"?"Skipped":"Misspelled")
-      +" letter &laquo;"+r.err.letter.toUpperCase()+"&raquo;");
+    const {letters,reasons}=normErr(r.err);
+    const REN={no_before:"Did not pronounce at the start",no_after:"Did not pronounce at the end",too_slow:"Did not start in time",discontinuous:"Discontinuous spelling"};
+    reasons.forEach(id=>issues.push(REN[id]||id));
+    if(letters.length) issues.push((letters.length>1?"Misspelled letters ":"Misspelled letter ")+letters.map(l=>"&laquo;"+((l.letter||"").toUpperCase())+"&raquo;").join(", "));
     return issues.length ? issues.join("; ") : "Incorrect";
   }
 
@@ -636,7 +675,9 @@ function printReport(gs, role, onDone) {
         +'<td class="dt-word">'+e.word.toUpperCase()+'</td>'
         +'<td class="dt-ph">'+(e.phonetic||"&mdash;")+'</td>'
         +'<td class="dt-res" style="color:'+(ok?"#16a34a":"#dc2626")+'">'+(ok?"&#10003;":"&#10007;")+'</td>'
-        +'<td class="dt-obs" style="color:'+(ok?"#16a34a":"#dc2626")+'">'+(ok?"&#10003; ":"&#10007; ")+reasonEn(e.reasons,e.result)+'</td>'
+        +'<td class="dt-obs" style="color:'+(ok?"#16a34a":"#dc2626")+'">'+(ok?"&#10003; ":"&#10007; ")+reasonEn(e.reasons,e.result)
+          +(e.help&&(e.help.def||e.help.ex||e.help.repeat)?'<div style="color:#0369a1;font-size:6pt;margin-top:1px;font-style:italic">Help used: '+[e.help.def?'definition':'',e.help.ex?'example':'',e.help.repeat?(e.help.repeat+'&times; repeat'):''].filter(Boolean).join(', ')+'</div>':'')
+          +'</td>'
         +'</tr>';
     }).join("");
     detailBlocks+='<div class="sblock">'
@@ -1104,6 +1145,7 @@ function App() {
   const [busy,     setBusy]     = useState(false);
   const [tab,      setTab]      = useState("judges");
   const [editBanks,setEditBanks]= useState({basic:[],intermediate:[],advanced:[]});
+  const [extraPaste,setExtraPaste]= useState({basic:"",intermediate:"",advanced:""}); // extra-round words per level
   const [progress, setProgress] = useState(null);
   const [ltrModal, setLtrModal] = useState(null);
   const [ovrModal, setOvrModal] = useState(false);
@@ -1682,12 +1724,21 @@ function App() {
   };
 
   const doSaveBanks = () => {
+    const parseExtra = t => (t&&t.trim()) ? parseTextBank(t) : null;
     upd(prev => ({
       ...prev,
-      banks:{basic:editBanks.basic, intermediate:editBanks.intermediate, advanced:editBanks.advanced},
-      // judges names are set at login; preserve existing
+      banks:{
+        basic: editBanks.basic?.length?editBanks.basic:(prev.banks?.basic||[]),
+        intermediate: editBanks.intermediate?.length?editBanks.intermediate:(prev.banks?.intermediate||[]),
+        advanced: editBanks.advanced?.length?editBanks.advanced:(prev.banks?.advanced||[]),
+      },
+      extraBanks:{
+        basic: parseExtra(extraPaste.basic)||(prev.extraBanks?.basic||[]),
+        intermediate: parseExtra(extraPaste.intermediate)||(prev.extraBanks?.intermediate||[]),
+        advanced: parseExtra(extraPaste.advanced)||(prev.extraBanks?.advanced||[]),
+      },
     }));
-    setStatus("✅ Bancos y jurados guardados.");
+    setStatus("✅ Bancos guardados.");
     setTab("contestants");
   };
 
@@ -1720,18 +1771,52 @@ function App() {
     setGs(prev=>{ if(!prev) return prev; const wj={...(prev.wordJudgments||{})}; wj[wi]={...(wj[wi]||{}),[role]:myVote}; return {...prev,wordJudgments:wj}; }); // optimistic echo
   },[role]);
 
+  /* Comodín (student help): records WHICH help each student requested (atomic, per word)
+     and reveals the definition/example live for everyone. type = "def" | "ex" | "repeat". */
+  const doComodin = async (type) => {
+    const s=gsRef.current; if(!s||!roomRef.current) return;
+    const wi=s.currentWordIdx||0;
+    const base="spellingbee/rooms/"+roomRef.current+"/state/wordHelp/"+wi;
+    if(type==="repeat"){
+      window.rtdb.ref(base+"/repeat").transaction(c=>(c||0)+1).catch(()=>{});
+      return;
+    }
+    const field=type==="def"?"def":"ex", textField=type==="def"?"defText":"exText";
+    window.rtdb.ref(base+"/"+field).set(true).catch(()=>{}); // reveal + record immediately
+    const word=((s.currentWords||[])[wi]||{}).word||"";
+    const info=await fetchWordInfo(word);
+    const txt=type==="def"?(info.definition||"(sin definición disponible)"):(info.example||"(sin ejemplo disponible)");
+    window.rtdb.ref(base+"/"+textField).set(txt).catch(()=>{});
+  };
+
   /* ── FINALIZER: a single client (host → primary judge) consolidates once every
      seated judge has acted, so per-judge atomic writes are never lost. ── */
   const finalizeDrawWords = useCallback(() => {
     upd(prev=>{
       if(prev.wordPhase!=="contestant_reveal" || (prev.currentWords||[]).length>0) return prev; // already drawn / stale
       const cfg=STAGES[prev.stage];
+      let bankWords=stageBankWords(prev, cfg.bank);
+      if(cfg.bank==="extra" && bankWords.length===0) bankWords=stageBankWords(prev,"advanced"); // fallback: no extra words provided
       const used=[...(prev.usedWords?.[cfg.bank]||[])];
-      const usedLengths=used.map(w=>w.length).filter(l=>l>0);
-      const targetLen=usedLengths.length?Math.round(usedLengths.reduce((a,b)=>a+b,0)/usedLengths.length):null;
-      const drawn=drawFairWords(prev.banks[cfg.bank],used,targetLen).slice(0,cfg.wpr||3); // tiebreaker draws only 1
+      let drawn, roundLens=Array.isArray(prev.roundLens)?prev.roundLens:[];
+      if(cfg.sameLen){
+        // FAIR: every contestant in this round gets words of the SAME letter-length per slot.
+        if(roundLens.length<(cfg.wpr||1)){
+          // First contestant of the round decides the lengths.
+          drawn=drawFairWords(bankWords,used,null).slice(0,cfg.wpr||1);
+          roundLens=drawn.map(w=>(w.word||"").length);
+        } else {
+          let localUsed=[...used];
+          drawn=roundLens.slice(0,cfg.wpr||1).map(L=>{ const w=pickWord(bankWords,localUsed,L)||pickWord(bankWords,localUsed,null); if(w) localUsed.push(w.word); return w; }).filter(Boolean);
+        }
+      } else {
+        const usedLengths=used.map(w=>w.length).filter(l=>l>0);
+        const targetLen=usedLengths.length?Math.round(usedLengths.reduce((a,b)=>a+b,0)/usedLengths.length):null;
+        drawn=drawFairWords(bankWords,used,targetLen).slice(0,cfg.wpr||3);
+      }
       const newUsed=[...used,...drawn.map(w=>w.word)];
-      return {...prev,currentWords:drawn,currentWordIdx:0,wordJudgments:{},wordPhase:"word_show",
+      return {...prev,currentWords:drawn,currentWordIdx:0,wordJudgments:{},wordHelp:{},wordPhase:"word_show",
+        roundLens: cfg.sameLen?roundLens:(prev.roundLens||[]),
         usedWords:{...prev.usedWords,[cfg.bank]:newUsed}};
     });
   },[]);
@@ -1757,7 +1842,8 @@ function App() {
         const anyErr=seatedVotes.map(([,v])=>v.err).find(e=>e)||null;
         const hEntry={stage:prev.stage,stageLabel:STAGES[prev.stage].label,
           cId:cur?.id,cName:cur?.name,word:word?.word||"",phonetic:word?.phonetic||"",
-          result:finalV,reasons:{override:null,err:anyErr,start:true,end:true}};
+          result:finalV,reasons:{override:null,err:anyErr,start:true,end:true},
+          help:(prev.wordHelp||{})[wi]||null};
         const ns={...prev.scores};
         const pv=ns[prev.stage]?.[cur?.id]?.v||[];
         const nv=[...pv]; nv[wi]=finalV;
@@ -1810,7 +1896,8 @@ function App() {
       const hEntry={stage:prev.stage,stageLabel:STAGES[prev.stage].label,
         cId:cur?.id,cName:cur?.name,
         word:d.word||"",phonetic:d.phonetic||"",
-        result:finalVerdict,reasons:{override:finalVerdict,err:null,start:true,end:true}};
+        result:finalVerdict,reasons:{override:finalVerdict,err:null,start:true,end:true},
+        help:(prev.wordHelp||{})[wi]||null};
       const ns={...prev.scores};
       const pv=ns[prev.stage]?.[cur?.id]?.v||[];
       const nv=[...pv]; nv[wi]=finalVerdict;
@@ -1834,17 +1921,17 @@ function App() {
     const nextIdx=s.cIdx+1;
     if(nextIdx>=active.length){
       upd(prev=>({...prev,cIdx:0,wordPhase:"idle",stageComplete:true,
-        currentWords:[],wordJudgments:{},discrepancies:[],judgesReady:{}}));
+        currentWords:[],wordJudgments:{},wordHelp:{},discrepancies:[],judgesReady:{}}));
     } else {
       upd(prev=>({...prev,cIdx:nextIdx,wordPhase:"contestant_reveal",
-        currentWords:[],wordJudgments:{},discrepancies:[],judgesReady:{},currentWordIdx:0}));
+        currentWords:[],wordJudgments:{},wordHelp:{},discrepancies:[],judgesReady:{},currentWordIdx:0}));
     }
   },[]);
 
   /* MC/Presenter starts the first contestant */
   const doStartContestants = useCallback(() => {
     upd(prev=>({...prev,wordPhase:"contestant_reveal",cIdx:0,
-      currentWords:[],wordJudgments:{},discrepancies:[],judgesReady:{}}));
+      currentWords:[],wordJudgments:{},wordHelp:{},discrepancies:[],judgesReady:{}}));
   },[]);
 
   /* Judges-only rooms auto-begin: with NO MC/presenter, once all expected judges
@@ -1887,7 +1974,7 @@ function App() {
     // Start WITHOUT forcing an MC. Control falls to whoever is present, in order:
     // MC → Presentador → organizador (creador) → Jurado #1. So a room with only
     // judges is fully autonomous — the first judge can run it.
-    upd(prev => ({...prev, phase:"competition", logoB64:logoB64||window._logoB64||prev.logoB64||"", setupComplete:true, stage:"basic", cIdx:0, slot:0, activeWord:null, judgment:null, stageComplete:false}));
+    upd(prev => ({...prev, phase:"competition", logoB64:logoB64||window._logoB64||prev.logoB64||"", setupComplete:true, stage:"basic", cIdx:0, slot:0, activeWord:null, judgment:null, stageComplete:false, roundLens:[], tbRound:0}));
     setScreen("competition");
   };
 
@@ -2012,7 +2099,8 @@ function App() {
   const doSubmit = () => {
     const s=gsRef.current; if(!s) return;
     const ranked=rankActive(s.contestants.filter(c=>c.active),s.scores,s.stage);
-    let advIds = s.stage==="tiebreaker" ? ranked.map(c=>c.id) : ranked.filter(c=>c.correct>=2).map(c=>c.id);
+    // basic/inter/advanced ELIMINATE (≥2 correct advances); extra + sudden-death keep everyone and just RANK.
+    let advIds = (s.stage==="tiebreaker"||s.stage==="extra") ? ranked.map(c=>c.id) : ranked.filter(c=>c.correct>=2).map(c=>c.id);
     if (advIds.length<2 && ranked.length>=2) advIds=ranked.slice(0,2).map(c=>c.id);
     if (!advIds.length) advIds=ranked.slice(0,1).map(c=>c.id);
     upd(prev=>({...prev,advancing:advIds}));
@@ -2027,11 +2115,12 @@ function App() {
         upd(prev=>({...prev,phase:"results",results:{first:ranked[0]?.id||null,second:ranked[1]?.id||null,third:ranked[2]?.id||null}}));
         setScreen("results");
       } else {
-        upd(prev=>({...prev,cIdx:0,slot:0,activeWord:null,judgment:null,stageComplete:false,advancing:[],tbRound:prev.tbRound+1}));
+        // Still tied → another sudden-death round with FRESH lengths.
+        upd(prev=>({...prev,cIdx:0,slot:0,activeWord:null,judgment:null,stageComplete:false,advancing:[],currentWords:[],wordJudgments:{},wordHelp:{},judgesReady:{},roundLens:[],tbRound:prev.tbRound+1}));
       }
       return;
     }
-    if (s.stage==="advanced" && r3) { // only finish if the podium is unambiguous; otherwise fall through to tiebreaker
+    if (s.stage==="extra" && r3) { // after the extra round, finish only if the podium is unambiguous; else → sudden death
       upd(prev=>({...prev,phase:"results",results:{first:ranked[0]?.id||null,second:ranked[1]?.id||null,third:ranked[2]?.id||null}}));
       setScreen("results"); return;
     }
@@ -2039,7 +2128,7 @@ function App() {
     upd(prev=>({
       ...prev, stage:next,
       contestants:prev.contestants.map(c=>({...c,active:s.advancing.includes(c.id)})),
-      cIdx:0,slot:0,activeWord:null,judgment:null,stageComplete:false,advancing:[],tbLen:null,tbRound:0,
+      cIdx:0,slot:0,activeWord:null,judgment:null,stageComplete:false,advancing:[],tbLen:null,tbRound:0,roundLens:[],
     }));
   };
 
@@ -2804,6 +2893,18 @@ function App() {
               {busy ? "⏳ Procesando..." : "📥 Cargar + Generar Fonética Automática"}
             </button>
           </div>
+          {/* Extra-round words per level */}
+          <div className="card" style={{marginBottom:12,borderColor:"rgba(56,189,248,.3)"}}>
+            <p style={{color:"#38bdf8",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:4}}>➕ PALABRAS EXTRA POR NIVEL <span style={{fontWeight:400,color:"#4B5A78"}}>(ronda Extra + muerte súbita)</span></p>
+            <p style={{color:"#4B5A78",fontSize:".74rem",marginBottom:10}}>Cada nivel aporta sus propias palabras extra; se combinan para la ronda Extra y el desempate. En la <strong>muerte súbita</strong> todos reciben palabras de la <strong>misma longitud</strong>. Una por línea (opcional con fonética: <span style={{fontFamily:"monospace",color:"#a78bfa"}}>elephant | /ˈɛlɪfənt/</span>).</p>
+            {[{key:"basic",label:"Básico",c:"#22c55e"},{key:"intermediate",label:"Intermedio",c:"#f59e0b"},{key:"advanced",label:"Avanzado",c:"#ef4444"}].map(({key,label,c})=>(
+              <div key={key} style={{marginBottom:8}}>
+                <p style={{color:c,fontSize:".74rem",fontWeight:700,marginBottom:4}}>{label} — extra{(gs?.extraBanks?.[key]?.length)?" ("+gs.extraBanks[key].length+" guardadas)":""}</p>
+                <textarea className="field" rows={3} placeholder={"palabra1\npalabra2\n..."} value={extraPaste[key]} onChange={e=>setExtraPaste(p=>({...p,[key]:e.target.value}))} style={{width:"100%",resize:"vertical",fontSize:".82rem"}}/>
+              </div>
+            ))}
+            <button className="btn btn-gold" style={{width:"100%",marginTop:6}} onClick={doSaveBanks}>💾 Guardar palabras extra</button>
+          </div>
           {["basic","intermediate","advanced"].some(k=>editBanks[k]?.length>0) && (
             <div className="card" style={{marginBottom:12}}>
               <p style={{color:"#E8A200",fontWeight:700,fontSize:".76rem",letterSpacing:".06em",marginBottom:12}}>✏️ REVISAR / EDITAR FONÉTICA</p>
@@ -3142,9 +3243,24 @@ function App() {
             const totalVotes=Object.keys((gs.wordJudgments||{})[wi]||{}).length;
             return (
               <div style={{width:"100%",textAlign:"center"}} className="pop">
-                <p style={{color:"#4B5A78",fontSize:".72rem",marginBottom:4}}>{cur.name} — Palabra {wi+1} de 3</p>
+                <p style={{color:"#4B5A78",fontSize:".72rem",marginBottom:4}}>{cur.name} — Palabra {wi+1} de {wpr}</p>
                 <div className="word-font" style={{fontSize:"clamp(1.8rem,5vw,3rem)",marginBottom:8,color:"#22c55e"}}>{(cw?.word||"").toUpperCase()}</div>
-                <div className="ph-font" style={{fontSize:"1rem",marginBottom:14}}>{cw?.phonetic||""}</div>
+                <div className="ph-font" style={{fontSize:"1rem",marginBottom:cfg?.sameLen?6:14}}>{cw?.phonetic||""}</div>
+                {cfg?.sameLen && cw && <div style={{fontSize:".76rem",color:"#38bdf8",marginBottom:12,fontWeight:700,letterSpacing:".04em"}}>🔢 {(cw.word||"").replace(/[^A-Za-z]/g,"").length} letras <span style={{fontWeight:400,color:"#4B5A78"}}>· misma longitud para todos</span></div>}
+                {(()=>{ const h=(gs.wordHelp||{})[wi]||{}; const usados=(h.def?1:0)+(h.ex?1:0)+(h.repeat||0); return (
+                  <div style={{width:"100%",marginBottom:12}}>
+                    {isController && (
+                      <div style={{display:"flex",gap:6,justifyContent:"center",marginBottom:(h.def||h.ex)?8:0}}>
+                        <button className="btn btn-ghost" style={{padding:"7px 10px",fontSize:".74rem",color:"#38bdf8"}} onClick={()=>doComodin("def")}>📖 Definición</button>
+                        <button className="btn btn-ghost" style={{padding:"7px 10px",fontSize:".74rem",color:"#38bdf8"}} onClick={()=>doComodin("ex")}>💬 Ejemplo</button>
+                        <button className="btn btn-ghost" style={{padding:"7px 10px",fontSize:".74rem",color:"#38bdf8"}} onClick={()=>doComodin("repeat")}>🔁 Repetir</button>
+                      </div>
+                    )}
+                    {h.def && <div style={{background:"rgba(56,189,248,.08)",border:"1px solid rgba(56,189,248,.25)",borderRadius:8,padding:"7px 10px",fontSize:".8rem",color:"#cfe8fb",textAlign:"left",marginTop:6}}><strong style={{color:"#38bdf8"}}>📖 Definición:</strong> {h.defText||"buscando…"}</div>}
+                    {h.ex && <div style={{background:"rgba(56,189,248,.08)",border:"1px solid rgba(56,189,248,.25)",borderRadius:8,padding:"7px 10px",fontSize:".8rem",color:"#cfe8fb",textAlign:"left",marginTop:6,fontStyle:"italic"}}><strong style={{color:"#38bdf8",fontStyle:"normal"}}>💬 Ejemplo:</strong> {h.exText||"buscando…"}</div>}
+                    {usados>0 && <p style={{fontSize:".7rem",color:"#4B5A78",textAlign:"center",marginTop:6}}>🎫 {usados} comodín(es) en esta palabra{h.repeat?" · "+h.repeat+" repetición(es)":""}</p>}
+                  </div>
+                ); })()}
                 {isJudge && !myVote && (() => {
                   const letters=(cw?.word||"").split("");
                   const REASONS=[
