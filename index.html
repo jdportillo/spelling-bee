@@ -514,8 +514,18 @@ function rankActive(contestants, scores, stage) {
 }
 function canResolveTop3(r) {
   if (!r.length) return false;
-  if (r.length<=2) return true;
+  if (r.length===1) return true;
+  // Two contestants must be DISTINGUISHABLE (a tie → needs a tiebreaker, not an auto-podium).
+  if (r.length===2) return r[0].correct!==r[1].correct;
   return r[0].correct!==r[1].correct && r[1].correct!==r[2].correct;
+}
+const REASON_LABELS_SHORT={no_before:"No dijo al inicio",no_after:"No dijo al final",too_slow:"No empezó a tiempo",discontinuous:"Deletreo discontinuo"};
+/* Normalize a vote's error detail to arrays, supporting old single-field votes. */
+function normErr(err){
+  if(!err||typeof err!=="object") return {letters:[],reasons:[]};
+  const letters=Array.isArray(err.letters)?err.letters:(err.letter?[{idx:err.letterIdx,letter:err.letter}]:[]);
+  const reasons=Array.isArray(err.reasons)?err.reasons:(err.reason?[err.reason]:[]);
+  return {letters,reasons};
 }
 function reasonText(reasons, result) {
   if (result==="correct") return "Correcta";
@@ -1118,8 +1128,8 @@ function App() {
   const [newUserForm, setNewUserForm] = useState({username:"",limit:5});
   const [operLogin,   setOperLogin]   = useState({username:"",password:""});
   const [disputeModal, setDisputeModal] = useState(false);
-  const [markedLetterIdx,setMarkedLetterIdx]=useState(null);
-  const [markedReason,setMarkedReason]=useState(null);
+  const [markedLetters,setMarkedLetters]=useState([]); // multi-select letter indices
+  const [markedReasons,setMarkedReasons]=useState([]); // multi-select reason ids
   const [revealAdvancing, setRevealAdvancing] = useState(false);
 
   const gsRef     = useRef(gs);     gsRef.current     = gs;
@@ -1182,15 +1192,6 @@ function App() {
     return () => ref.off("value", h);
   }, [role, roomId]);
 
-  /* Presence: mark my role online and auto-clear it if my device disconnects, so the
-     finalizer election and the ready/vote thresholds can ignore judges who dropped. */
-  useEffect(()=>{
-    if(!role||!roomId||!window.FIREBASE_OK) return;
-    const pRef=window.rtdb.ref("spellingbee/rooms/"+roomId+"/state/presence/"+role);
-    pRef.set(true).catch(()=>{});
-    pRef.onDisconnect().remove();
-    return ()=>{ try{pRef.onDisconnect().cancel();}catch(e){} pRef.remove().catch(()=>{}); };
-  }, [role, roomId]);
 
   /* Save room session on every meaningful state change for reload recovery */
   useEffect(()=>{
@@ -1696,7 +1697,7 @@ function App() {
   ══════════════════════════════════════════ */
 
   /* All judges pressed "Listo" — pre-draw 3 words */
-  useEffect(()=>{setMarkedLetterIdx(null);setMarkedReason(null);},[gs?.currentWordIdx]);
+  useEffect(()=>{setMarkedLetters([]);setMarkedReasons([]);},[gs?.currentWordIdx]);
 
   const doJudgeReady = useCallback(() => {
     const s=gsRef.current; if(!s||!roomRef.current||!role) return;
@@ -1721,17 +1722,6 @@ function App() {
 
   /* ── FINALIZER: a single client (host → primary judge) consolidates once every
      seated judge has acted, so per-judge atomic writes are never lost. ── */
-  const finalizerRole = (gs2) => {
-    const g=gs2||gsRef.current; if(!g) return null;
-    // The lowest-order judge that is currently ONLINE; falls back to lowest-order overall
-    // if presence is unknown. This survives the first judge disconnecting mid-round.
-    const pres=g.presence||{};
-    const seated=(g.judges||[]).slice().sort((a,b)=>(a.order||0)-(b.order||0));
-    const present=seated.filter(j=>pres[j.id]);
-    const pick=present[0]||seated[0];
-    return pick?pick.id:null;
-  };
-
   const finalizeDrawWords = useCallback(() => {
     upd(prev=>{
       if(prev.wordPhase!=="contestant_reveal" || (prev.currentWords||[]).length>0) return prev; // already drawn / stale
@@ -1746,19 +1736,17 @@ function App() {
     });
   },[]);
 
-  const finalizeWord = useCallback((wiArg) => {
+  const finalizeWord = useCallback((wiArg, force) => {
     upd(prev=>{
       const wi=wiArg;
       if(prev.wordPhase!=="word_show" || (prev.currentWordIdx||0)!==wi) return prev; // stale
       const seated=(prev.judges||[]);
       const seatedIds=new Set(seated.map(j=>j.id));
-      const pres=prev.presence||{};
-      const presentSeated=seated.filter(j=>pres[j.id]);
-      const reqIds=(presentSeated.length?presentSeated:seated).map(j=>j.id); // only ONLINE judges must have voted
       const votesObj=(prev.wordJudgments||{})[wi]||{};
-      if(reqIds.length<1 || !reqIds.every(id=>votesObj[id])) return prev; // some online judge hasn't voted
-      // Tally EVERY seated judge's vote that exists (incl. one who voted then left).
       const seatedVotes=Object.entries(votesObj).filter(([id])=>seatedIds.has(id));
+      // Normally EVERY seated judge must have voted; a controller "force" only needs ≥1.
+      if(!force && (seatedIds.size<1 || seatedVotes.length<seatedIds.size)) return prev;
+      if(seatedVotes.length<1) return prev;
       const verdicts=seatedVotes.map(([,v])=>v.verdict);
       const hasDisc=verdicts.some(v=>v!==verdicts[0]);
       const word=prev.currentWords[wi];
@@ -1789,22 +1777,23 @@ function App() {
   },[]);
 
   useEffect(()=>{
-    const g=gs; if(!g||g.phase!=="competition") return;
-    if(role!==finalizerRole(g)) return; // only the single (online) finalizer acts
+    const g=gs; if(!g||g.phase!=="competition"||!isJudge) return;
     const seated=(g.judges||[]);
-    const pres=g.presence||{};
-    const presentSeated=seated.filter(j=>pres[j.id]);
-    const reqIds=(presentSeated.length?presentSeated:seated).map(j=>j.id); // gate on ONLINE judges only
-    if(reqIds.length<1) return;
+    const seatedIds=seated.map(j=>j.id);
+    if(seatedIds.length<1) return;
     if(g.wordPhase==="contestant_reveal"){
-      const ready=g.judgesReady||{};
-      if(reqIds.every(id=>ready[id]) && (g.currentWords||[]).length===0) finalizeDrawWords();
+      // The word DRAW is random, so only ONE deterministic client does it (lowest-order judge);
+      // otherwise two clients would draw different words.
+      const drawer=(seated.slice().sort((a,b)=>(a.order||0)-(b.order||0))[0]||{}).id;
+      if(role===drawer && seatedIds.every(id=>(g.judgesReady||{})[id]) && (g.currentWords||[]).length===0) finalizeDrawWords();
     } else if(g.wordPhase==="word_show"){
+      // Recording a word is DETERMINISTIC, so ANY judge whose client sees all votes may
+      // consolidate — no single-point-of-failure. Duplicate writes are idempotent (stale-guarded).
       const wi=g.currentWordIdx||0;
       const votes=(g.wordJudgments||{})[wi]||{};
-      if(reqIds.every(id=>votes[id])) finalizeWord(wi);
+      if(seatedIds.every(id=>votes[id])) finalizeWord(wi);
     }
-  },[gs?.phase, gs?.wordPhase, gs?.currentWordIdx, gs?.judgesReady, gs?.wordJudgments, gs?.judges, gs?.presence, gs?.mc?.name, gs?.presenter?.name, role, finalizeDrawWords, finalizeWord]);
+  },[gs?.phase, gs?.wordPhase, gs?.currentWordIdx, gs?.judgesReady, gs?.wordJudgments, gs?.judges, role, isJudge, finalizeDrawWords, finalizeWord]);
 
   /* Resolve discrepancy — pick one judge's verdict or custom */
   const doResolveDiscrepancy = useCallback((discIdx, finalVerdict) => {
@@ -2042,7 +2031,7 @@ function App() {
       }
       return;
     }
-    if (s.stage==="advanced" && (r3||ranked.length<=2)) {
+    if (s.stage==="advanced" && r3) { // only finish if the podium is unambiguous; otherwise fall through to tiebreaker
       upd(prev=>({...prev,phase:"results",results:{first:ranked[0]?.id||null,second:ranked[1]?.id||null,third:ranked[2]?.id||null}}));
       setScreen("results"); return;
     }
@@ -3137,6 +3126,11 @@ function App() {
                   </p>
                 </>
               )}
+              {isController && (gs.currentWords||[]).length===0 && (()=>{ const ready=Object.keys(gs.judgesReady||{}).length; const total=(gs.judges||[]).length; return (ready<total)?(
+                <button className="btn btn-ghost" style={{marginTop:12,fontSize:".74rem",padding:"7px 12px",color:"#f59e0b"}}
+                  onClick={()=>{ if(confirm("¿Sortear la palabra ahora con "+ready+" de "+total+" jurados listos? Úsalo solo si alguien se desconectó.")) finalizeDrawWords(); }}>
+                  ▶ Sortear palabra ahora ({ready}/{total} listos)
+                </button>):null; })()}
             </div>
           )}
 
@@ -3165,10 +3159,10 @@ function App() {
                     too_slow:"No inició en tiempo (>10 seg)",
                     discontinuous:"Deletreo discontinuo / se detuvo",
                   };
-                  const hasSelection=markedLetterIdx!==null||markedReason!==null;
+                  const hasSelection=markedLetters.length>0||markedReasons.length>0;
                   const selParts=[];
-                  if(markedLetterIdx!==null) selParts.push("Letra: "+((cw?.word||"")[markedLetterIdx]||"").toUpperCase()+" (pos. "+(markedLetterIdx+1)+")");
-                  if(markedReason) selParts.push(RLABELS[markedReason]||markedReason);
+                  if(markedLetters.length) selParts.push("Letras: "+markedLetters.slice().sort((a,b)=>a-b).map(i=>((cw?.word||"")[i]||"").toUpperCase()+"("+(i+1)+")").join(", "));
+                  markedReasons.forEach(rid=>selParts.push(RLABELS[rid]||rid));
                   return (
                     <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
 
@@ -3179,10 +3173,10 @@ function App() {
                         </p>
                         <div style={{display:"flex",flexWrap:"wrap",gap:4,justifyContent:"center"}}>
                           {letters.map((ch,i)=>{
-                            const isW=markedLetterIdx===i;
+                            const isW=markedLetters.includes(i);
                             return(
                               <button key={i}
-                                onClick={()=>setMarkedLetterIdx(isW?null:i)}
+                                onClick={()=>setMarkedLetters(prev=>prev.includes(i)?prev.filter(x=>x!==i):[...prev,i])}
                                 title={"Marcar "+ch.toUpperCase()+" como incorrecta"}
                                 style={{
                                   width:ch===" "?"14px":"32px",minWidth:ch===" "?"14px":"32px",
@@ -3212,10 +3206,10 @@ function App() {
                         </p>
                         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:5}}>
                           {REASONS.map(r=>{
-                            const isSel=markedReason===r.id;
+                            const isSel=markedReasons.includes(r.id);
                             return(
                               <button key={r.id}
-                                onClick={()=>setMarkedReason(isSel?null:r.id)}
+                                onClick={()=>setMarkedReasons(prev=>prev.includes(r.id)?prev.filter(x=>x!==r.id):[...prev,r.id])}
                                 style={{
                                   padding:"7px 5px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",
                                   textAlign:"center",lineHeight:1.4,fontSize:"9px",
@@ -3247,20 +3241,19 @@ function App() {
                       {/* Verdict buttons */}
                       <div style={{display:"flex",gap:8,width:"100%"}}>
                         <button className="btn btn-green" style={{flex:1,padding:"10px 0",fontSize:".9rem"}}
-                          onClick={()=>{doJudgeWordVerdict("correct",null);setMarkedLetterIdx(null);setMarkedReason(null);}}>
+                          onClick={()=>{doJudgeWordVerdict("correct",null);setMarkedLetters([]);setMarkedReasons([]);}}>
                           ✅ Correcta
                         </button>
                         <button className="btn btn-red" style={{flex:1,padding:"10px 0",fontSize:".9rem"}}
                           onClick={()=>{
-                            const errInfo=(markedLetterIdx!==null||markedReason)
+                            const errInfo=(markedLetters.length||markedReasons.length)
                               ?{
-                                  letterIdx:markedLetterIdx,
-                                  letter:markedLetterIdx!==null?(cw?.word||"")[markedLetterIdx]:null,
-                                  reason:markedReason||null,
+                                  letters:markedLetters.slice().sort((a,b)=>a-b).map(i=>({idx:i,letter:(cw?.word||"")[i]||""})),
+                                  reasons:markedReasons.slice(),
                                 }
                               :null;
                             doJudgeWordVerdict("incorrect",errInfo);
-                            setMarkedLetterIdx(null);setMarkedReason(null);
+                            setMarkedLetters([]);setMarkedReasons([]);
                           }}>
                           ❌ Incorrecta
                         </button>
@@ -3276,23 +3269,25 @@ function App() {
                     <p style={{fontWeight:700,fontSize:"1rem",color:myVote.verdict==="correct"?"#22c55e":"#ef4444",marginBottom:4}}>
                       {myVote.verdict==="correct"?"✅ Marcaste: Correcta":"❌ Marcaste: Incorrecta"}
                     </p>
-                    {myVote.verdict==="incorrect" && (myVote.err?.letter||myVote.err?.reason) && (
+                    {myVote.verdict==="incorrect" && (()=>{ const {letters,reasons}=normErr(myVote.err); return (letters.length||reasons.length)?(
                       <div style={{fontSize:".75rem",color:"#ef4444",lineHeight:1.6}}>
-                        {myVote.err?.letter && (
-                          <span>Letra: <strong style={{letterSpacing:2}}>{myVote.err.letter.toUpperCase()}</strong> (pos. {(myVote.err?.letterIdx||0)+1})</span>
+                        {letters.length>0 && (
+                          <span>{letters.length>1?"Letras: ":"Letra: "}<strong style={{letterSpacing:2}}>{letters.map(l=>(l.letter||"").toUpperCase()+" ("+((l.idx||0)+1)+")").join(", ")}</strong></span>
                         )}
-                        {myVote.err?.letter && myVote.err?.reason && <span> · </span>}
-                        {myVote.err?.reason && (
-                          <span>{{no_before:"No dijo al inicio",no_after:"No dijo al final",too_slow:"No empezó a tiempo",discontinuous:"Deletreo discontinuo"}[myVote.err.reason]||myVote.err.reason}</span>
-                        )}
-                      </div>
-                    )}
-                    {myVote.verdict==="incorrect" && !myVote.err?.letter && !myVote.err?.reason && (
+                        {letters.length>0 && reasons.length>0 && <span> · </span>}
+                        {reasons.length>0 && <span>{reasons.map(r=>REASON_LABELS_SHORT[r]||r).join(" · ")}</span>}
+                      </div>):null; })()}
+                    {myVote.verdict==="incorrect" && (()=>{ const {letters,reasons}=normErr(myVote.err); return (!letters.length&&!reasons.length)?(
                       <p style={{fontSize:".72rem",color:"rgba(239,68,68,.6)"}}>Sin detalle adicional</p>
-                    )}
+                    ):null; })()}
                   </div>
                 )}
                 {!isJudge && <p style={{color:"#4B5A78"}}>{totalVotes}/{seatedJudges} jurados calificaron</p>}
+                {isController && (()=>{ const wi=gs.currentWordIdx||0; const voted=Object.keys((gs.wordJudgments||{})[wi]||{}).length; const total=(gs.judges||[]).length; return (voted>=1 && voted<total)?(
+                  <button className="btn btn-ghost" style={{marginTop:10,fontSize:".74rem",padding:"7px 12px",color:"#f59e0b"}}
+                    onClick={()=>{ if(confirm("¿Cerrar la palabra con "+voted+" de "+total+" votos? Úsalo solo si un jurado se desconectó y no volverá.")) finalizeWord(wi,true); }}>
+                    ⏭ Cerrar palabra sin jurado ausente ({voted}/{total})
+                  </button>):null; })()}
               </div>
             );
           })()}
@@ -3326,13 +3321,13 @@ function App() {
                           <span style={{fontSize:".68rem",opacity:.75}}>{lastName}</span>
                           {(()=>{
                           const fv=(disc.votes||{})[jid];
-                          const e=fv&&typeof fv==="object"?fv.err:null;
-                          if(!e) return null;
+                          const {letters,reasons}=normErr(fv&&typeof fv==="object"?fv.err:null);
+                          if(!letters.length&&!reasons.length) return null;
                           const RL={no_before:"sin inicio",no_after:"sin final",too_slow:"tardó",discontinuous:"discontinuo"};
                           return(<span style={{fontSize:".65rem",color:"#f59e0b",display:"block",marginTop:2,lineHeight:1.4}}>
-                            {e.letter&&<span>letra {e.letter.toUpperCase()} (p.{(e.letterIdx||0)+1})</span>}
-                            {e.letter&&e.reason&&<span> · </span>}
-                            {e.reason&&<span>{RL[e.reason]||e.reason}</span>}
+                            {letters.length>0&&<span>{letters.length>1?"letras ":"letra "}{letters.map(l=>(l.letter||"").toUpperCase()+"("+((l.idx||0)+1)+")").join(",")}</span>}
+                            {letters.length>0&&reasons.length>0&&<span> · </span>}
+                            {reasons.length>0&&<span>{reasons.map(r=>RL[r]||r).join(", ")}</span>}
                           </span>);
                         })()}
                         </button>
